@@ -75,17 +75,30 @@ def _dedupe_key(strategy: str, symbol: str, tf: int, action: str, bar_time: str)
     return hashlib.sha256(raw.encode()).hexdigest()
 
 def send_to_traderspost(payload: dict):
-    if DRY_RUN:
-        print(f"[DRY-RUN] Would POST to TradersPost: {json.dumps(payload)[:500]}", flush=True)
-        return True, "dry-run"
-    if not TP_URL:
-        raise RuntimeError("TP_WEBHOOK_URL is not set in environment.")
-    payload.setdefault("meta", {})
-    payload["meta"]["environment"] = "paper" if PAPER_MODE else "live"
-    payload["meta"]["sentAt"] = datetime.now(timezone.utc).isoformat()
-    r = requests.post(TP_URL, json=payload, timeout=12)
-    ok = 200 <= r.status_code < 300
-    return ok, f"{r.status_code} {r.text[:300]}"
+    try:
+        if DRY_RUN:
+            print(f"[DRY-RUN] Would POST to TradersPost: {json.dumps(payload)[:500]}", flush=True)
+            return True, "dry-run"
+        if not TP_URL:
+            print("[ERROR] TP_WEBHOOK_URL is empty or missing.", flush=True)
+            return False, "no-webhook-url"
+
+        payload.setdefault("meta", {})
+        payload["meta"]["environment"] = "paper" if PAPER_MODE else "live"
+        payload["meta"]["sentAt"] = datetime.now(timezone.utc).isoformat()
+
+        print(f"[POST] TradersPost URL present. Sending payload...", flush=True)
+        r = requests.post(TP_URL, json=payload, timeout=12)
+        ok = 200 <= r.status_code < 300
+        info = f"{r.status_code} {r.text[:300]}"
+        if not ok:
+            print(f"[POST ERROR] {info}", flush=True)
+        return ok, info
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"[POST EXCEPTION] {e}\n{tb}", flush=True)
+        return False, f"exception: {e}"
 
 def build_payload(symbol: str, sig: dict):
     p = {
@@ -547,18 +560,27 @@ def compute_signal(strategy_name, symbol, tf_minutes):
     return None
 
 def send_startup_test_order():
-    """Optional: prove the webhook works by sending 1 share market BUY in paper."""
+    """Prove webhook/DRY-RUN path works on boot."""
+    print(
+        f"[STARTUP] Flags: SEND_TEST_ORDER={SEND_TEST_ORDER}  DRY_RUN={DRY_RUN}  PAPER_MODE={PAPER_MODE}  "
+        f"TP_URL_SET={'yes' if bool(TP_URL) else 'no'}",
+        flush=True
+    )
+
     if not SEND_TEST_ORDER:
+        print("[STARTUP] SEND_TEST_ORDER=0 → skipping startup test order.", flush=True)
         return
-    test = {
+
+    test_payload = {
         "ticker": "AAPL",
         "action": "buy",
         "orderType": "market",
         "quantity": 1,
-        "meta": {"note": "startup-test-order", "environment": "paper"}
+        "meta": {"note": "startup-test-order", "environment": "paper" if PAPER_MODE else "live"}
     }
-    ok, info = send_to_traderspost(test)
-    print(f"[TEST ORDER] AAPL 1 share -> {info}", flush=True)
+    print("[STARTUP] Attempting startup test order (AAPL, qty=1)...", flush=True)
+    ok, info = send_to_traderspost(test_payload)
+    print(f"[TEST ORDER RESULT] ok={ok}  info={info}", flush=True)
 
 def replay_signals_once():
     """Replay a single strategy on recent history and print how many signals you'd have had."""
@@ -610,27 +632,46 @@ def replay_signals_once():
 # ==============================
 def main():
     print("Bot starting…", flush=True)
+
+    # ---- startup diagnostics (runs once) ----
+    try:
+        send_startup_test_order()
+    except Exception as e:
+        import traceback
+        print("[STARTUP ERROR]", e, traceback.format_exc(), flush=True)
+
+    # ---- main loop ----
     while True:
         loop_start = time.time()
-        print("Tick…", flush=True)
+        try:
+            print("Tick…", flush=True)
 
-        for (name, sym, tf) in COMBOS:
-            sig = compute_signal(name, sym, tf)
-            if not sig:
-                continue
+            for (name, sym, tf) in COMBOS:
+                # Optional: one-combo debug snapshot (if you added that helper)
+                if DEBUG_COMBO:
+                    try:
+                        debug_snapshot_one_combo(name, sym, tf)
+                    except Exception as e:
+                        print(f"[DEBUG SNAPSHOT ERROR] {name},{sym},{tf}: {e}", flush=True)
 
-            # per-bar dedupe
-            k = _dedupe_key(name, sym, tf, sig["action"], sig.get("barTime",""))
-            if k in _sent:
-                continue
-            _sent.add(k)
+                sig = compute_signal(name, sym, tf)
+                if not sig:
+                    continue
 
-            payload = build_payload(sym, sig)
-            ok, info = send_to_traderspost(payload)
-            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{stamp}] {name} {sym} {tf}m -> {sig['action']} qty={sig['quantity']} | {info}", flush=True)
+                k = _dedupe_key(name, sym, tf, sig["action"], sig.get("barTime",""))
+                if k in _sent:
+                    continue
+                _sent.add(k)
 
-        # sleep remaining time in poll interval
+                payload = build_payload(sym, sig)
+                ok, info = send_to_traderspost(payload)
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[{stamp}] {name} {sym} {tf}m -> {sig['action']} qty={sig['quantity']} | {info}", flush=True)
+
+        except Exception as e:
+            import traceback
+            print("[LOOP ERROR]", e, traceback.format_exc(), flush=True)
+
         elapsed = time.time() - loop_start
         time.sleep(max(1, POLL_SECONDS - int(elapsed)))
 
