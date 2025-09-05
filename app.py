@@ -13,6 +13,16 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")  # If you keep using Polygon here
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() != "false"  # default paper
 
+# ===== Diagnostics =====
+DRY_RUN = os.getenv("DRY_RUN", "0") == "1"               # don't POST; just log payload
+SEND_TEST_ORDER = os.getenv("SEND_TEST_ORDER", "0") == "1"  # fire one paper test order on boot
+REPLAY_ON_START = os.getenv("REPLAY_ON_START", "0") == "1"  # run a quick historical replay then continue
+REPLAY_STRAT = os.getenv("REPLAY_STRAT", "")              # e.g. "ict_bos_fvg"
+REPLAY_SYMBOL = os.getenv("REPLAY_SYMBOL", "")            # e.g. "META"
+REPLAY_TF = int(os.getenv("REPLAY_TF", "5"))              # minutes
+REPLAY_HOURS = int(os.getenv("REPLAY_HOURS", "24"))       # how far back to replay
+DEBUG_COMBO = os.getenv("DEBUG_COMBO", "")                # "strategy,symbol,tf" (e.g. "poc,AVGO,1")
+
 # ---- Global position sizing (bit-for-bit with your Colab) ----
 EQUITY_USD  = float(os.getenv("EQUITY_USD",  "100000"))  # $100k
 RISK_PCT    = float(os.getenv("RISK_PCT",    "0.01"))    # 1% as 0.01 (same as your notebook)
@@ -65,12 +75,14 @@ def _dedupe_key(strategy: str, symbol: str, tf: int, action: str, bar_time: str)
     return hashlib.sha256(raw.encode()).hexdigest()
 
 def send_to_traderspost(payload: dict):
+    if DRY_RUN:
+        print(f"[DRY-RUN] Would POST to TradersPost: {json.dumps(payload)[:500]}", flush=True)
+        return True, "dry-run"
     if not TP_URL:
         raise RuntimeError("TP_WEBHOOK_URL is not set in environment.")
     payload.setdefault("meta", {})
     payload["meta"]["environment"] = "paper" if PAPER_MODE else "live"
     payload["meta"]["sentAt"] = datetime.now(timezone.utc).isoformat()
-
     r = requests.post(TP_URL, json=payload, timeout=12)
     ok = 200 <= r.status_code < 300
     return ok, f"{r.status_code} {r.text[:300]}"
@@ -533,6 +545,65 @@ def compute_signal(strategy_name, symbol, tf_minutes):
     if strategy_name == "ict_bos_fvg_ob":  return signal_ict_bos_fvg_ob(symbol, df1m, tf_minutes)
     if strategy_name == "poc_pinescript":  return signal_poc_pinescript(symbol, df1m, tf_minutes)
     return None
+
+def send_startup_test_order():
+    """Optional: prove the webhook works by sending 1 share market BUY in paper."""
+    if not SEND_TEST_ORDER:
+        return
+    test = {
+        "ticker": "AAPL",
+        "action": "buy",
+        "orderType": "market",
+        "quantity": 1,
+        "meta": {"note": "startup-test-order", "environment": "paper"}
+    }
+    ok, info = send_to_traderspost(test)
+    print(f"[TEST ORDER] AAPL 1 share -> {info}", flush=True)
+
+def replay_signals_once():
+    """Replay a single strategy on recent history and print how many signals you'd have had."""
+    if not REPLAY_ON_START or not (REPLAY_STRAT and REPLAY_SYMBOL):
+        return
+    lookback = max(REPLAY_HOURS * 60, 120)  # minutes
+    df1m = fetch_polygon_1m(REPLAY_SYMBOL, lookback_minutes=lookback)
+    if df1m is None or df1m.empty:
+        print("[REPLAY] No data fetched.", flush=True)
+        return
+
+    # Normalize tz
+    try:
+        df1m.index = df1m.index.tz_convert("America/New_York")
+    except Exception:
+        df1m.index = df1m.index.tz_localize("UTC").tz_convert("America/New_York")
+
+    # Resample to TF and iterate bar-by-bar, calling the right adapter each time
+    tf = REPLAY_TF
+    bars = _resample(df1m, tf)
+    hits = 0
+    last_key = None
+    for i in range(len(bars)):
+        # Slice up to i to emulate "bar close" at that point
+        df_slice = df1m.loc[:bars.index[i]]
+        if REPLAY_STRAT == "poc":
+            sig = signal_poc(REPLAY_SYMBOL, df_slice, tf)
+        elif REPLAY_STRAT == "ict_bos_fvg":
+            sig = signal_ict_bos_fvg(REPLAY_SYMBOL, df_slice, tf)
+        elif REPLAY_STRAT == "ict_bos_fvg_ob":
+            sig = signal_ict_bos_fvg_ob(REPLAY_SYMBOL, df_slice, tf)
+        elif REPLAY_STRAT == "poc_pinescript":
+            sig = signal_poc_pinescript(REPLAY_SYMBOL, df_slice, tf)
+        else:
+            print(f"[REPLAY] Unknown strategy '{REPLAY_STRAT}'", flush=True)
+            return
+
+        if sig:
+            # de-dupe by bar time + action
+            k = (sig.get("barTime",""), sig.get("action",""))
+            if k != last_key:
+                hits += 1
+                last_key = k
+
+    print(f"[REPLAY] {REPLAY_STRAT} {REPLAY_SYMBOL} {tf}m -> {hits} signal(s) in last {REPLAY_HOURS}h.", flush=True)
 
 # ==============================
 # Main loop — bar-close polling
