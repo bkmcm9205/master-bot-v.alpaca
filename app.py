@@ -15,7 +15,7 @@ PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() != "false"  # default paper
 
 # ===== Diagnostics =====
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"               # don't POST; just log payload
-SEND_TEST_ORDER = os.getenv("SEND_TEST_ORDER", "1") == "1"  # fire one paper test order on boot
+SEND_TEST_ORDER = os.getenv("SEND_TEST_ORDER", "0") == "1"  # fire one paper test order on boot
 REPLAY_ON_START = os.getenv("REPLAY_ON_START", "0") == "1"  # run a quick historical replay then continue
 REPLAY_STRAT = os.getenv("REPLAY_STRAT", "")              # e.g. "ict_bos_fvg"
 REPLAY_SYMBOL = os.getenv("REPLAY_SYMBOL", "")            # e.g. "META"
@@ -380,7 +380,7 @@ def signal_ict_bos_fvg_ob(
     bars['bear_fvg_top'] = np.where(bear_fvg, bars['low'].shift(2), np.nan)
     bars['bear_fvg_bot'] = np.where(bear_fvg, bars['high'], np.nan)
     for col in ['bull_fvg_top','bull_fvg_bot','bear_fvg_top','bear_fvg_bot']:
-        bars[col] = bars[col].fillna(method='ffill', limit=fvg_max_age_bars)
+        bars[col] = bars[col].ffill(limit=fvg_max_age_bars)
 
     # Simple OB proxy: highest volume bar in last N
     vol_slice = bars['volume'].iloc[-ob_lookback:]
