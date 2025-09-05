@@ -18,7 +18,7 @@ if not TP_URL:
     sys.exit(1)
 
 payload = {
-    "ticker": "AAPL",
+    "ticker": "MSFT",
     "action": "buy",          # enter long
     "orderType": "market",
     "quantity": 1,            # tiny paper test
