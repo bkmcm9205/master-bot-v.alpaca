@@ -15,7 +15,7 @@ PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() != "false"  # default paper
 
 # ===== Diagnostics =====
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"               # don't POST; just log payload
-SEND_TEST_ORDER = os.getenv("SEND_TEST_ORDER", "0") == "1"  # fire one paper test order on boot
+SEND_TEST_ORDER = os.getenv("SEND_TEST_ORDER", "1") == "1"  # fire one paper test order on boot
 REPLAY_ON_START = os.getenv("REPLAY_ON_START", "0") == "1"  # run a quick historical replay then continue
 REPLAY_STRAT = os.getenv("REPLAY_STRAT", "")              # e.g. "ict_bos_fvg"
 REPLAY_SYMBOL = os.getenv("REPLAY_SYMBOL", "")            # e.g. "META"
