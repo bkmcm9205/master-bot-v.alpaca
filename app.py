@@ -664,6 +664,61 @@ def debug_snapshot_one_combo(name, sym, tf):
 
     print(f"[DEBUG] Signal -> {sig}", flush=True)
 
+def replay_signals_once():
+    """Replay a single strategy on recent history and print how many signals you'd have had."""
+    try:
+        if not REPLAY_ON_START or not (REPLAY_STRAT and REPLAY_SYMBOL):
+            print(f"[REPLAY] Skipped. REPLAY_ON_START={REPLAY_ON_START} STRAT='{REPLAY_STRAT}' SYMBOL='{REPLAY_SYMBOL}'", flush=True)
+            return
+
+        lookback = max(REPLAY_HOURS * 60, 120)  # minutes
+        print(f"[REPLAY] Starting: strat={REPLAY_STRAT} symbol={REPLAY_SYMBOL} tf={REPLAY_TF}m hours={REPLAY_HOURS}", flush=True)
+
+        df1m = fetch_polygon_1m(REPLAY_SYMBOL, lookback_minutes=lookback)
+        if df1m is None or df1m.empty:
+            print("[REPLAY] No data fetched.", flush=True)
+            return
+
+        try:
+            df1m.index = df1m.index.tz_convert("America/New_York")
+        except Exception:
+            df1m.index = df1m.index.tz_localize("UTC").tz_convert("America/New_York")
+
+        tf = REPLAY_TF
+        bars = _resample(df1m, tf)
+        if bars.empty:
+            print("[REPLAY] Resampled bars empty.", flush=True)
+            return
+
+        hits = 0
+        last_key = None
+        for i in range(len(bars)):
+            df_slice = df1m.loc[:bars.index[i]]
+
+            if REPLAY_STRAT == "poc":
+                sig = signal_poc(REPLAY_SYMBOL, df_slice, tf)
+            elif REPLAY_STRAT == "ict_bos_fvg":
+                sig = signal_ict_bos_fvg(REPLAY_SYMBOL, df_slice, tf)
+            elif REPLAY_STRAT == "ict_bos_fvg_ob":
+                sig = signal_ict_bos_fvg_ob(REPLAY_SYMBOL, df_slice, tf)
+            elif REPLAY_STRAT == "poc_pinescript":
+                sig = signal_poc_pinescript(REPLAY_SYMBOL, df_slice, tf)
+            else:
+                print(f"[REPLAY] Unknown strategy '{REPLAY_STRAT}'", flush=True)
+                return
+
+            if sig:
+                k = (sig.get("barTime",""), sig.get("action",""))
+                if k != last_key:
+                    hits += 1
+                    last_key = k
+
+        print(f"[REPLAY] {REPLAY_STRAT} {REPLAY_SYMBOL} {tf}m -> {hits} signal(s) in last {REPLAY_HOURS}h.", flush=True)
+
+    except Exception as e:
+        import traceback
+        print("[REPLAY ERROR]", e, traceback.format_exc(), flush=True)
+
 # ==============================
 # Main loop — bar-close polling
 # ==============================
@@ -673,9 +728,11 @@ def main():
     # ---- startup diagnostics (runs once) ----
     try:
         send_startup_test_order()
+        print("[STARTUP] Calling replay_signals_once()…", flush=True)
+        replay_signals_once()
     except Exception as e:
         import traceback
-        print("[STARTUP ERROR]", e, traceback.format_exc(), flush=True)
+        print("[STARTUP DIAGS ERROR]", e, traceback.format_exc(), flush=True)
 
     # ---- main loop ----
     while True:
