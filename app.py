@@ -627,6 +627,43 @@ def replay_signals_once():
 
     print(f"[REPLAY] {REPLAY_STRAT} {REPLAY_SYMBOL} {tf}m -> {hits} signal(s) in last {REPLAY_HOURS}h.", flush=True)
 
+def debug_snapshot_one_combo(name, sym, tf):
+    target = f"{name},{sym},{tf}"
+    if DEBUG_COMBO != target:
+        return
+
+    df1m = fetch_polygon_1m(sym, lookback_minutes=600)
+    if df1m is None or df1m.empty:
+        print(f"[DEBUG] No data for {target}", flush=True)
+        return
+
+    try:
+        df1m.index = df1m.index.tz_convert("America/New_York")
+    except Exception:
+        df1m.index = df1m.index.tz_localize("UTC").tz_convert("America/New_York")
+
+    bars = _resample(df1m, tf)
+    if bars.empty:
+        print(f"[DEBUG] No bars after resample for {target}", flush=True)
+        return
+
+    row = bars.iloc[-1]; ts = bars.index[-1]
+    print(f"[DEBUG] Latest {target} bar={ts} O={row['open']} H={row['high']} L={row['low']} C={row['close']} V={row['volume']}", flush=True)
+
+    # Compute a signal on the full slice (bar-close behavior)
+    if name == "poc":
+        sig = signal_poc(sym, df1m, tf)
+    elif name == "ict_bos_fvg":
+        sig = signal_ict_bos_fvg(sym, df1m, tf)
+    elif name == "ict_bos_fvg_ob":
+        sig = signal_ict_bos_fvg_ob(sym, df1m, tf)
+    elif name == "poc_pinescript":
+        sig = signal_poc_pinescript(sym, df1m, tf)
+    else:
+        sig = None
+
+    print(f"[DEBUG] Signal -> {sig}", flush=True)
+
 # ==============================
 # Main loop — bar-close polling
 # ==============================
