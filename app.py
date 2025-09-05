@@ -1,93 +1,567 @@
-# app.py  — live loop for paper trading via TradersPost
-import os, time, json, hashlib, requests
-from datetime import datetime, timezone
+# app.py — paper/live trading loop for your allow-listed (strategy, symbol, timeframe) combos
+# Uses TradersPost webhook + Polygon 1m data (swap fetcher if you prefer your DB).
 
-TP_URL = os.getenv("TP_WEBHOOK_URL")
-PAPER_MODE = True
-POLL_SECONDS = 10  # how often to check signals
+import os, time, json, hashlib, requests, math
+import pandas as pd, numpy as np
+from datetime import datetime, timezone, timedelta
 
-# ====== YOUR TOP COMBOS ======
+# ==============================
+# ENV / CONFIG
+# ==============================
+TP_URL = os.getenv("TP_WEBHOOK_URL")            # TradersPost Strategy Webhook URL (Paper)
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")  # If you keep using Polygon here
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
+PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() != "false"  # default paper
+
+# ---- Global position sizing (bit-for-bit with your Colab) ----
+EQUITY_USD  = float(os.getenv("EQUITY_USD",  "100000"))  # $100k
+RISK_PCT    = float(os.getenv("RISK_PCT",    "0.01"))    # 1% as 0.01 (same as your notebook)
+MAX_POS_PCT = float(os.getenv("MAX_POS_PCT", "0.10"))    # 10% max notional per position
+MIN_QTY     = int(os.getenv("MIN_QTY", "1"))
+ROUND_LOT   = int(os.getenv("ROUND_LOT","1"))
+
+def _position_qty(entry_price: float, stop_price: float,
+                  equity=EQUITY_USD, risk_pct=RISK_PCT, max_pos_pct=MAX_POS_PCT,
+                  min_qty=MIN_QTY, round_lot=ROUND_LOT) -> int:
+    if entry_price is None or stop_price is None:
+        return 0
+    risk_per_share = abs(entry_price - stop_price)
+    if risk_per_share <= 0:
+        return 0
+    qty_risk     = (equity * risk_pct) / risk_per_share
+    qty_notional = (equity * max_pos_pct) / max(1e-9, entry_price)
+    qty = math.floor(max(min(qty_risk, qty_notional), 0) / max(1, round_lot)) * max(1, round_lot)
+    return int(max(qty, min_qty if qty > 0 else 0))
+
+# ==============================
+# Allow-list (your 15 combos) — NO quantity here
+# ==============================
+# (strategy_name, symbol, timeframe_minutes)
 COMBOS = [
-    # (strategy_name, symbol, timeframe_minutes, quantity)
-    ("liquidity_sweep", "AAPL", 3, 50),
-    # add the rest of your winners…
+    ("ict_bos_fvg_ob", "META", 3),
+    ("ict_bos_fvg",    "IONQ", 1),
+    ("ict_bos_fvg",    "AVGO", 2),
+    ("ict_bos_fvg",    "MU",   2),
+    ("ict_bos_fvg_ob", "META", 5),
+    ("ict_bos_fvg",    "QQQ",  2),
+    ("poc_pinescript", "CAN",  3),
+    ("poc_pinescript", "WOLF", 3),
+    ("ict_bos_fvg_ob", "QQQ",  1),
+    ("ict_bos_fvg",    "SPY",  1),
+    ("poc",            "AVGO", 1),
+    ("ict_bos_fvg",    "META", 2),
+    ("ict_bos_fvg",    "GOOGL",1),
+    ("ict_bos_fvg",    "AVGO", 15),
+    ("ict_bos_fvg",    "WOLF", 3),
 ]
 
-# ====== SIGNAL LOGIC: RETURN dict OR None ======
-# Fill this in to call your real strategy functions
-def compute_signal(strategy_name, symbol, tf_minutes):
-    """
-    Return a dict like:
-      {
-        "action": "buy"|"sell"|"exit"|"add",
-        "orderType": "market"|"limit"|"stop",
-        "price": None or float,
-        "takeProfit": None or float,
-        "stopLoss": None or float,
-        "clientTag": "optional-string",
-        "barTime": "2025-09-05T13:59:00Z"  # optional, for dedupe
-      }
-    or return None if no signal right now.
-    """
-    # TODO: call your strategy code here and build the dict above.
-    return None
+# ==============================
+# Utilities
+# ==============================
+_sent = set()  # dedupe: (strategy, symbol, tf, action, barTime)
 
-# ====== SENDER + DEDUPE ======
-_seen = set()
-
-def _dedupe_key(payload: dict) -> str:
-    # include barTime/clientTag if you set them to ensure once-per-bar
-    raw = json.dumps(payload, sort_keys=True)
+def _dedupe_key(strategy: str, symbol: str, tf: int, action: str, bar_time: str) -> str:
+    raw = f"{strategy}|{symbol}|{tf}|{action}|{bar_time}"
     return hashlib.sha256(raw.encode()).hexdigest()
 
-def build_payload(symbol: str, qty: int, sig: dict):
+def send_to_traderspost(payload: dict):
+    if not TP_URL:
+        raise RuntimeError("TP_WEBHOOK_URL is not set in environment.")
+    payload.setdefault("meta", {})
+    payload["meta"]["environment"] = "paper" if PAPER_MODE else "live"
+    payload["meta"]["sentAt"] = datetime.now(timezone.utc).isoformat()
+
+    r = requests.post(TP_URL, json=payload, timeout=12)
+    ok = 200 <= r.status_code < 300
+    return ok, f"{r.status_code} {r.text[:300]}"
+
+def build_payload(symbol: str, sig: dict):
     p = {
         "ticker": symbol,
-        "action": sig["action"],
+        "action": sig["action"],                          # 'buy' | 'sell' | 'exit' | 'add'
         "orderType": sig.get("orderType", "market"),
-        "quantity": qty,
-        "meta": {
-            "environment": "paper" if PAPER_MODE else "live",
-            "sentAt": datetime.now(timezone.utc).isoformat()
-        }
+        "quantity": int(sig["quantity"]),                 # sized by your wrapper
     }
     if sig.get("price") is not None:      p["price"] = float(sig["price"])
     if sig.get("takeProfit") is not None: p["takeProfit"] = float(sig["takeProfit"])
     if sig.get("stopLoss") is not None:   p["stopLoss"] = float(sig["stopLoss"])
-    if sig.get("clientTag"):              p["clientTag"] = sig["clientTag"]
-    if sig.get("timeInForce"):            p["timeInForce"] = sig["timeInForce"]
     return p
 
-def send(payload: dict):
-    if not TP_URL:
-        raise RuntimeError("TP_WEBHOOK_URL is not set in Render → Environment.")
+# ==============================
+# Data fetch — Polygon 1m (replace with your DB if you like)
+# ==============================
+def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2_400) -> pd.DataFrame:
+    """Fetch recent 1m bars; returns tz-aware America/New_York index with o/h/l/c/volume."""
+    if not POLYGON_API_KEY:
+        return pd.DataFrame()
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(minutes=lookback_minutes)
+    url = (
+        f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/"
+        f"{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
+        f"?adjusted=true&sort=asc&limit=50000&apiKey={POLYGON_API_KEY}"
+    )
+    r = requests.get(url, timeout=15)
+    if r.status_code != 200:
+        return pd.DataFrame()
+    rows = r.json().get("results", [])
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["ts"] = pd.to_datetime(df["t"], unit="ms", utc=True)
+    df = df.set_index("ts").sort_index()
+    df.index = df.index.tz_convert("America/New_York")
+    df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
+    return df[["open","high","low","close","volume"]]
 
-    key = _dedupe_key(payload)
-    if key in _seen:
-        return False, "duplicate"
+# ==============================
+# Shared helpers
+# ==============================
+def _is_rth(ts):
+    h, m = ts.hour, ts.minute
+    return ((h > 9) or (h == 9 and m >= 30)) and (h < 16)
 
-    r = requests.post(TP_URL, json=payload, timeout=10)
-    ok = 200 <= r.status_code < 300
-    if ok: _seen.add(key)
-    return ok, f"{r.status_code} {r.text[:200]}"
+def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
+    rule = f"{int(tf_min)}min"
+    agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
+    return df1m.resample(rule, origin="start_day", label="right").agg(agg).dropna()
 
-# ====== MAIN LOOP ======
+# ==============================
+# Signal adapters (return dict with quantity)
+# ==============================
+
+def signal_poc(
+    symbol: str,
+    df1m: pd.DataFrame,
+    tf_min: int = 5,
+    poc_bin: float = 0.05,
+    retest_tol: float = 0.5,
+    r_multiple: float = 2.0,
+    stop_buf: float = 0.3,
+    ema_fast: int = 8,
+    ema_slow: int = 21,
+    am_window=((9, 30), (11, 0)),
+    pm_window=((15, 0), (16, 0)),
+    trade_am: bool = True,
+    trade_pm: bool = True,
+):
+    if df1m is None or df1m.empty:
+        return None
+
+    bars = _resample(df1m, tf_min)
+    if bars.empty or len(bars) < max(ema_fast, ema_slow) + 5:
+        return None
+
+    # prev-day POC (volume bins)
+    df1m_et = df1m.copy()
+    df1m_et["date_et"] = df1m_et.index.date
+    poc_by_date = {}
+    for date, day_df in df1m_et.groupby("date_et", sort=True):
+        rth = day_df[day_df.index.map(_is_rth)]
+        if rth.empty:
+            continue
+        prices = rth["close"].to_numpy()
+        vols   = rth["volume"].to_numpy()
+        bins = np.floor(prices / poc_bin) * poc_bin
+        vol_by_bin = {}
+        for b, v in zip(bins, vols):
+            vol_by_bin[b] = vol_by_bin.get(b, 0.0) + float(v)
+        if vol_by_bin:
+            poc_by_date[date] = float(max(vol_by_bin.items(), key=lambda kv: kv[1])[0])
+
+    dates = sorted(poc_by_date.keys())
+    if len(dates) < 2:
+        return None
+    prev_poc_map = {dates[i]: poc_by_date[dates[i - 1]] for i in range(1, len(dates))}
+    bars = bars.copy()
+    bars["date_et"] = bars.index.date
+    bars["prevPOC"] = bars["date_et"].map(prev_poc_map)
+
+    # EMAs
+    emaF = bars["close"].ewm(span=ema_fast, adjust=False).mean()
+    emaS = bars["close"].ewm(span=ema_slow, adjust=False).mean()
+    up = (emaF > emaS).fillna(False)
+    dn = (emaF < emaS).fillna(False)
+
+    # session guard
+    (am_sH, am_sM), (am_eH, am_eM) = am_window
+    (pm_sH, pm_sM), (pm_eH, pm_eM) = pm_window
+    def in_session(ts):
+        hh, mm = ts.hour, ts.minute
+        in_am = trade_am and ((hh > am_sH or (hh == am_sH and mm >= am_sM)) and (hh < am_eH or (hh == am_eH and mm <= am_eM)))
+        in_pm = trade_pm and ((hh > pm_sH or (hh == pm_sH and mm >= pm_sM)) and (hh < pm_eH or (hh == pm_eH and mm <= pm_eM)))
+        return in_am or in_pm
+
+    ts = bars.index[-1]
+    if not in_session(ts):
+        return None
+
+    row = bars.iloc[-1]
+    poc = row["prevPOC"]
+    if pd.isna(poc):
+        return None
+
+    near_long  = (row["low"]  <= poc + retest_tol) and (row["close"] >  poc)
+    near_short = (row["high"] >= poc - retest_tol) and (row["close"] <  poc)
+    long_trend  = bool(up.iloc[-1])
+    short_trend = bool(dn.iloc[-1])
+
+    if long_trend and near_long:
+        entry = float(row["close"])
+        sl    = float(poc - stop_buf)
+        tp    = float(entry + r_multiple * max(entry - sl, 0.1))
+        qty   = _position_qty(entry, sl)
+        return {"action":"buy","orderType":"market","price":None,
+                "takeProfit":tp,"stopLoss":sl,"barTime":ts.tz_convert("UTC").isoformat(),
+                "quantity":int(qty)}
+
+    if short_trend and near_short:
+        entry = float(row["close"])
+        sl    = float(poc + stop_buf)
+        tp    = float(entry - r_multiple * max(sl - entry, 0.1))
+        qty   = _position_qty(entry, sl)
+        return {"action":"sell","orderType":"market","price":None,
+                "takeProfit":tp,"stopLoss":sl,"barTime":ts.tz_convert("UTC").isoformat(),
+                "quantity":int(qty)}
+
+    return None
+
+
+def signal_ict_bos_fvg(
+    symbol: str,
+    df1m: pd.DataFrame,
+    tf_min: int = 5,
+    bos_lookback: int = 5,
+    min_fvg_size: float = 0.05,
+    fvg_validity_bars: int = 50,
+    entry_buffer: float = 0.02,
+    r_multiple: float = 2.0,
+    atr_period: int = 14,
+    atr_stop_multiplier: float = 2.0,
+    am_window=((9,30),(11,0)),
+    pm_window=((15,0),(16,0)),
+    trade_am=True,
+    trade_pm=True,
+):
+    if df1m is None or df1m.empty:
+        return None
+    bars = _resample(df1m, tf_min)
+    if len(bars) < max(atr_period, bos_lookback) + 10:
+        return None
+
+    # ATR
+    hl = bars["high"] - bars["low"]
+    hc = (bars["high"] - bars["close"].shift(1)).abs()
+    lc = (bars["low"] - bars["close"].shift(1)).abs()
+    atr = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(atr_period).mean()
+
+    # BOS
+    bos_bull = pd.Series(False, index=bars.index)
+    bos_bear = pd.Series(False, index=bars.index)
+    for i in range(bos_lookback, len(bars)):
+        prev_high = bars.iloc[i-bos_lookback:i]["high"].max()
+        prev_low  = bars.iloc[i-bos_lookback:i]["low"].min()
+        if bars.iloc[i]["high"] > prev_high: bos_bull.iloc[i] = True
+        if bars.iloc[i]["low"]  < prev_low:  bos_bear.iloc[i] = True
+
+    # FVGs
+    bull_top = pd.Series(np.nan, index=bars.index); bull_bot = pd.Series(np.nan, index=bars.index)
+    bear_top = pd.Series(np.nan, index=bars.index); bear_bot = pd.Series(np.nan, index=bars.index)
+    for i in range(2, len(bars)):
+        gap_bottom = bars.iloc[i-2]["high"]; gap_top = bars.iloc[i]["low"]
+        if gap_top > gap_bottom + min_fvg_size:
+            bull_bot.iloc[i] = gap_bottom; bull_top.iloc[i] = gap_top
+        gap_top2 = bars.iloc[i-2]["low"]; gap_bot2 = bars.iloc[i]["high"]
+        if gap_top2 > gap_bot2 + min_fvg_size:
+            bear_top.iloc[i] = gap_top2; bear_bot.iloc[i] = gap_bot2
+
+    # Active FVG windows
+    def _active(top, bot, validity):
+        a_top = pd.Series(np.nan, index=bars.index); a_bot = pd.Series(np.nan, index=bars.index)
+        cur_t = np.nan; cur_b = np.nan; age=0
+        for i in range(len(bars)):
+            if not np.isnan(top.iloc[i]): cur_t,cur_b,age = top.iloc[i], bot.iloc[i], 0
+            else:
+                age += 1
+                if age > validity: cur_t,cur_b = np.nan, np.nan
+            a_top.iloc[i]=cur_t; a_bot.iloc[i]=cur_b
+        return a_top, a_bot
+
+    a_bull_top, a_bull_bot = _active(bull_top, bull_bot, fvg_validity_bars)
+    a_bear_top, a_bear_bot = _active(bear_top, bear_bot, fvg_validity_bars)
+
+    # session guard
+    (am_sH, am_sM), (am_eH, am_eM) = am_window
+    (pm_sH, pm_sM), (pm_eH, pm_eM) = pm_window
+    def in_session(ts):
+        hh, mm = ts.hour, ts.minute
+        in_am = trade_am and ((hh > am_sH or (hh == am_sH and mm >= am_sM)) and (hh < am_eH or (hh == am_eH and mm <= am_eM)))
+        in_pm = trade_pm and ((hh > pm_sH or (hh == pm_sH and mm >= pm_sM)) and (hh < pm_eH or (hh == pm_eH and mm <= pm_eM)))
+        return in_am or in_pm
+
+    ts = bars.index[-1]
+    if not in_session(ts): return None
+    row = bars.iloc[-1]
+    atr_now = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else 1.0
+
+    # Long
+    if bool(bos_bull.iloc[-1]) and not np.isnan(a_bull_top.iloc[-1]) and not np.isnan(a_bull_bot.iloc[-1]):
+        top_, bot_ = float(a_bull_top.iloc[-1]), float(a_bull_bot.iloc[-1])
+        if (row["low"] <= top_ + entry_buffer) and (row["high"] >= bot_ - entry_buffer):
+            entry = float(row["close"])
+            sl    = bot_ - atr_now * atr_stop_multiplier
+            tp    = entry + r_multiple * abs(entry - sl)
+            qty   = _position_qty(entry, sl)
+            return {"action":"buy","orderType":"market","price":None,
+                    "takeProfit":tp,"stopLoss":sl,"barTime":ts.tz_convert("UTC").isoformat(),
+                    "quantity":int(qty)}
+
+    # Short
+    if bool(bos_bear.iloc[-1]) and not np.isnan(a_bear_top.iloc[-1]) and not np.isnan(a_bear_bot.iloc[-1]):
+        top_, bot_ = float(a_bear_top.iloc[-1]), float(a_bear_bot.iloc[-1])
+        if (row["high"] >= bot_ - entry_buffer) and (row["low"] <= top_ + entry_buffer):
+            entry = float(row["close"])
+            sl    = top_ + atr_now * atr_stop_multiplier
+            tp    = entry - r_multiple * abs(sl - entry)
+            qty   = _position_qty(entry, sl)
+            return {"action":"sell","orderType":"market","price":None,
+                    "takeProfit":tp,"stopLoss":sl,"barTime":ts.tz_convert("UTC").isoformat(),
+                    "quantity":int(qty)}
+
+    return None
+
+
+def signal_ict_bos_fvg_ob(
+    symbol: str,
+    df1m: pd.DataFrame,
+    tf_min: int = 5,
+    swing_length: int = 5,
+    fvg_min_gap: float = 0.02,
+    fvg_max_age_bars: int = 20,
+    ob_lookback: int = 10,
+    r_multiple: float = 2.0,
+    atr_period: int = 14,
+    min_stop_distance: float = 0.5,
+    max_stop_distance: float = 2.0,
+    am_window=((9,30),(11,0)),
+    pm_window=((15,0),(16,0)),
+    trade_am=True,
+    trade_pm=True,
+):
+    if df1m is None or df1m.empty:
+        return None
+    bars = _resample(df1m, tf_min)
+    if len(bars) < max(atr_period, swing_length*2+1) + 10:
+        return None
+
+    # ATR (for context)
+    hl = bars['high'] - bars['low']
+    hc = (bars['high'] - bars['close'].shift(1)).abs()
+    lc = (bars['low'] - bars['close'].shift(1)).abs()
+    atr = pd.concat([hl, hc, lc], axis=1).max(axis=1).rolling(atr_period).mean()
+
+    # FVG flags & zones (forward-fill with age limit)
+    bull_fvg = (bars['low'] > bars['high'].shift(2) + fvg_min_gap)
+    bear_fvg = (bars['high'] < bars['low'].shift(2) - fvg_min_gap)
+    bars['bull_fvg_top'] = np.where(bull_fvg, bars['low'], np.nan)
+    bars['bull_fvg_bot'] = np.where(bull_fvg, bars['high'].shift(2), np.nan)
+    bars['bear_fvg_top'] = np.where(bear_fvg, bars['low'].shift(2), np.nan)
+    bars['bear_fvg_bot'] = np.where(bear_fvg, bars['high'], np.nan)
+    for col in ['bull_fvg_top','bull_fvg_bot','bear_fvg_top','bear_fvg_bot']:
+        bars[col] = bars[col].fillna(method='ffill', limit=fvg_max_age_bars)
+
+    # Simple OB proxy: highest volume bar in last N
+    vol_slice = bars['volume'].iloc[-ob_lookback:]
+    if vol_slice.empty: return None
+    ob_idx = vol_slice.idxmax(); ob_bar = bars.loc[ob_idx]
+    bull_ob_high = float(ob_bar['high']); bull_ob_low = float(ob_bar['low'])
+    bear_ob_high = bull_ob_high;          bear_ob_low = bull_ob_low
+
+    # session guard
+    (am_sH, am_sM), (am_eH, am_eM) = am_window
+    (pm_sH, pm_sM), (pm_eH, pm_eM) = pm_window
+    def in_session(ts):
+        hh, mm = ts.hour, ts.minute
+        in_am = trade_am and ((hh > am_sH or (hh == am_sH and mm >= am_sM)) and (hh < am_eH or (hh == am_eH and mm <= am_eM)))
+        in_pm = trade_pm and ((hh > pm_sH or (hh == pm_sH and mm >= pm_sM)) and (hh < pm_eH or (hh == pm_eH and mm <= pm_eM)))
+        return in_am or in_pm
+
+    ts = bars.index[-1]
+    if not in_session(ts): return None
+    row = bars.iloc[-1]
+
+    # recent BOS (tight)
+    i = len(bars)-1
+    prev_high = bars.iloc[max(0,i-20):i]["high"].max()
+    prev_low  = bars.iloc[max(0,i-20):i]["low"].min()
+    bos_bull = row['high'] > prev_high + 0.1
+    bos_bear = row['low']  < prev_low  - 0.1
+
+    # Long: inside bull FVG AND within OB range
+    in_bull_fvg = (row.get('bull_fvg_top',np.nan) <= row['low']) and (row.get('bull_fvg_bot',np.nan) >= row['high'])
+    in_bull_ob  = (row['low'] <= bull_ob_high) and (row['high'] >= bull_ob_low)
+    if bos_bull and not np.isnan(row.get('bull_fvg_top',np.nan)) and not np.isnan(row.get('bull_fvg_bot',np.nan)) and in_bull_fvg and in_bull_ob:
+        entry = float(row['close'])
+        atr_now = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else 1.0
+        # clamp stop distance
+        raw_stop = bull_ob_low - max(0.5, atr_now*0.5)
+        dist = max(min_stop_distance, min(abs(entry - raw_stop), max_stop_distance))
+        sl = entry - dist
+        tp = entry + r_multiple * dist
+        qty = _position_qty(entry, sl)
+        return {"action":"buy","orderType":"market","price":None,
+                "takeProfit":tp,"stopLoss":sl,"barTime":ts.tz_convert("UTC").isoformat(),
+                "quantity":int(qty)}
+
+    # Short: inside bear FVG AND within OB range
+    in_bear_fvg = (row.get('bear_fvg_top',np.nan) >= row['low']) and (row.get('bear_fvg_bot',np.nan) <= row['high'])
+    in_bear_ob  = (row['low'] <= bear_ob_high) and (row['high'] >= bear_ob_low)
+    if bos_bear and not np.isnan(row.get('bear_fvg_top',np.nan)) and not np.isnan(row.get('bear_fvg_bot',np.nan)) and in_bear_fvg and in_bear_ob:
+        entry = float(row['close'])
+        atr_now = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else 1.0
+        raw_stop = bear_ob_high + max(0.5, atr_now*0.5)
+        dist = max(min_stop_distance, min(abs(raw_stop - entry), max_stop_distance))
+        sl = entry + dist
+        tp = entry - r_multiple * dist
+        qty = _position_qty(entry, sl)
+        return {"action":"sell","orderType":"market","price":None,
+                "takeProfit":tp,"stopLoss":sl,"barTime":ts.tz_convert("UTC").isoformat(),
+                "quantity":int(qty)}
+
+    return None
+
+
+def signal_poc_pinescript(
+    symbol: str,
+    df1m: pd.DataFrame,
+    tf_min: int = 5,
+    tp_pct: float = 0.010,
+    sl_pct: float = 0.005,
+    poc_bin: float = 0.05,
+    use_vwap_poc: bool = True,
+    am_window=((9,30),(11,0)),
+    pm_window=((15,0),(16,0)),
+    trade_am=True,
+    trade_pm=True,
+):
+    if df1m is None or df1m.empty:
+        return None
+    bars = _resample(df1m, tf_min)
+    if len(bars) < 3: return None
+
+    # prev-day POC (VWAP or profile)
+    df_grouped = df1m.groupby(df1m.index.date)
+    prev_poc_by_date = {}
+    for date, day_df in df_grouped:
+        rth = day_df[day_df.index.map(_is_rth)]
+        if rth.empty:
+            prev_poc_by_date[date] = math.nan
+            continue
+        if use_vwap_poc:
+            typical = (rth["high"]+rth["low"]+rth["close"])/3.0
+            vol = rth["volume"]
+            poc = (typical*vol).sum()/vol.sum() if vol.sum()>0 else math.nan
+        else:
+            prices = rth["close"].to_numpy(); vols = rth["volume"].to_numpy()
+            bins = np.floor(prices/poc_bin)*poc_bin
+            vol_by_bin = {}
+            for b,v in zip(bins,vols):
+                vol_by_bin[b]=vol_by_bin.get(b,0.0)+float(v)
+            poc = max(vol_by_bin.items(), key=lambda kv: kv[1])[0] if vol_by_bin else math.nan
+        prev_poc_by_date[date]=poc
+
+    dates = sorted(prev_poc_by_date.keys())
+    if len(dates) < 2: return None
+    prev_for_today = {dates[i]:prev_poc_by_date[dates[i-1]] for i in range(1,len(dates))}
+    bars = bars.copy(); bars["date_et"]=bars.index.date; bars["prevPOC"]=bars["date_et"].map(prev_for_today)
+
+    # session guard
+    (am_sH, am_sM), (am_eH, am_eM) = am_window
+    (pm_sH, pm_sM), (pm_eH, pm_eM) = pm_window
+    def in_session(ts):
+        hh, mm = ts.hour, ts.minute
+        in_am = trade_am and ((hh > am_sH or (hh == am_sH and mm >= am_sM)) and (hh < am_eH or (hh == am_eH and mm <= am_eM)))
+        in_pm = trade_pm and ((hh > pm_sH or (hh == pm_sH and mm >= pm_sM)) and (hh < pm_eH or (hh == pm_eH and mm <= pm_eM)))
+        return in_am or in_pm
+
+    i = len(bars)-1; ts = bars.index[i]
+    if not in_session(ts): return None
+
+    price = float(bars.iloc[i]["close"])
+    prev_close = float(bars.iloc[i-1]["close"]) if i>0 else math.nan
+    poc = bars.iloc[i]["prevPOC"]
+    if pd.isna(poc) or math.isnan(prev_close):
+        return None
+
+    cross_up   = (prev_close < poc) and (price >= poc)
+    cross_down = (prev_close > poc) and (price <= poc)
+
+    if cross_up:
+        tp = price * (1.0 + tp_pct)
+        sl = price * (1.0 - sl_pct)
+        qty = _position_qty(price, sl)
+        return {"action":"buy","orderType":"market","price":None,
+                "takeProfit":tp,"stopLoss":sl,"barTime":ts.tz_convert("UTC").isoformat(),
+                "quantity":int(qty)}
+
+    if cross_down:
+        tp = price * (1.0 - tp_pct)
+        sl = price * (1.0 + sl_pct)
+        qty = _position_qty(price, sl)
+        return {"action":"sell","orderType":"market","price":None,
+                "takeProfit":tp,"stopLoss":sl,"barTime":ts.tz_convert("UTC").isoformat(),
+                "quantity":int(qty)}
+
+    return None
+
+# ==============================
+# Router
+# ==============================
+def compute_signal(strategy_name, symbol, tf_minutes):
+    df1m = fetch_polygon_1m(symbol, lookback_minutes=2400)  # ~40 hours
+    if df1m is None or df1m.empty:
+        return None
+
+    # ensure tz is ET
+    try:
+        df1m.index = df1m.index.tz_convert("America/New_York")
+    except Exception:
+        df1m.index = df1m.index.tz_localize("UTC").tz_convert("America/New_York")
+
+    if strategy_name == "poc":             return signal_poc(symbol, df1m, tf_minutes)
+    if strategy_name == "ict_bos_fvg":     return signal_ict_bos_fvg(symbol, df1m, tf_minutes)
+    if strategy_name == "ict_bos_fvg_ob":  return signal_ict_bos_fvg_ob(symbol, df1m, tf_minutes)
+    if strategy_name == "poc_pinescript":  return signal_poc_pinescript(symbol, df1m, tf_minutes)
+    return None
+
+# ==============================
+# Main loop — bar-close polling
+# ==============================
 def main():
     print("Bot starting…", flush=True)
     while True:
         loop_start = time.time()
-        print("Bot loop tick…", flush=True)
+        print("Tick…", flush=True)
 
-        for (name, sym, tf, qty) in COMBOS:
+        for (name, sym, tf) in COMBOS:
             sig = compute_signal(name, sym, tf)
-            if not sig: 
+            if not sig:
                 continue
-            payload = build_payload(sym, qty, sig)
-            ok, info = send(payload)
-            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{stamp}] {name} {sym} {tf}m -> {sig['action']} | {info}", flush=True)
 
-        time.sleep(max(1, POLL_SECONDS - int(time.time() - loop_start)))
+            # per-bar dedupe
+            k = _dedupe_key(name, sym, tf, sig["action"], sig.get("barTime",""))
+            if k in _sent:
+                continue
+            _sent.add(k)
+
+            payload = build_payload(sym, sig)
+            ok, info = send_to_traderspost(payload)
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{stamp}] {name} {sym} {tf}m -> {sig['action']} qty={sig['quantity']} | {info}", flush=True)
+
+        # sleep remaining time in poll interval
+        elapsed = time.time() - loop_start
+        time.sleep(max(1, POLL_SECONDS - int(elapsed)))
 
 if __name__ == "__main__":
     main()
