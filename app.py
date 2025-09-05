@@ -17,26 +17,24 @@ COMBOS = [
 ]
 
 # ========= 2) YOUR SIGNAL LOGIC =========
+# --- TEMP TEST: send one buy once, then never again ---
+_test_sent = False
+
 def compute_signal(strategy_name, symbol, tf_minutes):
-    """
-    Return a dict when a signal appears, or None.
-    Expected keys:
-      action: 'buy' | 'add' | 'sell' | 'exit'
-      orderType: 'market' | 'limit' | 'stop' (start with 'market' if unsure)
-      price: optional float for limit/stop entries
-      takeProfit: optional float (TP level)
-      stopLoss: optional float (SL level)
-    Replace this stub with YOUR real logic. For now, it does nothing.
-    """
-    # TODO: hook into your actual strategy functions here.
-    # Example shape:
-    # return {
-    #   "action": "buy",
-    #   "orderType": "market",
-    #   "price": None,
-    #   "takeProfit": 123.45,
-    #   "stopLoss": 117.80
-    # }
+    global _test_sent
+    if _test_sent:
+        return None  # no more signals after the first test
+
+    # fire exactly once to verify end-to-end (adjust symbol/qty as you like)
+    if strategy_name == "liquidity_sweep" and symbol == "AAPL":
+        _test_sent = True
+        return {
+            "action": "buy",
+            "orderType": "market",
+            "price": None,
+            "takeProfit": None,  # you can put a number here to test TP
+            "stopLoss":  None    # or here to test SL
+        }
     return None
 
 # ========= 3) SENDING HELPERS =========
