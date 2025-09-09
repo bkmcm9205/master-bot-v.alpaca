@@ -13,6 +13,8 @@ POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")  # If you keep using Polygon here
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() != "false"  # default paper
 STARTUP_TPSL_TEST = os.getenv("STARTUP_TPSL_TEST", "0").lower()  # "1"/"true"/"yes" to run test on boot
+POLY_LIVE_TEST = os.getenv("POLY_LIVE_TEST", "0").lower()   # "1"/"true"/"yes" to run freshness check
+POLY_TEST_SYMBOL = os.getenv("POLY_TEST_SYMBOL", "SPY")     # symbol to test freshness on
 
 # ===== Diagnostics =====
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"               # don't POST; just log payload
@@ -731,11 +733,48 @@ def replay_signals_once():
         import traceback
         print("[REPLAY ERROR]", e, traceback.format_exc(), flush=True)
 
+from datetime import datetime, timezone, timedelta
+
+def _print_polygon_freshness():
+    try:
+        # Use your unified fetch if you have it; otherwise call your polygon 1m fetcher directly.
+        fetch_fn = globals().get("fetch_bars_1m") or globals().get("fetch_polygon_1m")
+        if not fetch_fn:
+            print("[FRESHNESS] No fetch function found (fetch_bars_1m/fetch_polygon_1m).", flush=True)
+            return
+
+        df = fetch_fn(POLY_TEST_SYMBOL, lookback_minutes=30)
+        if df is None or df.empty:
+            print(f"[FRESHNESS] No bars for {POLY_TEST_SYMBOL}.", flush=True)
+            return
+
+        last_ts = df.index[-1]                   # tz-aware ET
+        now_utc = datetime.now(timezone.utc)
+        now_et  = now_utc.astimezone(last_ts.tzinfo)
+        age = (now_et - last_ts)
+        age_sec = int(age.total_seconds())
+
+        print(f"[FRESHNESS] {POLY_TEST_SYMBOL} last bar={last_ts.isoformat()}  now={now_et.isoformat()}  age={age_sec}s", flush=True)
+
+        # Quick interpretation to make it obvious in logs:
+        if age <= timedelta(minutes=1, seconds=30):
+            print("[FRESHNESS] ✅ Looks REAL-TIME (≤ ~90s old).", flush=True)
+        elif age <= timedelta(minutes=16):
+            print("[FRESHNESS] ⚠️ Looks like ~15-minute delay.", flush=True)
+        else:
+            print("[FRESHNESS] ⏸ Market likely closed or no recent bars.", flush=True)
+    except Exception as e:
+        print(f"[FRESHNESS] Error: {e}", flush=True)
+
 # ==============================
 # Main loop — bar-close polling
 # ==============================
 def main():
     print("Bot starting…", flush=True)
+
+    if POLY_LIVE_TEST in ("1", "true", "yes"):
+        _print_polygon_freshness()
+
 
       # --- TEMP: send a one-time TP/SL test order on startup ---
     if STARTUP_TPSL_TEST in ("1", "true", "yes"):
