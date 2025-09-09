@@ -131,17 +131,17 @@ def build_payload(symbol: str, sig: dict):
         "meta": sig.get("meta", {})
     }
 
-  if "meta" not in payload:
-      payload["meta"] = {}
+    if "meta" not in payload:
+        payload["meta"] = {}
 
     payload["meta"].update({
-      "runId": RUN_ID,
-      "sentAt": datetime.now(timezone.utc).isoformat()
+        "runId": RUN_ID,
+        "sentAt": datetime.now(timezone.utc).isoformat()
     })
 
-  combo = (sig.get("meta") or {}).get("combo")
-  if combo:
-      payload["meta"]["combo"] = combo  # e.g., "poc|AAPL|5"
+    combo = (sig.get("meta") or {}).get("combo")
+    if combo:
+        payload["meta"]["combo"] = combo  # e.g., "poc|AAPL|5"
 
     tp_abs = sig.get("tp_abs")
     sl_abs = sig.get("sl_abs")
