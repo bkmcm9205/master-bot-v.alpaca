@@ -4,6 +4,7 @@
 import os, time, json, hashlib, requests, math
 import pandas as pd, numpy as np
 from datetime import datetime, timezone, timedelta
+from collections import defaultdict
 
 # ==============================
 # ENV / CONFIG
@@ -15,6 +16,11 @@ PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() != "false"  # default paper
 STARTUP_TPSL_TEST = os.getenv("STARTUP_TPSL_TEST", "0").lower()  # "1"/"true"/"yes" to run test on boot
 POLY_LIVE_TEST = os.getenv("POLY_LIVE_TEST", "0").lower()   # "1"/"true"/"yes" to run freshness check
 POLY_TEST_SYMBOL = os.getenv("POLY_TEST_SYMBOL", "SPY")     # symbol to test freshness on
+RUN_ID = datetime.now().astimezone().strftime("%Y-%m-%d")
+COUNTS = defaultdict(int)        # e.g., COUNTS["orders.ok"] += 1
+COMBO_COUNTS = defaultdict(int)  # keys like "poc|AAPL|5::signals"
+
+                                              
 
 # ===== Diagnostics =====
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"               # don't POST; just log payload
@@ -102,6 +108,16 @@ def send_to_traderspost(payload: dict):
         tb = traceback.format_exc()
         print(f"[POST EXCEPTION] {e}\n{tb}", flush=True)
         return False, f"exception: {e}"
+    try:
+        combo = (payload.get("meta") or {}).get("combo", "UNKNOWN")
+        if ok:
+            COUNTS["orders.ok"] += 1
+            COMBO_COUNTS[f"{combo}::orders.ok"] += 1
+        else:
+            COUNTS["orders.err"] += 1
+            COMBO_COUNTS[f"{combo}::orders.err"] += 1
+    except Exception:
+        pass
 
 def build_payload(symbol: str, sig: dict):
     """
@@ -114,6 +130,18 @@ def build_payload(symbol: str, sig: dict):
         "quantity": int(sig["quantity"]),
         "meta": sig.get("meta", {})
     }
+
+  if "meta" not in payload:
+      payload["meta"] = {}
+
+    payload["meta"].update({
+      "runId": RUN_ID,
+      "sentAt": datetime.now(timezone.utc).isoformat()
+    })
+
+  combo = (sig.get("meta") or {}).get("combo")
+  if combo:
+      payload["meta"]["combo"] = combo  # e.g., "poc|AAPL|5"
 
     tp_abs = sig.get("tp_abs")
     sl_abs = sig.get("sl_abs")
@@ -164,6 +192,40 @@ def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
     rule = f"{int(tf_min)}min"
     agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
     return df1m.resample(rule, origin="start_day", label="right").agg(agg).dropna()
+
+def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
+    """
+    Increments counters, attaches combo meta, builds payload and sends.
+    """
+    # Build a stable combo key like "poc|AAPL|5"
+    combo_key = f"{strat_name}|{symbol}|{int(tf_min)}"
+
+    # Count the signal
+    COUNTS["signals"] += 1
+    COMBO_COUNTS[f"{combo_key}::signals"] += 1
+
+    # Attach combo and timeframe to meta so it flows into payload
+    meta = sig.get("meta", {})
+    meta["combo"] = combo_key
+    meta["timeframe"] = f"{int(tf_min)}m"
+    sig["meta"] = meta
+
+    # Send
+    payload = build_payload(symbol, sig)
+    ok, info = send_to_traderspost(payload)
+
+    # Count accepted / rejected (safety if you didn't already in send_to_traderspost)
+    try:
+        if ok:
+            COUNTS["orders.ok"] += 1
+            COMBO_COUNTS[f"{combo_key}::orders.ok"] += 1
+        else:
+            COUNTS["orders.err"] += 1
+            COMBO_COUNTS[f"{combo_key}::orders.err"] += 1
+    except Exception:
+        pass
+
+    print(f"[ORDER SENT] {combo_key} -> ok={ok} info={info}", flush=True)
 
 # ==============================
 # Signal adapters (return dict with quantity)
@@ -633,8 +695,12 @@ def replay_signals_once():
             return
 
         if sig:
+            # OPTIONAL: actually run through payload pipeline during replay
+            if os.getenv("REPLAY_SEND_ORDERS", "0").lower() in ("1", "true", "yes"):
+                handle_signal(REPLAY_STRAT, REPLAY_SYMBOL, tf, sig)
+
             # de-dupe by bar time + action
-            k = (sig.get("barTime",""), sig.get("action",""))
+            k = (sig.get("barTime", ""), sig.get("action", ""))
             if k != last_key:
                 hits += 1
                 last_key = k
@@ -675,7 +741,9 @@ def debug_snapshot_one_combo(name, sym, tf):
         sig = signal_poc_pinescript(sym, df1m, tf)
     else:
         sig = None
-
+    if sig:
+        handle_signal(name, sym, tf, sig)
+      
     print(f"[DEBUG] Signal -> {sig}", flush=True)
 
 def replay_signals_once():
@@ -709,31 +777,34 @@ def replay_signals_once():
         for i in range(len(bars)):
             df_slice = df1m.loc[:bars.index[i]]
 
-            if REPLAY_STRAT == "poc":
-                sig = signal_poc(REPLAY_SYMBOL, df_slice, tf)
-            elif REPLAY_STRAT == "ict_bos_fvg":
-                sig = signal_ict_bos_fvg(REPLAY_SYMBOL, df_slice, tf)
-            elif REPLAY_STRAT == "ict_bos_fvg_ob":
-                sig = signal_ict_bos_fvg_ob(REPLAY_SYMBOL, df_slice, tf)
-            elif REPLAY_STRAT == "poc_pinescript":
-                sig = signal_poc_pinescript(REPLAY_SYMBOL, df_slice, tf)
-            else:
-                print(f"[REPLAY] Unknown strategy '{REPLAY_STRAT}'", flush=True)
-                return
+        if REPLAY_STRAT == "poc":
+            sig = signal_poc(REPLAY_SYMBOL, df_slice, tf)
+        elif REPLAY_STRAT == "ict_bos_fvg":
+            sig = signal_ict_bos_fvg(REPLAY_SYMBOL, df_slice, tf)
+        elif REPLAY_STRAT == "ict_bos_fvg_ob":
+            sig = signal_ict_bos_fvg_ob(REPLAY_SYMBOL, df_slice, tf)
+        elif REPLAY_STRAT == "poc_pinescript":
+            sig = signal_poc_pinescript(REPLAY_SYMBOL, df_slice, tf)
+        else:
+            print(f"[REPLAY] Unknown strategy '{REPLAY_STRAT}'", flush=True)
+            return
 
-            if sig:
-                k = (sig.get("barTime",""), sig.get("action",""))
-                if k != last_key:
-                    hits += 1
-                    last_key = k
+        # OPTIONALLY send orders during replay (off by default)
+        if sig and os.getenv("REPLAY_SEND_ORDERS", "0").lower() in ("1", "true", "yes"):
+            handle_signal(REPLAY_STRAT, REPLAY_SYMBOL, tf, sig)
+
+        # Your original hit-count logic (unchanged)
+        if sig:
+            k = (sig.get("barTime", ""), sig.get("action", ""))
+            if k != last_key:
+                hits += 1
+                last_key = k
 
         print(f"[REPLAY] {REPLAY_STRAT} {REPLAY_SYMBOL} {tf}m -> {hits} signal(s) in last {REPLAY_HOURS}h.", flush=True)
 
     except Exception as e:
         import traceback
         print("[REPLAY ERROR]", e, traceback.format_exc(), flush=True)
-
-from datetime import datetime, timezone, timedelta
 
 def _print_polygon_freshness():
     try:
@@ -765,6 +836,20 @@ def _print_polygon_freshness():
             print("[FRESHNESS] ⏸ Market likely closed or no recent bars.", flush=True)
     except Exception as e:
         print(f"[FRESHNESS] Error: {e}", flush=True)
+
+def print_eod_report():
+    print("\n========== EOD REPORT ==========", flush=True)
+    print(f"RUN_ID: {RUN_ID}", flush=True)
+    print(f"Totals: signals={COUNTS['signals']}  orders.ok={COUNTS['orders.ok']}  orders.err={COUNTS['orders.err']}", flush=True)
+    print("Per-Combo:", flush=True)
+    for k in sorted(COMBO_COUNTS.keys()):
+        if k.endswith("::signals"):
+            base = k[:-9]
+            sigs = COMBO_COUNTS[k]
+            oks  = COMBO_COUNTS.get(f"{base}::orders.ok", 0)
+            ers  = COMBO_COUNTS.get(f"{base}::orders.err", 0)
+            print(f"  {base}  -> signals={sigs}  orders.ok={oks}  orders.err={ers}", flush=True)
+    print("================================\n", flush=True)
 
 # ==============================
 # Main loop — bar-close polling
