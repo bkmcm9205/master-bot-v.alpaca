@@ -12,6 +12,7 @@ TP_URL = os.getenv("TP_WEBHOOK_URL")            # TradersPost Strategy Webhook U
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")  # If you keep using Polygon here
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() != "false"  # default paper
+STARTUP_TPSL_TEST = os.getenv("STARTUP_TPSL_TEST", "0").lower()  # "1"/"true"/"yes" to run test on boot
 
 # ===== Diagnostics =====
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"               # don't POST; just log payload
@@ -735,6 +736,25 @@ def replay_signals_once():
 # ==============================
 def main():
     print("Bot starting…", flush=True)
+
+      # --- TEMP: send a one-time TP/SL test order on startup ---
+    if STARTUP_TPSL_TEST in ("1", "true", "yes"):
+        try:
+            test_sig = {
+                "action": "buy",
+                "orderType": "market",
+                "quantity": 1,
+                # absolute TP/SL to validate payload shape
+                "tp_abs": 102.00,
+                "sl_abs": 99.00,
+                "meta": {"note": "tp-sl-format-test"}
+            }
+            payload = build_payload("AAPL", test_sig)
+            print("[STARTUP TEST PAYLOAD]", payload, flush=True)
+            ok, info = send_to_traderspost(payload)
+            print("[STARTUP TEST RESULT]", ok, info, flush=True)
+        except Exception as e:
+            print("[STARTUP TEST ERROR]", e, flush=True)
 
     # ---- startup diagnostics (runs once) ----
     try:
