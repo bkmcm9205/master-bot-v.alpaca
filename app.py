@@ -101,16 +101,27 @@ def send_to_traderspost(payload: dict):
         return False, f"exception: {e}"
 
 def build_payload(symbol: str, sig: dict):
-    p = {
+    """
+    Build TradersPost payload with ABSOLUTE TP/SL formatted correctly.
+    """
+    payload = {
         "ticker": symbol,
-        "action": sig["action"],                          # 'buy' | 'sell' | 'exit' | 'add'
+        "action": sig["action"],          # "buy" or "sell"
         "orderType": sig.get("orderType", "market"),
-        "quantity": int(sig["quantity"]),                 # sized by your wrapper
+        "quantity": int(sig["quantity"]),
+        "meta": sig.get("meta", {})
     }
-    if sig.get("price") is not None:      p["price"] = float(sig["price"])
-    if sig.get("takeProfit") is not None: p["takeProfit"] = float(sig["takeProfit"])
-    if sig.get("stopLoss") is not None:   p["stopLoss"] = float(sig["stopLoss"])
-    return p
+
+    tp_abs = sig.get("tp_abs")
+    sl_abs = sig.get("sl_abs")
+
+    if tp_abs is not None:
+        payload["takeProfit"] = {"limitPrice": float(round(tp_abs, 2))}
+
+    if sl_abs is not None:
+        payload["stopLoss"] = {"type": "stop", "stopPrice": float(round(sl_abs, 2))}
+
+    return payload
 
 # ==============================
 # Data fetch — Polygon 1m (replace with your DB if you like)
@@ -248,7 +259,7 @@ def signal_poc(
         return {"action":"sell","orderType":"market","price":None,
                 "takeProfit":tp,"stopLoss":sl,"barTime":ts.tz_convert("UTC").isoformat(),
                 "quantity":int(qty)}
-
+  
     return None
 
 
@@ -768,6 +779,58 @@ def main():
 
         elapsed = time.time() - loop_start
         time.sleep(max(1, POLL_SECONDS - int(elapsed)))
+
+def build_payload(symbol: str, sig: dict):
+    """
+    Build a TradersPost payload, accepting either:
+      - legacy numeric:  takeProfit=<float>, stopLoss=<float>
+      - new absolute:    tp_abs=<float>,    sl_abs=<float>
+    and converting them to the required nested objects.
+    """
+    action     = sig.get("action")                     # "buy" | "sell"
+    order_type = sig.get("orderType", "market")        # "market" | "limit"
+    qty        = int(sig.get("quantity", 0))
+
+    payload = {
+        "ticker": symbol,
+        "action": action,
+        "orderType": order_type,
+        "quantity": qty,
+        "meta": {}
+    }
+
+    # pass-through optional meta
+    if isinstance(sig.get("meta"), dict):
+        payload["meta"].update(sig["meta"])
+
+    # include barTime (useful for audit)
+    if sig.get("barTime"):
+        payload["meta"]["barTime"] = sig["barTime"]
+
+    # limit orders: map price -> limitPrice
+    if order_type.lower() == "limit":
+        if sig.get("price") is not None:
+            payload["limitPrice"] = float(round(sig["price"], 2))
+
+    # ---- unify TP/SL sources ----
+    tp_abs = sig.get("tp_abs")
+    sl_abs = sig.get("sl_abs")
+
+    # support your current numeric fields too
+    if tp_abs is None and sig.get("takeProfit") is not None:
+        tp_abs = float(sig["takeProfit"])
+    if sl_abs is None and sig.get("stopLoss") is not None:
+        sl_abs = float(sig["stopLoss"])
+
+    # TradersPost requires nested objects:
+    # takeProfit: {"limitPrice": <abs price>}
+    # stopLoss  : {"type": "stop", "stopPrice": <abs price>}
+    if tp_abs is not None:
+        payload["takeProfit"] = {"limitPrice": float(round(tp_abs, 2))}
+    if sl_abs is not None:
+        payload["stopLoss"]   = {"type": "stop", "stopPrice": float(round(sl_abs, 2))}
+
+    return payload
 
 if __name__ == "__main__":
     main()
