@@ -26,8 +26,6 @@ COMBO_COUNTS = defaultdict(int)  # keys like "poc|AAPL|5::signals"
 TP_SL_SAME_BAR = os.getenv("TP_SL_SAME_BAR", "tp").lower()  # "tp" | "sl"
 # Open trades keyed by (symbol, tf_min)
 OPEN_TRADES = defaultdict(list)  # (symbol, tf) -> list[LiveTrade]
-# keep only open trades in the list
-OPEN_TRADES[key] = [x for x in trades if x.is_open]
 
 @dataclass
 class LiveTrade:
