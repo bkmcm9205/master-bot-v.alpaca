@@ -3,8 +3,10 @@
 
 import os, time, json, hashlib, requests, math
 import pandas as pd, numpy as np
+import csv
 from datetime import datetime, timezone, timedelta
-from collections import defaultdict
+from collections import defaultdict, deque
+from dataclasses import dataclass
 
 # ==============================
 # ENV / CONFIG
@@ -19,8 +21,40 @@ POLY_TEST_SYMBOL = os.getenv("POLY_TEST_SYMBOL", "SPY")     # symbol to test fre
 RUN_ID = datetime.now().astimezone().strftime("%Y-%m-%d")
 COUNTS = defaultdict(int)        # e.g., COUNTS["orders.ok"] += 1
 COMBO_COUNTS = defaultdict(int)  # keys like "poc|AAPL|5::signals"
+# If both TP and SL are inside the same bar, which one do we assume hit first?
+# "tp" (optimistic) or "sl" (conservative). You can override via env var.
+TP_SL_SAME_BAR = os.getenv("TP_SL_SAME_BAR", "tp").lower()  # "tp" | "sl"
+# Open trades keyed by (symbol, tf_min)
+OPEN_TRADES = defaultdict(list)  # (symbol, tf) -> list[LiveTrade]
+# keep only open trades in the list
+OPEN_TRADES[key] = [x for x in trades if x.is_open]
 
-                                              
+@dataclass
+class LiveTrade:
+    combo: str            # e.g., "poc|AAPL|5"
+    symbol: str
+    tf_min: int
+    side: str             # "buy" or "sell"
+    entry: float
+    tp: float
+    sl: float
+    qty: int
+    entry_time: str       # ISO string
+    is_open: bool = True
+    exit: float = None
+    exit_time: str = None
+    reason: str = None    # "tp" | "sl"  
+
+# Per-combo performance
+PERF = {
+    # combo -> dict with rolling stats
+    # "poc|AAPL|5": {
+    #   "trades": 0, "wins": 0, "losses": 0,
+    #   "gross_profit": 0.0, "gross_loss": 0.0,
+    #   "net_pnl": 0.0, "max_dd": 0.0,
+    #   "equity_curve": [0.0, ...]  # cumulative
+    # }
+}
 
 # ===== Diagnostics =====
 DRY_RUN = os.getenv("DRY_RUN", "0") == "1"               # don't POST; just log payload
@@ -211,6 +245,9 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
     sig["meta"] = meta
 
     # Send
+
+    _record_open_trade(strat_name, symbol, tf_min, sig)
+  
     payload = build_payload(symbol, sig)
     ok, info = send_to_traderspost(payload)
 
@@ -226,6 +263,95 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
         pass
 
     print(f"[ORDER SENT] {combo_key} -> ok={ok} info={info}", flush=True)
+
+def _combo_key(strat_name: str, symbol: str, tf_min: int) -> str:
+    return f"{strat_name}|{symbol}|{int(tf_min)}"
+
+def _perf_init(combo: str):
+    if combo not in PERF:
+        PERF[combo] = {
+            "trades": 0, "wins": 0, "losses": 0,
+            "gross_profit": 0.0, "gross_loss": 0.0,
+            "net_pnl": 0.0, "max_dd": 0.0,
+            "equity_curve": [0.0],
+        }
+
+def _perf_update(combo: str, pnl: float):
+    _perf_init(combo)
+    p = PERF[combo]
+    p["trades"] += 1
+    if pnl > 0:
+        p["wins"] += 1
+        p["gross_profit"] += pnl
+    elif pnl < 0:
+        p["losses"] += 1
+        p["gross_loss"] += pnl
+    p["net_pnl"] += pnl
+    # update equity curve + drawdown
+    ec = p["equity_curve"]
+    ec.append(ec[-1] + pnl)
+    dd = min(0.0, ec[-1] - max(ec))  # negative number
+    p["max_dd"] = min(p["max_dd"], dd)
+
+def _record_open_trade(strat_name: str, symbol: str, tf_min: int, sig: dict):
+    combo = _combo_key(strat_name, symbol, tf_min)
+    _perf_init(combo)
+
+    # Support both your legacy and new keys
+    tp = sig.get("tp_abs", sig.get("takeProfit"))
+    sl = sig.get("sl_abs", sig.get("stopLoss"))
+
+    t = LiveTrade(
+        combo=combo,
+        symbol=symbol,
+        tf_min=int(tf_min),
+        side=sig["action"],  # "buy"/"sell"
+        entry=float(sig.get("entry") or sig.get("price") or 0.0) if sig.get("entry") is not None or sig.get("price") is not None else float("nan"),
+        tp=float(tp) if tp is not None else float("nan"),
+        sl=float(sl) if sl is not None else float("nan"),
+        qty=int(sig["quantity"]),
+        entry_time=sig.get("barTime") or datetime.now(timezone.utc).isoformat(),
+    )
+    OPEN_TRADES[(symbol, int(tf_min))].append(t)
+
+def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, close: float):
+    key = (symbol, int(tf_min))
+    if key not in OPEN_TRADES:
+        return
+    trades = OPEN_TRADES[key]
+    for t in trades:
+        if not t.is_open:
+            continue
+
+        hit_tp = (high >= t.tp) if t.side == "buy" else (low <= t.tp)
+        hit_sl = (low <= t.sl) if t.side == "buy" else (high >= t.sl)
+
+        if hit_tp and hit_sl:
+            # both inside the same bar — choose policy
+            pick = TP_SL_SAME_BAR
+            if pick == "sl":
+                hit_tp, hit_sl = False, True
+            else:
+                hit_tp, hit_sl = True, False
+
+        if hit_tp or hit_sl:
+            t.is_open = False
+            t.exit_time = ts.tz_convert("UTC").isoformat() if hasattr(ts, "tzinfo") else str(ts)
+            if hit_tp:
+                t.exit = t.tp
+                t.reason = "tp"
+            else:
+                t.exit = t.sl
+                t.reason = "sl"
+
+            # PnL in dollars
+            if t.side == "buy":
+                pnl = (t.exit - t.entry) * t.qty
+            else:
+                pnl = (t.entry - t.exit) * t.qty
+
+            _perf_update(t.combo, pnl)
+            print(f"[CLOSE] {t.combo} {t.reason.upper()} qty={t.qty} entry={t.entry:.2f} exit={t.exit:.2f} pnl={pnl:+.2f}", flush=True)
 
 # ==============================
 # Signal adapters (return dict with quantity)
@@ -851,6 +977,24 @@ def print_eod_report():
             print(f"  {base}  -> signals={sigs}  orders.ok={oks}  orders.err={ers}", flush=True)
     print("================================\n", flush=True)
 
+# CSV for Tableau/Excel
+    out_path = f"/opt/render/project/src/eod_perf_{RUN_ID}.csv"
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["combo", "trades", "wins", "losses", "win_rate", "profit_factor", "net_pnl", "max_drawdown"])
+        for combo in sorted(PERF.keys()):
+            p = PERF[combo]
+            trades = p["trades"]
+            if trades == 0:
+                continue
+            wins = p["wins"]; losses = p["losses"]
+            wr = (100.0 * wins / trades) if trades else 0.0
+            gp = p["gross_profit"]; gl = p["gross_loss"]
+            pf = (gp / abs(gl)) if gl < 0 else float("inf") if gp > 0 else 0.0
+            w.writerow([combo, trades, wins, losses, round(wr,2), round(pf,3), round(p["net_pnl"],2), round(p["max_dd"],2)])
+
+    print(f"[EOD] Wrote summary CSV → {out_path}", flush=True)
+
 # ==============================
 # Main loop — bar-close polling
 # ==============================
@@ -889,40 +1033,72 @@ def main():
         import traceback
         print("[STARTUP DIAGS ERROR]", e, traceback.format_exc(), flush=True)
 
-    # ---- main loop ----
-    while True:
-        loop_start = time.time()
-        try:
-            print("Tick…", flush=True)
+# ---- main loop ----
+while True:
+    loop_start = time.time()
+    try:
+        print("Tick…", flush=True)
 
-            for (name, sym, tf) in COMBOS:
-                # Optional: one-combo debug snapshot (if you added that helper)
-                if DEBUG_COMBO:
-                    try:
-                        debug_snapshot_one_combo(name, sym, tf)
-                    except Exception as e:
-                        print(f"[DEBUG SNAPSHOT ERROR] {name},{sym},{tf}: {e}", flush=True)
+        for (name, sym, tf) in COMBOS:
+            # Optional: one-combo debug snapshot (if you added that helper)
+            if DEBUG_COMBO:
+                try:
+                    debug_snapshot_one_combo(name, sym, tf)
+                except Exception as e:
+                    print(f"[DEBUG SNAPSHOT ERROR] {name},{sym},{tf}: {e}", flush=True)
 
-                sig = compute_signal(name, sym, tf)
-                if not sig:
-                    continue
+            # --- CLOSE FIRST: get the latest closed bar and close any open trade on TP/SL ---
+            last_row_close = None
+            try:
+                # small, fast lookback just to get the last bar at this TF
+                lookback = max(90, int(tf) * 10)  # minutes
+                df1m_latest = fetch_polygon_1m(sym, lookback_minutes=lookback)
+                bars_latest = _resample(df1m_latest, tf)
+                if bars_latest is not None and not bars_latest.empty:
+                    last_row = bars_latest.iloc[-1]
+                    last_ts  = bars_latest.index[-1]
+                    last_row_close = float(last_row["close"])
+                    _maybe_close_on_bar(
+                        sym, tf, last_ts,
+                        float(last_row["high"]),
+                        float(last_row["low"]),
+                        last_row_close
+                    )
+            except Exception as e:
+                print(f"[CLOSE-PHASE ERROR] {name} {sym} {tf}m: {e}", flush=True)
 
-                k = _dedupe_key(name, sym, tf, sig["action"], sig.get("barTime",""))
-                if k in _sent:
-                    continue
-                _sent.add(k)
+            # --- THEN compute a fresh signal on the full slice ---
+            sig = compute_signal(name, sym, tf)
+            if not sig:
+                continue
 
-                payload = build_payload(sym, sig)
-                ok, info = send_to_traderspost(payload)
-                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{stamp}] {name} {sym} {tf}m -> {sig['action']} qty={sig['quantity']} | {info}", flush=True)
+            # give ledger an explicit entry if missing
+            if "entry" not in sig and last_row_close is not None:
+                sig["entry"] = last_row_close
 
-        except Exception as e:
-            import traceback
-            print("[LOOP ERROR]", e, traceback.format_exc(), flush=True)
+            # de-dupe
+            k = _dedupe_key(name, sym, tf, sig["action"], sig.get("barTime", ""))
+            if k in _sent:
+                continue
+            _sent.add(k)
 
-        elapsed = time.time() - loop_start
-        time.sleep(max(1, POLL_SECONDS - int(elapsed)))
+            # record open trade BEFORE posting
+            try:
+                _record_open_trade(name, sym, tf, sig)
+            except Exception as e:
+                print(f"[LEDGER OPEN ERROR] {name} {sym} {tf}m: {e}", flush=True)
+
+            payload = build_payload(sym, sig)
+            ok, info = send_to_traderspost(payload)
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{stamp}] {name} {sym} {tf}m -> {sig['action']} qty={sig['quantity']} | {info}", flush=True)
+
+    except Exception as e:
+        import traceback
+        print("[LOOP ERROR]", e, traceback.format_exc(), flush=True)
+
+    elapsed = time.time() - loop_start
+    time.sleep(max(1, POLL_SECONDS - int(elapsed)))
 
 def build_payload(symbol: str, sig: dict):
     """
