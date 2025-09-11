@@ -7,6 +7,7 @@ import csv
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 from dataclasses import dataclass
+import pytz
 
 # ==============================
 # ENV / CONFIG
@@ -26,6 +27,13 @@ COMBO_COUNTS = defaultdict(int)  # keys like "poc|AAPL|5::signals"
 TP_SL_SAME_BAR = os.getenv("TP_SL_SAME_BAR", "tp").lower()  # "tp" | "sl"
 # Open trades keyed by (symbol, tf_min)
 OPEN_TRADES = defaultdict(list)  # (symbol, tf) -> list[LiveTrade]
+# EOD auto-summary
+EOD_ENABLE     = os.getenv("EOD_ENABLE", "1").lower() in ("1", "true", "yes")
+EOD_HOUR_ET    = int(os.getenv("EOD_HOUR_ET", "16"))   # 16 = 4pm
+EOD_MINUTE_ET  = int(os.getenv("EOD_MINUTE_ET", "1"))  # 4:01pm for safety
+RUN_EOD_NOW    = os.getenv("RUN_EOD_NOW", "0").lower() in ("1","true","yes")  # manual test
+_last_eod_date = None  # tracks which date we've printed for
+ET_TZ = pytz.timezone("America/New_York")
 
 @dataclass
 class LiveTrade:
@@ -350,6 +358,9 @@ def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, c
 
             _perf_update(t.combo, pnl)
             print(f"[CLOSE] {t.combo} {t.reason.upper()} qty={t.qty} entry={t.entry:.2f} exit={t.exit:.2f} pnl={pnl:+.2f}", flush=True)
+
+def _now_et():
+    return datetime.now(timezone.utc).astimezone(ET_TZ)
 
 # ==============================
 # Signal adapters (return dict with quantity)
@@ -1090,6 +1101,22 @@ while True:
             ok, info = send_to_traderspost(payload)
             stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"[{stamp}] {name} {sym} {tf}m -> {sig['action']} qty={sig['quantity']} | {info}", flush=True)
+
+    # --- Auto EOD summary ---
+        try:
+            if EOD_ENABLE:
+                now_et = _now_et()
+                today = now_et.date()
+                ready_time = (now_et.hour > EOD_HOUR_ET) or \
+                             (now_et.hour == EOD_HOUR_ET and now_et.minute >= EOD_MINUTE_ET)
+                manual = RUN_EOD_NOW
+
+                if (manual or ready_time) and (_last_eod_date != today):
+                    print_eod_report()
+                    # mark done for today
+                    globals()['_last_eod_date'] = today
+        except Exception as e:
+            print(f"[EOD AUTO ERROR] {e}", flush=True)
 
     except Exception as e:
         import traceback
