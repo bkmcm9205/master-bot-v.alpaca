@@ -7,6 +7,7 @@ import csv
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from botocore.config import Config
 import pytz
 import boto3
 
@@ -975,7 +976,13 @@ def _print_polygon_freshness():
 
 def upload_to_s3(local_path: str, bucket: str, key: str):
     try:
-        s3 = boto3.client("s3")
+        region = os.getenv("AWS_REGION", "us-east-2")
+        s3 = boto3.client(
+            "s3",
+            region_name=region,
+            config=Config(signature_version="s3v4")
+        )
+        print(f"[EOD] Uploading to s3://{bucket}/{key} (region={region})", flush=True)
         s3.upload_file(local_path, bucket, key)
         print(f"[EOD] Uploaded {local_path} → s3://{bucket}/{key}", flush=True)
     except Exception as e:
