@@ -8,6 +8,7 @@ from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 from dataclasses import dataclass
 import pytz
+import boto3
 
 # ==============================
 # ENV / CONFIG
@@ -972,6 +973,15 @@ def _print_polygon_freshness():
     except Exception as e:
         print(f"[FRESHNESS] Error: {e}", flush=True)
 
+def upload_to_s3(local_path: str, bucket: str, key: str):
+    try:
+        s3 = boto3.client("s3")
+        s3.upload_file(local_path, bucket, key)
+        print(f"[EOD] Uploaded {local_path} → s3://{bucket}/{key}", flush=True)
+    except Exception as e:
+        import traceback
+        print("[EOD UPLOAD ERROR]", e, traceback.format_exc(), flush=True)
+
 def print_eod_report():
     print("\n========== EOD REPORT ==========", flush=True)
     print(f"RUN_ID: {RUN_ID}", flush=True)
@@ -986,7 +996,7 @@ def print_eod_report():
             print(f"  {base}  -> signals={sigs}  orders.ok={oks}  orders.err={ers}", flush=True)
     print("================================\n", flush=True)
 
-# CSV for Tableau/Excel
+    # ---- write CSV locally ----
     out_path = f"/opt/render/project/src/eod_perf_{RUN_ID}.csv"
     with open(out_path, "w", newline="") as f:
         w = csv.writer(f)
@@ -999,10 +1009,16 @@ def print_eod_report():
             wins = p["wins"]; losses = p["losses"]
             wr = (100.0 * wins / trades) if trades else 0.0
             gp = p["gross_profit"]; gl = p["gross_loss"]
-            pf = (gp / abs(gl)) if gl < 0 else float("inf") if gp > 0 else 0.0
+            pf = (gp / abs(gl)) if gl < 0 else (float("inf") if gp > 0 else 0.0)
             w.writerow([combo, trades, wins, losses, round(wr,2), round(pf,3), round(p["net_pnl"],2), round(p["max_dd"],2)])
 
     print(f"[EOD] Wrote summary CSV → {out_path}", flush=True)
+
+    # ---- upload to S3 (if bucket configured) ----
+    bucket = os.getenv("AWS_BUCKET_NAME")
+    if bucket:
+        key = os.path.basename(out_path)  # e.g. eod_perf_2025-09-11.csv
+        upload_to_s3(out_path, bucket, key)
 
 # ==============================
 # Main loop — bar-close polling
