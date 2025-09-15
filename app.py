@@ -231,9 +231,22 @@ def _is_rth(ts):
     return ((h > 9) or (h == 9 and m >= 30)) and (h < 16)
 
 def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
-    rule = f"{int(tf_min)}min"
-    agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
-    return df1m.resample(rule, origin="start_day", label="right").agg(agg).dropna()
+    """
+    Safe resample: returns empty DataFrame if df1m is empty or index is not a DateTimeIndex.
+    Expects df1m indexed by tz-aware DateTime (ET) with columns o/h/l/c/volume.
+    """
+    try:
+        if df1m is None or df1m.empty:
+            return pd.DataFrame()
+        if not isinstance(df1m.index, pd.DatetimeIndex):
+            return pd.DataFrame()  # avoid "RangeIndex" resample errors
+
+        rule = f"{int(tf_min)}min"
+        agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
+        return df1m.resample(rule, origin="start_day", label="right").agg(agg).dropna()
+    except Exception:
+        # Defensive: if anything goes wrong, don't explode the loop
+        return pd.DataFrame()
 
 def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
     """
@@ -1080,33 +1093,44 @@ while True:
                     print(f"[DEBUG SNAPSHOT ERROR] {name},{sym},{tf}: {e}", flush=True)
 
             # --- CLOSE FIRST: get the latest closed bar and close any open trade on TP/SL ---
-            last_row_close = None
-            try:
-                # small, fast lookback just to get the last bar at this TF
-                lookback = max(90, int(tf) * 10)  # minutes
-                df1m_latest = fetch_polygon_1m(sym, lookback_minutes=lookback)
-                bars_latest = _resample(df1m_latest, tf)
-                if bars_latest is not None and not bars_latest.empty:
-                    last_row = bars_latest.iloc[-1]
-                    last_ts  = bars_latest.index[-1]
-                    last_row_close = float(last_row["close"])
-                    _maybe_close_on_bar(
-                        sym, tf, last_ts,
-                        float(last_row["high"]),
-                        float(last_row["low"]),
-                        last_row_close
-                    )
-            except Exception as e:
-                print(f"[CLOSE-PHASE ERROR] {name} {sym} {tf}m: {e}", flush=True)
+                try:
+                    # small, fast lookback just to get the last bar at this TF
+                    lookback = max(90, int(tf) * 10)  # minutes
+                    df1m_latest = fetch_polygon_1m(sym, lookback_minutes=lookback)
+
+                    # If fetch failed/empty or index isn’t datetime, skip safely
+                    if df1m_latest is None or df1m_latest.empty or not isinstance(df1m_latest.index, pd.DatetimeIndex):
+                        # nothing to close on
+                        last_row = None
+                    else:
+                        bars_latest = _resample(df1m_latest, tf)
+                        if bars_latest is not None and not bars_latest.empty:
+                            last_row = bars_latest.iloc[-1]
+                            last_ts  = bars_latest.index[-1]
+                            _maybe_close_on_bar(
+                                sym, tf,
+                                last_ts,
+                                float(last_row["high"]),
+                                float(last_row["low"]),
+                                float(last_row["close"])
+                            )
+                        else:
+                            last_row = None
+                except Exception as e:
+                    print(f"[CLOSE-PHASE ERROR] {name} {sym} {tf}m: {e}", flush=True)
+                    last_row = None  # ensure defined for later
 
             # --- THEN compute a fresh signal on the full slice ---
             sig = compute_signal(name, sym, tf)
             if not sig:
                 continue
 
-            # give ledger an explicit entry if missing
-            if "entry" not in sig and last_row_close is not None:
-                sig["entry"] = last_row_close
+            # set an explicit entry if your signal didn’t provide one (helps PnL math)
+                if "entry" not in sig and last_row is not None:
+                    try:
+                        sig["entry"] = float(last_row["close"])
+                    except Exception:
+                        pass
 
             # de-dupe
             k = _dedupe_key(name, sym, tf, sig["action"], sig.get("barTime", ""))
