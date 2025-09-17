@@ -1,6 +1,15 @@
+# Core
 pandas
 numpy
 requests
 boto3
+
+# Time & scheduling
+python-dateutil
+
+# ML & TA
 pandas-ta
 scikit-learn
+
+# Optional: if you’re plotting/debugging
+matplotlib
