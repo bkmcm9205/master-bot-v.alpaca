@@ -1,4 +1,6 @@
-requests
 pandas
 numpy
+requests
 boto3
+pandas-ta
+scikit-learn
