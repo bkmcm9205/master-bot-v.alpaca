@@ -6,6 +6,7 @@ import pandas as pd, numpy as np
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 # ==============================
 # ENV / CONFIG
@@ -41,6 +42,31 @@ RISK_PCT    = float(os.getenv("RISK_PCT",    "0.01"))
 MAX_POS_PCT = float(os.getenv("MAX_POS_PCT", "0.10"))
 MIN_QTY     = int(os.getenv("MIN_QTY", "1"))
 ROUND_LOT   = int(os.getenv("ROUND_LOT","1"))
+
+SCANNER_MARKET_HOURS_ONLY = os.getenv("SCANNER_MARKET_HOURS_ONLY","1").lower() in ("1","true","yes")
+ALLOW_PREMARKET  = os.getenv("ALLOW_PREMARKET","0").lower() in ("1","true","yes")
+ALLOW_AFTERHOURS = os.getenv("ALLOW_AFTERHOURS","0").lower() in ("1","true","yes")
+
+def _market_session_now():
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    t = now_et.time()
+    # Sessions (ET)
+    rth_start = (9,30)
+    rth_end   = (16,0)
+    pre_start = (4,0)
+    pre_end   = (9,30)
+    ah_start  = (16,0)
+    ah_end    = (20,0)
+
+    def within(start, end):
+        (sh, sm), (eh, em) = start, end
+        return (t >= datetime(1,1,1,sh,sm).time()) and (t < datetime(1,1,1,eh,em).time())
+
+    in_rth = within(rth_start, rth_end)
+    in_pre = ALLOW_PREMARKET  and within(pre_start, pre_end)
+    in_ah  = ALLOW_AFTERHOURS and within(ah_start, ah_end)
+
+    return in_rth or in_pre or in_ah
 
 def _position_qty(entry_price: float, stop_price: float,
                   equity=EQUITY_USD, risk_pct=RISK_PCT, max_pos_pct=MAX_POS_PCT,
@@ -329,6 +355,11 @@ def build_universe():
 def scan_once(universe: list[str]):
     global _round_robin
 
+    if SCANNER_MARKET_HOURS_ONLY and not _market_session_now():
+        if SCANNER_DEBUG:
+            print("[SCAN] Skipping — market session closed.", flush=True)
+        return
+
     if not universe:
         return
 
@@ -374,6 +405,9 @@ def scan_once(universe: list[str]):
                 if k in _sent:
                     continue
                 _sent.add(k)
+
+                if SCANNER_MARKET_HOURS_ONLY and not _market_session_now():
+                    continue  # if the session flipped while scanning, skip sends
 
                 payload = build_payload(sym, sig)
                 ok, info = send_to_traderspost(payload)
