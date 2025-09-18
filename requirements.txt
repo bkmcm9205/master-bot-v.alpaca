@@ -3,6 +3,7 @@ pandas
 numpy
 requests
 boto3
+pytz
 
 # Time & scheduling
 python-dateutil
