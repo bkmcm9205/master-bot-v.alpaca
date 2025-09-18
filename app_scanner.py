@@ -9,6 +9,7 @@
 import os, time, json, math, hashlib, requests
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -108,7 +109,8 @@ class LiveTrade:
 # Utils
 # ------------------------------
 def _now_et():
-    return datetime.now(timezone.utc).astimezone()
+    """Return current Eastern Time (aware datetime)."""
+    return datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
 
 def _is_rth(ts):
     # 9:30<=t<16:00 local exchange time
