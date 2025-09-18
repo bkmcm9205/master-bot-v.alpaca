@@ -394,8 +394,8 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, conf_thresho
 
     # Features
     bars = bars.copy()
-    bars["return"] = bars["close"].pct_change()
-    bars["rsi"] = ta.rsi(bars["close"], length=14)
+    bars["return"]     = bars["close"].pct_change()
+    bars["rsi"]        = ta.rsi(bars["close"], length=14)
     bars["volatility"] = bars["close"].rolling(20).std()
     bars.dropna(inplace=True)
     if len(bars) < 60:
@@ -403,18 +403,29 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, conf_thresho
 
     X = bars[["return","rsi","volatility"]].copy()
     y = (bars["close"].shift(-1) > bars["close"]).astype(int)
-    X = X.iloc[:-1]; y = y.iloc[:-1]  # last row reserved for inference target alignment
+    X = X.iloc[:-1]   # leave last row for inference
+    y = y.iloc[:-1]
 
     if len(X) < 50:
         return None
 
     cut = int(len(X) * 0.7)
     X_train, y_train = X.iloc[:cut], y.iloc[:cut]
-    X_test  = X.iloc[cut:]
+    # (We don’t need X_test here; we only score the latest bar)
 
     clf = RandomForestClassifier(n_estimators=100, random_state=42)
     clf.fit(X_train, y_train)
-    proba = clf.predict_proba([X.iloc[-1]])[0][1]   # prob of up
+
+    # --- FIX: preserve feature names & alignment ---
+    x_live = X.iloc[[-1]]  # DataFrame with same columns
+    # If sklearn stored feature order, enforce it:
+    try:
+        feat_cols = list(clf.feature_names_in_)
+        x_live = x_live[feat_cols]
+    except Exception:
+        pass
+
+    proba = clf.predict_proba(x_live)[0][1]   # probability of “up”
     pred  = int(proba >= 0.5)
 
     ts = bars.index[-1]
@@ -424,18 +435,21 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, conf_thresho
     # Entry rule (long-only here; sentiment gate will filter later)
     if pred == 1 and proba >= conf_threshold:
         price = float(bars["close"].iloc[-1])
-        sl    = price * 0.99             # 1% stop
-        tp    = price * (1 + 0.01*r_multiple)  # r-multiple based on 1% unit
+        sl    = price * 0.99                         # 1% stop
+        tp    = price * (1 + 0.01 * r_multiple)      # r-multiple on 1% unit
         qty   = _position_qty(price, sl)
         if qty <= 0:
             return None
         return {
-            "action":"buy","orderType":"market","price":None,
-            "takeProfit":tp,"stopLoss":sl,
+            "action": "buy",
+            "orderType": "market",
+            "price": None,
+            "takeProfit": tp,
+            "stopLoss": sl,
             "barTime": ts.tz_convert("UTC").isoformat(),
             "entry": price,
             "quantity": int(qty),
-            "meta": {"note":"ml_pattern"}
+            "meta": {"note": "ml_pattern"}
         }
     return None
 
