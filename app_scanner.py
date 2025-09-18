@@ -34,6 +34,19 @@ MAX_POS_PCT         = float(os.getenv("MAX_POS_PCT", "0.10"))     # 10% notional
 MIN_QTY             = int(os.getenv("MIN_QTY", "1"))
 ROUND_LOT           = int(os.getenv("ROUND_LOT","1"))
 
+# --- Daily guard config ---
+DAILY_GUARD_ENABLED   = os.getenv("DAILY_GUARD_ENABLED", "1").lower() in ("1","true","yes")
+DAILY_TP_PCT          = float(os.getenv("DAILY_TP_PCT", "0.25"))   # +25% lock-in
+DAILY_DD_PCT          = float(os.getenv("DAILY_DD_PCT", "0.05"))   # -5% stop day
+DAILY_FLATTEN_ON_HIT  = os.getenv("DAILY_FLATTEN_ON_HIT", "1").lower() in ("1","true","yes")
+
+# Use START_EQUITY if provided, otherwise default to your sizing equity
+START_EQUITY = float(os.getenv("START_EQUITY", str(EQUITY_USD)))
+
+# Daily state
+DAY_STAMP     = datetime.now().astimezone().strftime("%Y-%m-%d")
+HALT_TRADING  = False
+
 # Engine guards
 MAX_CONCURRENT_POSITIONS  = int(os.getenv("MAX_CONCURRENT_POSITIONS", "100"))  # hard cap
 MAX_ORDERS_PER_MIN        = int(os.getenv("MAX_ORDERS_PER_MIN", "60"))         # throttle for TradersPost
@@ -648,15 +661,19 @@ def main():
             sentiment = compute_sentiment() if SENTIMENT_ONLY_GATE else "neutral"
             print(f"[SENTIMENT] {sentiment}", flush=True)
 
-            # Day guard
+            # ---- Daily guard housekeeping ----
             reset_daily_guard_if_new_day()
-            check_daily_guard_and_maybe_halt()
+            if DAILY_GUARD_ENABLED:
+                check_daily_guard_and_maybe_halt()
 
-            # close on last bars across open trades quickly (per unique (sym, tf))
+            # Decide if we allow NEW entries this loop
+            ALLOW_ENTRIES = not (DAILY_GUARD_ENABLED and HALT_TRADING)
+
+            # ---- Close phase: evaluate exits on last bars for all open trades ----
             touched = set((k[0], k[1]) for k in OPEN_TRADES.keys())
             for (sym, tf) in touched:
                 try:
-                    df = fetch_polygon_1m(sym, lookback_minutes=max(60, tf*12))
+                    df = fetch_polygon_1m(sym, lookback_minutes=max(60, tf * 12))
                     bars = _resample(df, tf)
                     if bars is not None and not bars.empty:
                         row = bars.iloc[-1]
@@ -666,8 +683,8 @@ def main():
                 except Exception as e:
                     print(f"[CLOSE-PHASE ERROR] {sym} {tf}m: {e}", flush=True)
 
-            # If halted, skip opening new positions
-            if HALT_TRADING:
+            # If entries are halted, skip scanning for NEW signals
+            if not ALLOW_ENTRIES:
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -678,13 +695,13 @@ def main():
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # Scan symbols & TFs (simple round-robin this loop)
+            # ---- Scan symbols & TFs ----
             for sym in symbols:
-                # quick per-symbol cap to avoid stampeding TP
-                if sum(1 for t in OPEN_TRADES.get((sym, TF_MIN_LIST[0]), []) if t.is_open) > 0:
-                    pass  # allow multiple TFs if desired; or skip to limit per-symbol
+                # Optional: per-symbol concurrent cap example (currently passive)
+                # if sum(1 for t in OPEN_TRADES.get((sym, TF_MIN_LIST[0]), []) if t.is_open) > 0:
+                #     pass
 
-                df1m = fetch_polygon_1m(sym, lookback_minutes= max(240, max(TF_MIN_LIST)*240))
+                df1m = fetch_polygon_1m(sym, lookback_minutes=max(240, max(TF_MIN_LIST) * 240))
                 if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
                     continue
                 try:
@@ -692,32 +709,32 @@ def main():
                 except Exception:
                     df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
 
-                # today volume gate (re-check per symbol)
+                # Today volume gate (per symbol)
                 today_mask = df1m.index.date == df1m.index[-1].date()
                 todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
                 if todays_vol < SCANNER_MIN_TODAY_VOL:
                     continue
 
                 for tf in TF_MIN_LIST:
-                    # produce a candidate signal
+                    # Produce a candidate signal
                     sig = compute_signal("ml_pattern", sym, tf, df1m=df1m)
                     if not sig:
                         continue
 
-                    # sentiment gate
+                    # Sentiment gate
                     if SENTIMENT_ONLY_GATE:
                         if sentiment == "bull" and sig["action"] != "buy":
                             continue
                         if sentiment == "bear" and sig["action"] != "sell":
                             continue
 
-                    # de-dupe by combo/action/time
-                    k = _dedupe_key("ml_pattern", sym, tf, sig["action"], sig.get("barTime",""))
+                    # De-dupe by combo/action/time
+                    k = _dedupe_key("ml_pattern", sym, tf, sig["action"], sig.get("barTime", ""))
                     if k in _sent_keys:
                         continue
                     _sent_keys.add(k)
 
-                    # one more positions cap just-in-time
+                    # Just-in-time concurrent cap
                     open_positions = sum(1 for lst in OPEN_TRADES.values() for t in lst if t.is_open)
                     if open_positions >= MAX_CONCURRENT_POSITIONS:
                         print(f"[LIMIT] Max concurrent reached mid-loop.", flush=True)
@@ -741,3 +758,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
