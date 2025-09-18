@@ -1,4 +1,16 @@
-requests
+# Core
 pandas
 numpy
+requests
 boto3
+pytz
+
+# Time & scheduling
+python-dateutil
+
+# ML & TA
+pandas-ta
+scikit-learn
+
+# Optional: if you’re plotting/debugging
+matplotlib
