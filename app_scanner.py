@@ -361,25 +361,110 @@ def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, c
 # ------------------------------
 # Sentiment gate (SPY/QQQ drift)
 # ------------------------------
-def compute_sentiment() -> str:
-    """Return 'bull', 'bear', or 'neutral' from SPY/QQQ 1m drift over SENTIMENT_LOOKBACK_MIN."""
-    rets = []
-    for sym in [s.strip().upper() for s in SENTIMENT_SYMBOLS if s.strip()]:
-        df = fetch_polygon_1m(sym, lookback_minutes=max(SENTIMENT_LOOKBACK_MIN+5, 90))
+# -------- Sentiment (RTH-aware + optional premarket gap) --------
+def _now_et():
+    return datetime.now(timezone.utc).astimezone(pytz.timezone("America/New_York"))
+
+def _is_rth(ts):
+    h, m = ts.hour, ts.minute
+    return ((h > 9) or (h == 9 and m >= 30)) and (h < 16)
+
+def compute_sentiment():
+    """
+    Modes (via env SENTIMENT_MODE):
+      - "rth_only": before 09:30 ET -> 'neutral'; during RTH use intraday momentum
+      - "premarket_gap": before 09:30 ET -> use gap vs prior close; during RTH use intraday momentum
+      - "intraday_momentum": always use momentum (original behaviour)
+    """
+    mode      = os.getenv("SENTIMENT_MODE", "rth_only").lower()
+    symbols   = [s.strip() for s in os.getenv("SENTS_SYMBOLS", "SPY,QQQ").split(",") if s.strip()]
+    look_min  = int(os.getenv("SENTS_LOOKBACK_MIN", "30"))   # momentum lookback (minutes)
+    tf_min    = int(os.getenv("SENTS_TF", "1"))
+    gap_bp    = float(os.getenv("SENTS_GAP_THRESHOLD_BP", "20")) / 10000.0  # 20bp=0.20%
+
+    now_et = _now_et()
+    is_rth_now = _is_rth(now_et)
+
+    def _intraday_momentum(sym):
+        df = fetch_polygon_1m(sym, lookback_minutes=max(look_min, tf_min*look_min))
         if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
-            continue
-        c0 = float(df["close"].iloc[-SENTIMENT_LOOKBACK_MIN]) if len(df) > SENTIMENT_LOOKBACK_MIN else float(df["close"].iloc[0])
-        c1 = float(df["close"].iloc[-1])
-        drift = (c1 - c0) / max(1e-9, c0)
-        rets.append(drift)
-    if not rets:
+            return 0.0
+        try:
+            df.index = df.index.tz_convert("America/New_York")
+        except Exception:
+            df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
+        bars = _resample(df, tf_min)
+        if bars is None or bars.empty:
+            return 0.0
+        window = bars.iloc[-min(len(bars), look_min):]
+        if len(window) < 2:
+            return 0.0
+        return (float(window["close"].iloc[-1]) / float(window["close"].iloc[0])) - 1.0
+
+    def _premarket_gap(sym):
+        # gap = (last price now vs yesterday RTH close)
+        df = fetch_polygon_1m(sym, lookback_minutes=24*60)
+        if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+            return 0.0
+        try:
+            df.index = df.index.tz_convert("America/New_York")
+        except Exception:
+            df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
+
+        # yesterday RTH close (last bar with 09:30<=t<16:00 of previous trading day)
+        dates = sorted({d.date() for d in df.index})
+        if len(dates) < 2:
+            return 0.0
+        yday = dates[-2]
+        y_rth = df[(df.index.date == yday) & (df.index.map(_is_rth))]
+        if y_rth.empty:
+            return 0.0
+        y_close = float(y_rth["close"].iloc[-1])
+
+        # current last traded price (could be premarket)
+        last_px = float(df["close"].iloc[-1])
+        return (last_px / y_close) - 1.0
+
+    vals = []
+    for s in symbols:
+        if mode == "intraday_momentum":
+            vals.append(_intraday_momentum(s))
+        elif mode == "premarket_gap":
+            if is_rth_now:
+                vals.append(_intraday_momentum(s))
+            else:
+                vals.append(_premarket_gap(s))
+        else:  # "rth_only" (default)
+            if is_rth_now:
+                vals.append(_intraday_momentum(s))
+            else:
+                # Be neutral before the bell
+                vals.append(0.0)
+
+    if not vals:
+        print("[SENTIMENT] no data; neutral", flush=True)
         return "neutral"
-    avg = float(np.mean(rets))
-    if avg > SENTIMENT_NEUTRAL_BAND:
-        return "bull"
-    if avg < -SENTIMENT_NEUTRAL_BAND:
-        return "bear"
-    return "neutral"
+
+    avg = sum(vals) / len(vals)
+
+    if mode == "premarket_gap" and not is_rth_now:
+        # Gap thresholds in bp
+        if avg >= gap_bp:
+            out = "bull"
+        elif avg <= -gap_bp:
+            out = "bear"
+        else:
+            out = "neutral"
+        print(f"[SENTIMENT] premarket gap avg={avg:+.4%} → {out}", flush=True)
+        return out
+
+    # Intraday momentum thresholds (tighter during RTH)
+    up_th = float(os.getenv("SENTS_UP_THRESH", "0.0015"))    # +0.15%
+    dn_th = float(os.getenv("SENTS_DN_THRESH", "-0.0015"))   # -0.15%
+
+    out = "bull" if avg >= up_th else "bear" if avg <= dn_th else "neutral"
+    print(f"[SENTIMENT] avg_momentum={avg:+.4%} → {out}", flush=True)
+    return out
 
 # ------------------------------
 # Strategy: ML Pattern (live adapter)
