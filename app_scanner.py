@@ -1,132 +1,151 @@
-# app_scanner.py — market scanner + sentiment-gated auto-trader for ML strategy
+# app_scanner.py — market scanner + auto-trader (TradersPost + Polygon)
+# - Dynamic symbol universe (Polygon reference, or env override)
+# - Multiple TFs; volume gate; sentiment gate; position sizing
+# - Daily profit target / drawdown kill switch (+ optional flatten)
+# - Max concurrent positions; per-minute order throttle
+# - End-of-day flatten
+# - Proper TradersPost TP/SL payload shape
 
 import os, time, json, math, hashlib, requests
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
-from dataclasses import dataclass
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-# ==============================
+# ------------------------------
 # ENV / CONFIG
-# ==============================
-TP_URL              = os.getenv("TP_WEBHOOK_URL", "").strip()
-POLYGON_API_KEY     = os.getenv("POLYGON_API_KEY", "").strip()
+# ------------------------------
+TP_URL              = os.getenv("TP_WEBHOOK_URL", "")            # TradersPost strategy webhook
+POLYGON_API_KEY     = os.getenv("POLYGON_API_KEY", "")           # Polygon key
+POLL_SECONDS        = int(os.getenv("POLL_SECONDS", "10"))       # main loop sleep
+RUN_ID              = datetime.now().astimezone().strftime("%Y-%m-%d")
 
-POLL_SECONDS        = int(os.getenv("POLL_SECONDS", "10"))
+# Universe / scan config
+SCANNER_SYMBOLS           = os.getenv("SCANNER_SYMBOLS", "").strip()  # comma list to override universe (optional)
+SCANNER_MAX_PAGES         = int(os.getenv("SCANNER_MAX_PAGES", "1"))  # pages of Polygon ref tickers (1000 per page)
+SCANNER_MIN_TODAY_VOL     = int(os.getenv("SCANNER_MIN_TODAY_VOL", "500000"))  # today volume gate per symbol
+TF_MIN_LIST               = [int(x) for x in os.getenv("TF_MIN_LIST", "1,2,3,5,10").split(",") if x.strip()]
 
-# Universe
-SCAN_TICKERS        = os.getenv("SCAN_TICKERS", "").strip()  # optional override (CSV)
-UNIVERSE_MAX        = int(os.getenv("UNIVERSE_MAX", "2000"))
-UNIVERSE_CACHE_MIN  = int(os.getenv("UNIVERSE_CACHE_MIN", "30"))  # minutes
-
-# Liquidity gates (absolute)
-MIN_AVG_DAILY_VOL   = int(os.getenv("MIN_AVG_DAILY_VOL", "0"))
-MIN_TODAY_VOL       = int(os.getenv("MIN_TODAY_VOL", "0"))
-
-# Timeframes to scan
-TF_MIN_LIST         = [int(x) for x in os.getenv("TF_MIN_LIST", "1,2,3,5,10").split(",") if x.strip()]
-
-# Risk / sizing (Colab parity)
+# Risk / sizing (bit-for-bit with your global wrapper intent)
 EQUITY_USD          = float(os.getenv("EQUITY_USD",  "100000"))
-RISK_PCT            = float(os.getenv("RISK_PCT",    "0.01"))
-MAX_POS_PCT         = float(os.getenv("MAX_POS_PCT", "0.10"))
+RISK_PCT            = float(os.getenv("RISK_PCT",    "0.01"))     # 1%
+MAX_POS_PCT         = float(os.getenv("MAX_POS_PCT", "0.10"))     # 10% notional cap
 MIN_QTY             = int(os.getenv("MIN_QTY", "1"))
-ROUND_LOT           = int(os.getenv("ROUND_LOT", "1"))
+ROUND_LOT           = int(os.getenv("ROUND_LOT","1"))
 
-# Run behavior
-MAX_OPEN_POS        = int(os.getenv("MAX_OPEN_POS", "50"))
-MAX_POSTS_PER_MIN   = int(os.getenv("MAX_POSTS_PER_MIN", "40"))
-
-# Market hours (US RTH) + auto-flatten
-AUTO_FLATTEN_MIN_BEFORE_CLOSE = int(os.getenv("AUTO_FLATTEN_MIN_BEFORE_CLOSE", "5"))
-TRADE_ONLY_RTH                = os.getenv("TRADE_ONLY_RTH", "1") in ("1","true","yes")
+# Engine guards
+MAX_CONCURRENT_POSITIONS  = int(os.getenv("MAX_CONCURRENT_POSITIONS", "100"))  # hard cap
+MAX_ORDERS_PER_MIN        = int(os.getenv("MAX_ORDERS_PER_MIN", "60"))         # throttle for TradersPost
+MARKET_TZ                 = "America/New_York"
+ALLOW_PREMARKET           = os.getenv("ALLOW_PREMARKET", "0").lower() in ("1","true","yes")
+ALLOW_AFTERHOURS          = os.getenv("ALLOW_AFTERHOURS", "0").lower() in ("1","true","yes")
 
 # Sentiment gate
-SENTIMENT_ON            = os.getenv("SENTIMENT_ON", "1") in ("1","true","yes")
-SENTIMENT_SYMBOL        = os.getenv("SENTIMENT_SYMBOL", "SPY").strip()
-SENTIMENT_TF            = int(os.getenv("SENTIMENT_TF", "5"))
-SENTIMENT_CACHE_SEC     = int(os.getenv("SENTIMENT_CACHE_SEC", "60"))
-SENTIMENT_NEUTRAL_ACTION= os.getenv("SENTIMENT_NEUTRAL_ACTION", "flat").lower()  # flat|long|short|both
-SHORTS_ENABLED          = os.getenv("SHORTS_ENABLED", "0") in ("1","true","yes")
+SENTIMENT_LOOKBACK_MIN    = int(os.getenv("SENTIMENT_LOOKBACK_MIN", "60"))   # minutes on 1m bars
+SENTIMENT_NEUTRAL_BAND    = float(os.getenv("SENTIMENT_NEUTRAL_BAND", "0.0015"))  # +/- drift band
+SENTIMENT_ONLY_GATE       = os.getenv("SENTIMENT_ONLY_GATE","1").lower() in ("1","true","yes")  # gate orders by sentiment
+SENTIMENT_SYMBOLS         = os.getenv("SENTIMENT_SYMBOLS", "SPY,QQQ").split(",")
 
-# Diagnostics
-RUN_ID              = datetime.now().astimezone().strftime("%Y-%m-%d")
-TP_SL_SAME_BAR      = os.getenv("TP_SL_SAME_BAR", "tp").lower()  # "tp" | "sl"
+# Daily portfolio guard
+START_EQUITY              = float(os.getenv("START_EQUITY", "100000"))
+DAILY_TP_PCT              = float(os.getenv("DAILY_TP_PCT", "0.03"))  # +3%
+DAILY_DD_PCT              = float(os.getenv("DAILY_DD_PCT", "0.05"))  # -5%
+DAILY_FLATTEN_ON_HIT      = os.getenv("DAILY_FLATTEN_ON_HIT","1").lower() in ("1","true","yes")
+HALT_TRADING              = False
+DAY_STAMP                 = datetime.now().astimezone().strftime("%Y-%m-%d")
 
-# Optional replay
-REPLAY_ON_START     = os.getenv("REPLAY_ON_START", "0") in ("1","true","yes")
-REPLAY_SYMBOL       = os.getenv("REPLAY_SYMBOL", "AAPL").strip()
-REPLAY_TF           = int(os.getenv("REPLAY_TF", "3"))
-REPLAY_HOURS        = int(os.getenv("REPLAY_HOURS", "24"))
+# Diagnostics / replay
+DRY_RUN                   = os.getenv("DRY_RUN","0") == "1"
+REPLAY_ON_START           = os.getenv("REPLAY_ON_START","0") == "1"
+REPLAY_SYMBOL             = os.getenv("REPLAY_SYMBOL","SPY")
+REPLAY_TF                 = int(os.getenv("REPLAY_TF","5"))
+REPLAY_HOURS              = int(os.getenv("REPLAY_HOURS","24"))
+REPLAY_SEND_ORDERS        = os.getenv("REPLAY_SEND_ORDERS","0").lower() in ("1","true","yes")
 
-# ==============================
-# Globals
-# ==============================
+# Counters / ledgers
 COUNTS        = defaultdict(int)
-COMBO_COUNTS  = defaultdict(int)
-_sent         = set()                # (symbol|tf|action|barTime) hash
+COMBO_COUNTS  = defaultdict(int)     # combo::<metric>
+PERF          = {}                   # combo -> rolling performance
 OPEN_TRADES   = defaultdict(list)    # (symbol, tf) -> [LiveTrade]
-POST_TIMES    = deque(maxlen=200)    # timestamps for throttle
-_last_uni_ts  = 0
-_uni_cache    = []
+_sent_keys    = set()                # de-dupe
+_order_times  = deque()              # throttle timestamps (epoch seconds)
 
-_last_sentiment = ("neutral", 0.0)   # (label, timestamp)
-
-# ==============================
-# Data classes
-# ==============================
-@dataclass
+# ------------------------------
+# Data models
+# ------------------------------
 class LiveTrade:
-    strategy: str
-    symbol: str
-    tf_min: int
-    side: str         # "buy" | "sell"
-    entry: float
-    tp: float
-    sl: float
-    qty: int
-    entry_time: str
-    is_open: bool = True
-    exit: float = None
-    exit_time: str = None
-    reason: str = None  # "tp" | "sl" | "flatten"
+    def __init__(self, combo, symbol, tf_min, side, entry, tp, sl, qty, entry_time):
+        self.combo = combo
+        self.symbol = symbol
+        self.tf_min = int(tf_min)
+        self.side = side            # "buy" or "sell"
+        self.entry = float(entry) if entry is not None else float("nan")
+        self.tp = float(tp) if tp is not None else float("nan")
+        self.sl = float(sl) if sl is not None else float("nan")
+        self.qty = int(qty)
+        self.entry_time = entry_time
+        self.is_open = True
+        self.exit = None
+        self.exit_time = None
+        self.reason = None
 
-# ==============================
-# Helpers: session, sizing, dedupe
-# ==============================
+# ------------------------------
+# Utils
+# ------------------------------
+def _now_et():
+    return datetime.now(timezone.utc).astimezone()
+
 def _is_rth(ts):
+    # 9:30<=t<16:00 local exchange time
     h, m = ts.hour, ts.minute
     return ((h > 9) or (h == 9 and m >= 30)) and (h < 16)
 
-def _near_close(ts, minutes=5):
-    return (ts.hour == 15 and ts.minute >= (60 - minutes)) or (ts.hour == 16 and ts.minute == 0)
+def _in_session(ts):
+    if _is_rth(ts):
+        return True
+    if ALLOW_PREMARKET and (4 <= ts.hour < 9 or (ts.hour == 9 and ts.minute < 30)):
+        return True
+    if ALLOW_AFTERHOURS and (16 <= ts.hour < 20):
+        return True
+    return False
 
+def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
+    if df1m is None or df1m.empty:
+        return pd.DataFrame()
+    if not isinstance(df1m.index, pd.DatetimeIndex):
+        return pd.DataFrame()
+    rule = f"{int(tf_min)}min"
+    agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
+    try:
+        bars = df1m.resample(rule, origin="start_day", label="right").agg(agg).dropna()
+    except Exception:
+        bars = pd.DataFrame()
+    return bars
+
+def _dedupe_key(strategy: str, symbol: str, tf: int, action: str, bar_time: str) -> str:
+    raw = f"{strategy}|{symbol}|{tf}|{action}|{bar_time}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+# Position sizing (your wrapper logic)
 def _position_qty(entry_price: float, stop_price: float,
                   equity=EQUITY_USD, risk_pct=RISK_PCT, max_pos_pct=MAX_POS_PCT,
                   min_qty=MIN_QTY, round_lot=ROUND_LOT) -> int:
     if entry_price is None or stop_price is None:
         return 0
-    risk_per_share = abs(entry_price - stop_price)
+    risk_per_share = abs(float(entry_price) - float(stop_price))
     if risk_per_share <= 0:
         return 0
     qty_risk     = (equity * risk_pct) / risk_per_share
-    qty_notional = (equity * max_pos_pct) / max(1e-9, entry_price)
+    qty_notional = (equity * max_pos_pct) / max(1e-9, float(entry_price))
     qty = math.floor(max(min(qty_risk, qty_notional), 0) / max(1, round_lot)) * max(1, round_lot)
     return int(max(qty, min_qty if qty > 0 else 0))
 
-def _dedupe_key(symbol: str, tf: int, action: str, bar_time: str) -> str:
-    raw = f"{symbol}|{tf}|{action}|{bar_time}"
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-def _open_positions_count() -> int:
-    return sum(t.is_open for lst in OPEN_TRADES.values() for t in lst)
-
-# ==============================
+# ------------------------------
 # Polygon fetchers
-# ==============================
+# ------------------------------
 def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
+    """Return tz-aware ET 1m bars with o/h/l/c/volume."""
     if not POLYGON_API_KEY:
         return pd.DataFrame()
     end = datetime.now(timezone.utc)
@@ -136,181 +155,168 @@ def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
         f"{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
         f"?adjusted=true&sort=asc&limit=50000&apiKey={POLYGON_API_KEY}"
     )
-    r = requests.get(url, timeout=15)
-    if r.status_code != 200:
-        return pd.DataFrame()
-    rows = r.json().get("results", [])
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    df["ts"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    df = df.set_index("ts").sort_index()
     try:
-        df.index = df.index.tz_convert("America/New_York")
+        r = requests.get(url, timeout=15)
+        if r.status_code != 200:
+            return pd.DataFrame()
+        rows = r.json().get("results", [])
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df["ts"] = pd.to_datetime(df["t"], unit="ms", utc=True)
+        df = df.set_index("ts").sort_index()
+        df.index = df.index.tz_convert(MARKET_TZ)
+        df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
+        return df[["open","high","low","close","volume"]]
     except Exception:
-        df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
-    df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
-    return df[["open","high","low","close","volume"]]
+        return pd.DataFrame()
 
-def _poly_reference_symbols(limit=1000):
+def get_universe_symbols() -> list:
+    """Universe: env override OR Polygon reference tickers (active US stocks)."""
+    if SCANNER_SYMBOLS:
+        return [s.strip().upper() for s in SCANNER_SYMBOLS.split(",") if s.strip()]
     if not POLYGON_API_KEY:
         return []
     out = []
-    url = f"https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&limit=1000&apiKey={POLYGON_API_KEY}"
-    while url and len(out) < limit:
-        r = requests.get(url, timeout=20)
+    page_token = None
+    pages = 0
+    while pages < SCANNER_MAX_PAGES:
+        params = {
+            "market":"stocks",
+            "active":"true",
+            "limit":"1000",
+            "apiKey": POLYGON_API_KEY
+        }
+        if page_token:
+            params["cursor"] = page_token
+        url = "https://api.polygon.io/v3/reference/tickers"
+        r = requests.get(url, params=params, timeout=20)
         if r.status_code != 200:
             break
-        data = r.json()
-        for row in data.get("results", []):
-            t = row.get("ticker")
-            primary = row.get("primary_exchange", "")
-            _type = row.get("type", "")
-            if t and _type in ("CS", "ADRC") and primary in ("XNYS", "XNAS", "ARCX", "BATS"):
-                out.append(t)
-                if len(out) >= limit:
-                    break
-        url = data.get("next_url")
-        if url and "apiKey=" not in url:
-            url = url + ("&" if "?" in url else "?") + f"apiKey={POLYGON_API_KEY}"
+        j = r.json()
+        results = j.get("results", [])
+        out.extend([x["ticker"] for x in results if x.get("ticker")])
+        page_token = j.get("next_url", None)
+        if not page_token:
+            break
+        pages += 1
+    # Basic hygiene: drop weird symbols
+    out = [s for s in out if s.isalnum()]
     return out
 
-def _poly_daily_30d(symbol: str) -> pd.DataFrame:
-    if not POLYGON_API_KEY:
-        return pd.DataFrame()
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=45)
-    url = (
-        f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/"
-        f"{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
-        f"?adjusted=true&sort=desc&limit=50&apiKey={POLYGON_API_KEY}"
-    )
-    r = requests.get(url, timeout=15)
-    if r.status_code != 200:
-        return pd.DataFrame()
-    rows = r.json().get("results", [])
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    df["ts"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    df = df.set_index("ts").sort_index(ascending=False)
-    df = df.rename(columns={"v":"volume"})
-    return df[["volume"]].head(30)
-
-def _get_today_volume(symbol: str) -> int:
-    df1m = fetch_polygon_1m(symbol, lookback_minutes=9*60)
-    if df1m is None or df1m.empty:
-        return 0
+# ------------------------------
+# TradersPost I/O
+# ------------------------------
+def send_to_traderspost(payload: dict):
+    """POST order payload to TradersPost or DRY-RUN."""
     try:
-        df1m.index = df1m.index.tz_convert("America/New_York")
-    except Exception:
-        df1m.index = df1m.index.tz_localize("UTC").tz_convert("America/New_York")
-    today_et = datetime.now(timezone.utc).astimezone().date()
-    df_today = df1m[df1m.index.date == today_et]
-    if df_today.empty:
-        return 0
-    return int(df_today["volume"].sum())
+        if DRY_RUN:
+            print(f"[DRY-RUN] {json.dumps(payload)[:500]}", flush=True)
+            return True, "dry-run"
+        if not TP_URL:
+            print("[ERROR] TP_WEBHOOK_URL missing.", flush=True)
+            return False, "no-webhook-url"
 
-def volume_ok(symbol: str) -> bool:
-    try:
-        if MIN_AVG_DAILY_VOL > 0:
-            d = _poly_daily_30d(symbol)
-            if d.empty:
-                return False
-            adv30 = float(d["volume"].mean())
-            if adv30 < MIN_AVG_DAILY_VOL:
-                return False
-        if MIN_TODAY_VOL > 0:
-            if _get_today_volume(symbol) < MIN_TODAY_VOL:
-                return False
-        return True
+        # throttle: max N per minute
+        now = time.time()
+        while _order_times and now - _order_times[0] > 60:
+            _order_times.popleft()
+        if len(_order_times) >= MAX_ORDERS_PER_MIN:
+            return False, f"throttled: {len(_order_times)}/{MAX_ORDERS_PER_MIN} in last 60s"
+        _order_times.append(now)
+
+        # annotate meta
+        payload.setdefault("meta", {})
+        payload["meta"]["environment"] = "paper"
+        payload["meta"]["sentAt"] = datetime.now(timezone.utc).isoformat()
+
+        r = requests.post(TP_URL, json=payload, timeout=12)
+        ok = 200 <= r.status_code < 300
+        info = f"{r.status_code} {r.text[:300]}"
+        if not ok:
+            print(f"[POST ERROR] {info}", flush=True)
+        return ok, info
     except Exception as e:
-        print(f"[VOLUME CHECK ERROR] {symbol}: {e}", flush=True)
-        return False
+        return False, f"exception: {e}"
 
-# ==============================
-# Bars helpers
-# ==============================
-def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
-    rule = f"{int(tf_min)}min"
-    agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
-    return df1m.resample(rule, origin="start_day", label="right").agg(agg).dropna()
-
-# ==============================
-# Sentiment engine
-# ==============================
-def _compute_sentiment():
+def build_payload(symbol: str, sig: dict):
     """
-    EMA(50/200) + price vs EMA50 on SENTIMENT_SYMBOL at SENTIMENT_TF.
-    Returns: "bull" | "bear" | "neutral"
+    Accepts either:
+      - sig['tp_abs'] / sig['sl_abs']  (absolute)
+      - or legacy sig['takeProfit'] / sig['stopLoss'] (absolute)
+    and shapes TradersPost nested fields.
     """
-    global _last_sentiment
-    now = time.time()
-    label, ts_cached = _last_sentiment
-    if (now - ts_cached) < SENTIMENT_CACHE_SEC:
-        return label
+    action     = sig.get("action")
+    order_type = sig.get("orderType","market")
+    qty        = int(sig.get("quantity", 0))
 
-    df1m = fetch_polygon_1m(SENTIMENT_SYMBOL, lookback_minutes=max(240, SENTIMENT_TF*300))
-    if df1m is None or df1m.empty:
-        _last_sentiment = ("neutral", now); return "neutral"
+    payload = {
+        "ticker": symbol,
+        "action": action,
+        "orderType": order_type,
+        "quantity": qty,
+        "meta": {}
+    }
+    if isinstance(sig.get("meta"), dict):
+        payload["meta"].update(sig["meta"])
+    if sig.get("barTime"):
+        payload["meta"]["barTime"] = sig["barTime"]
 
-    bars = _resample(df1m, SENTIMENT_TF)
-    if bars is None or bars.empty or len(bars) < 220:
-        _last_sentiment = ("neutral", now); return "neutral"
+    # map limit if provided
+    if order_type.lower() == "limit" and sig.get("price") is not None:
+        payload["limitPrice"] = float(round(sig["price"], 2))
 
-    ema50  = bars["close"].ewm(span=50, adjust=False).mean()
-    ema200 = bars["close"].ewm(span=200, adjust=False).mean()
-    c = bars["close"].iloc[-1]
-    e50 = ema50.iloc[-1]
-    e200= ema200.iloc[-1]
+    tp_abs = sig.get("tp_abs", sig.get("takeProfit"))
+    sl_abs = sig.get("sl_abs", sig.get("stopLoss"))
 
-    if e50 > e200 and c > e50:
-        label = "bull"
-    elif e50 < e200 and c < e50:
-        label = "bear"
-    else:
-        label = "neutral"
+    if tp_abs is not None:
+        payload["takeProfit"] = {"limitPrice": float(round(tp_abs, 2))}
+    if sl_abs is not None:
+        payload["stopLoss"] = {"type":"stop", "stopPrice": float(round(sl_abs, 2))}
+    return payload
 
-    _last_sentiment = (label, now)
-    return label
+# ------------------------------
+# Performance & ledger
+# ------------------------------
+def _combo_key(strategy: str, symbol: str, tf_min: int) -> str:
+    return f"{strategy}|{symbol}|{int(tf_min)}"
 
-def _sentiment_allows(action: str):
-    """
-    Decide whether a new entry 'buy' or 'sell' is allowed based on sentiment and settings.
-    """
-    if not SENTIMENT_ON:
-        return True
+def _perf_init(combo: str):
+    if combo not in PERF:
+        PERF[combo] = {
+            "trades": 0, "wins": 0, "losses": 0,
+            "gross_profit": 0.0, "gross_loss": 0.0,
+            "net_pnl": 0.0, "max_dd": 0.0,
+            "equity_curve": [0.0],
+        }
 
-    label = _compute_sentiment()
-    if label == "bull":
-        return action == "buy"
-    if label == "bear":
-        return SHORTS_ENABLED and action == "sell"
+def _perf_update(combo: str, pnl: float):
+    _perf_init(combo)
+    p = PERF[combo]
+    p["trades"] += 1
+    if pnl > 0:
+        p["wins"] += 1
+        p["gross_profit"] += pnl
+    elif pnl < 0:
+        p["losses"] += 1
+        p["gross_loss"] += pnl
+    p["net_pnl"] += pnl
+    ec = p["equity_curve"]
+    ec.append(ec[-1] + pnl)
+    dd = min(0.0, ec[-1] - max(ec))
+    p["max_dd"] = min(p["max_dd"], dd)
 
-    # neutral
-    if SENTIMENT_NEUTRAL_ACTION == "flat":
-        return False
-    if SENTIMENT_NEUTRAL_ACTION == "long":
-        return action == "buy"
-    if SENTIMENT_NEUTRAL_ACTION == "short":
-        return SHORTS_ENABLED and action == "sell"
-    if SENTIMENT_NEUTRAL_ACTION == "both":
-        return action in ("buy", "sell") and (SHORTS_ENABLED or action == "buy")
-    return False
-
-# ==============================
-# Ledger close on bar
-# ==============================
-def _record_open_trade(strategy: str, symbol: str, tf_min: int, sig: dict):
-    tp = sig.get("tp_abs") if sig.get("tp_abs") is not None else sig.get("takeProfit")
-    sl = sig.get("sl_abs") if sig.get("sl_abs") is not None else sig.get("stopLoss")
-
+def _record_open_trade(strat_name: str, symbol: str, tf_min: int, sig: dict):
+    combo = _combo_key(strat_name, symbol, tf_min)
+    _perf_init(combo)
+    tp = sig.get("tp_abs", sig.get("takeProfit"))
+    sl = sig.get("sl_abs", sig.get("stopLoss"))
     t = LiveTrade(
-        strategy=strategy,
+        combo=combo,
         symbol=symbol,
         tf_min=int(tf_min),
         side=sig["action"],
-        entry=float(sig.get("entry") or sig.get("price") or 0.0) if (sig.get("entry") is not None or sig.get("price") is not None) else float("nan"),
+        entry=float(sig.get("entry") or sig.get("price") or sig.get("lastClose") or 0.0),
         tp=float(tp) if tp is not None else float("nan"),
         sl=float(sl) if sl is not None else float("nan"),
         qty=int(sig["quantity"]),
@@ -320,346 +326,384 @@ def _record_open_trade(strategy: str, symbol: str, tf_min: int, sig: dict):
 
 def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, close: float):
     key = (symbol, int(tf_min))
-    if key not in OPEN_TRADES:
-        return
-    for t in OPEN_TRADES[key]:
+    trades = OPEN_TRADES.get(key, [])
+    for t in trades:
         if not t.is_open:
             continue
-
         hit_tp = (high >= t.tp) if t.side == "buy" else (low <= t.tp)
         hit_sl = (low <= t.sl) if t.side == "buy" else (high >= t.sl)
-
-        if hit_tp and hit_sl:
-            if TP_SL_SAME_BAR == "sl":
-                hit_tp, hit_sl = False, True
-            else:
-                hit_tp, hit_sl = True, False
-
-        # auto-flatten near close
-        flatten_now = TRADE_ONLY_RTH and _near_close(ts, AUTO_FLATTEN_MIN_BEFORE_CLOSE)
-
-        if hit_tp or hit_sl or flatten_now:
+        if hit_tp or hit_sl:
             t.is_open = False
             t.exit_time = ts.tz_convert("UTC").isoformat() if hasattr(ts, "tzinfo") else str(ts)
             if hit_tp:
-                t.exit = t.tp; t.reason = "tp"
-            elif hit_sl:
-                t.exit = t.sl; t.reason = "sl"
+                t.exit = t.tp
+                t.reason = "tp"
             else:
-                t.exit = close; t.reason = "flatten"
-
+                t.exit = t.sl
+                t.reason = "sl"
             pnl = (t.exit - t.entry) * t.qty if t.side == "buy" else (t.entry - t.exit) * t.qty
-            print(f"[CLOSE] {t.strategy}|{t.symbol}|{t.tf_min} {t.reason.upper()} qty={t.qty} entry={t.entry:.2f} exit={t.exit:.2f} pnl={pnl:+.2f}", flush=True)
+            _perf_update(t.combo, pnl)
+            print(f"[CLOSE] {t.combo} {t.reason.upper()} qty={t.qty} entry={t.entry:.2f} exit={t.exit:.2f} pnl={pnl:+.2f}", flush=True)
 
-# ==============================
-# TradersPost payload / post / throttle
-# ==============================
-def build_payload(symbol: str, sig: dict):
-    payload = {
-        "ticker": symbol,
-        "action": sig["action"],
-        "orderType": sig.get("orderType", "market"),
-        "quantity": int(sig["quantity"]),
-        "meta": {}
-    }
-    if isinstance(sig.get("meta"), dict):
-        payload["meta"].update(sig["meta"])
-    if sig.get("barTime"):
-        payload["meta"]["barTime"] = sig["barTime"]
+# ------------------------------
+# Sentiment gate (SPY/QQQ drift)
+# ------------------------------
+def compute_sentiment() -> str:
+    """Return 'bull', 'bear', or 'neutral' from SPY/QQQ 1m drift over SENTIMENT_LOOKBACK_MIN."""
+    rets = []
+    for sym in [s.strip().upper() for s in SENTIMENT_SYMBOLS if s.strip()]:
+        df = fetch_polygon_1m(sym, lookback_minutes=max(SENTIMENT_LOOKBACK_MIN+5, 90))
+        if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex):
+            continue
+        c0 = float(df["close"].iloc[-SENTIMENT_LOOKBACK_MIN]) if len(df) > SENTIMENT_LOOKBACK_MIN else float(df["close"].iloc[0])
+        c1 = float(df["close"].iloc[-1])
+        drift = (c1 - c0) / max(1e-9, c0)
+        rets.append(drift)
+    if not rets:
+        return "neutral"
+    avg = float(np.mean(rets))
+    if avg > SENTIMENT_NEUTRAL_BAND:
+        return "bull"
+    if avg < -SENTIMENT_NEUTRAL_BAND:
+        return "bear"
+    return "neutral"
 
-    if payload["orderType"].lower() == "limit" and sig.get("price") is not None:
-        payload["limitPrice"] = float(round(sig["price"], 2))
-
-    tp_abs = sig.get("tp_abs")
-    sl_abs = sig.get("sl_abs")
-    if tp_abs is None and sig.get("takeProfit") is not None:
-        tp_abs = float(sig["takeProfit"])
-    if sl_abs is None and sig.get("stopLoss") is not None:
-        sl_abs = float(sig["stopLoss"])
-
-    if tp_abs is not None:
-        payload["takeProfit"] = {"limitPrice": float(round(tp_abs, 2))}
-    if sl_abs is not None:
-        payload["stopLoss"] = {"type": "stop", "stopPrice": float(round(sl_abs, 2))}
-
-    return payload
-
-POST_TIMES = deque(maxlen=200)
-def _throttle_ok():
-    now = time.time()
-    while POST_TIMES and now - POST_TIMES[0] > 60:
-        POST_TIMES.popleft()
-    return len(POST_TIMES) < MAX_POSTS_PER_MIN
-
-def send_to_traderspost(payload: dict):
-    if not TP_URL:
-        print("[POST] Missing TP_WEBHOOK_URL", flush=True)
-        return False, "missing-webhook-url"
-    if not _throttle_ok():
-        return False, "throttled"
-
+# ------------------------------
+# Strategy: ML Pattern (live adapter)
+# ------------------------------
+def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, conf_threshold=0.8, r_multiple=3.0):
+    """
+    Lightweight live adapter that mirrors your backtest intent:
+    - Resample to tf; build simple features; train RF on historical slice; predict last bar.
+    - Long-only by default. Volume gate handled by caller via today's volume check.
+    NOTE: This keeps model in-process (no persistence) for simplicity.
+    """
     try:
-        payload.setdefault("meta", {})
-        payload["meta"]["environment"] = "paper"
-        payload["meta"]["sentAt"] = datetime.now(timezone.utc).isoformat()
-        r = requests.post(TP_URL, json=payload, timeout=12)
-        ok = 200 <= r.status_code < 300
-        info = f"{r.status_code} {r.text[:300]}"
-        if ok:
-            POST_TIMES.append(time.time())
-        else:
-            print(f"[POST ERROR] {info}", flush=True)
-        return ok, info
-    except Exception as e:
-        return False, f"exception: {e}"
-
-# ==============================
-# Strategy adapter: ML pattern (long + optional short)
-# ==============================
-def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int = 5,
-                      conf_threshold: float = 0.8, n_estimators: int = 100,
-                      r_multiple: float = 3.0, allow_shorts: bool = False):
-    """
-    Returns a single-bar-close signal dict or None.
-    Long when model positive-prob >= threshold.
-    Short (if allow_shorts) when negative-prob >= threshold.
-    """
-    if df1m is None or df1m.empty:
+        from sklearn.ensemble import RandomForestClassifier
+        import pandas_ta as ta
+    except Exception:
+        # If packages missing, skip
         return None
 
-    try:
-        import pandas_ta as ta
-        from sklearn.ensemble import RandomForestClassifier
-    except Exception as e:
-        print(f"[STRAT IMPORT ERROR] {e}", flush=True)
+    if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
         return None
 
     bars = _resample(df1m, tf_min)
-    if bars is None or bars.empty or len(bars) < 80:
+    if bars.empty or len(bars) < 120:
         return None
 
+    # Features
+    bars = bars.copy()
     bars["return"] = bars["close"].pct_change()
     bars["rsi"] = ta.rsi(bars["close"], length=14)
     bars["volatility"] = bars["close"].rolling(20).std()
-    bars = bars.dropna()
+    bars.dropna(inplace=True)
     if len(bars) < 60:
         return None
 
-    features = bars[["return","rsi","volatility"]]
-    target = (bars["close"].shift(-1) > bars["close"]).astype(int)
+    X = bars[["return","rsi","volatility"]].copy()
+    y = (bars["close"].shift(-1) > bars["close"]).astype(int)
+    X = X.iloc[:-1]; y = y.iloc[:-1]  # last row reserved for inference target alignment
 
-    train_size = int(len(features) * 0.7)
-    X_train, y_train = features.iloc[:train_size], target.iloc[:train_size]
-    X_test  = features.iloc[train_size:]
-    if X_test.empty:
+    if len(X) < 50:
         return None
 
-    model = RandomForestClassifier(n_estimators=n_estimators, random_state=42)
-    try:
-        model.fit(X_train, y_train)
-    except Exception as e:
-        print(f"[MODEL FIT ERROR] {symbol} {tf_min}m: {e}", flush=True)
+    cut = int(len(X) * 0.7)
+    X_train, y_train = X.iloc[:cut], y.iloc[:cut]
+    X_test  = X.iloc[cut:]
+
+    clf = RandomForestClassifier(n_estimators=100, random_state=42)
+    clf.fit(X_train, y_train)
+    proba = clf.predict_proba([X.iloc[-1]])[0][1]   # prob of up
+    pred  = int(proba >= 0.5)
+
+    ts = bars.index[-1]
+    if not _in_session(ts):
         return None
 
-    bars_test = bars.iloc[train_size:].copy()
-    try:
-        proba = model.predict_proba(X_test)
-    except Exception as e:
-        print(f"[MODEL PRED ERROR] {symbol} {tf_min}m: {e}", flush=True)
-        return None
-
-    pos_conf = proba[:,1]  # P(y=1)
-    neg_conf = proba[:,0]  # P(y=0)
-
-    bars_test["pos_conf"] = pos_conf
-    bars_test["neg_conf"] = neg_conf
-
-    ts = bars_test.index[-1]
-    row = bars_test.iloc[-1]
-    if TRADE_ONLY_RTH and (not _is_rth(ts)):
-        return None
-
-    price = float(row["close"])
-
-    # ----- Long path -----
-    if row["pos_conf"] >= conf_threshold:
-        entry = price
-        sl    = entry * 0.99
-        tp    = entry * (1.0 + r_multiple * 0.01)
-        qty   = _position_qty(entry, sl)
-        if qty > 0:
-            return {
-                "action": "buy",
-                "orderType": "market",
-                "quantity": int(qty),
-                "barTime": ts.tz_convert("UTC").isoformat(),
-                "entry": entry,
-                "tp_abs": float(tp),
-                "sl_abs": float(sl),
-                "meta": {"strategy": "ml_pattern", "tf": f"{tf_min}m"}
-            }
-
-    # ----- Short path (optional) -----
-    if allow_shorts and row["neg_conf"] >= conf_threshold:
-        entry = price
-        sl    = entry * 1.01
-        tp    = entry * (1.0 - r_multiple * 0.01)
-        # position sizing uses entry vs stop
-        qty   = _position_qty(entry, sl)
-        if qty > 0:
-            return {
-                "action": "sell",
-                "orderType": "market",
-                "quantity": int(qty),
-                "barTime": ts.tz_convert("UTC").isoformat(),
-                "entry": entry,
-                "tp_abs": float(tp),
-                "sl_abs": float(sl),
-                "meta": {"strategy": "ml_pattern", "tf": f"{tf_min}m"}
-            }
-
+    # Entry rule (long-only here; sentiment gate will filter later)
+    if pred == 1 and proba >= conf_threshold:
+        price = float(bars["close"].iloc[-1])
+        sl    = price * 0.99             # 1% stop
+        tp    = price * (1 + 0.01*r_multiple)  # r-multiple based on 1% unit
+        qty   = _position_qty(price, sl)
+        if qty <= 0:
+            return None
+        return {
+            "action":"buy","orderType":"market","price":None,
+            "takeProfit":tp,"stopLoss":sl,
+            "barTime": ts.tz_convert("UTC").isoformat(),
+            "entry": price,
+            "quantity": int(qty),
+            "meta": {"note":"ml_pattern"}
+        }
     return None
 
-# ==============================
-# Universe & scanning
-# ==============================
-def get_universe():
-    global _last_uni_ts, _uni_cache
-    now = time.time()
-    if _uni_cache and (now - _last_uni_ts) < (UNIVERSE_CACHE_MIN * 60):
-        return _uni_cache
+# ------------------------------
+# Daily guard
+# ------------------------------
+def _today_local_date_str():
+    return datetime.now().astimezone().strftime("%Y-%m-%d")
 
-    if SCAN_TICKERS:
-        syms = [x.strip().upper() for x in SCAN_TICKERS.split(",") if x.strip()]
-        _uni_cache = syms; _last_uni_ts = now
-        return syms
+def _realized_day_pnl() -> float:
+    total = 0.0
+    for _, p in PERF.items():
+        total += float(p.get("net_pnl", 0.0))
+    return total
 
-    syms = _poly_reference_symbols(limit=UNIVERSE_MAX)
-    _uni_cache = syms; _last_uni_ts = now
-    print(f"[UNIVERSE] {len(syms)} symbols discovered.", flush=True)
-    return syms
+def _opposite(action: str) -> str:
+    return "sell" if action == "buy" else "buy"
 
-def compute_signal(symbol: str, tf: int):
-    df1m = fetch_polygon_1m(symbol, lookback_minutes=max(240, tf*80))
+def flatten_all_open_positions():
+    posted = 0
+    for (sym, tf), trades in list(OPEN_TRADES.items()):
+        for t in trades:
+            if not t.is_open or not t.qty or not t.symbol:
+                continue
+            exit_action = _opposite(t.side)
+            payload = {
+                "ticker": t.symbol,
+                "action": exit_action,
+                "orderType": "market",
+                "quantity": int(t.qty),
+                "meta": {
+                    "note": "daily-guard-flatten",
+                    "combo": t.combo,
+                    "triggeredAt": datetime.now(timezone.utc).isoformat()
+                }
+            }
+            ok, info = send_to_traderspost(payload)
+            print(f"[DAILY-GUARD] Flatten {t.combo} -> ok={ok} info={info}", flush=True)
+            posted += 1
+            try:
+                t.is_open = False
+                t.exit_time = datetime.now(timezone.utc).isoformat()
+                t.exit = t.entry
+                t.reason = "daily_guard"
+            except Exception:
+                pass
+    print(f"[DAILY-GUARD] Flatten requests posted: {posted}", flush=True)
+
+def reset_daily_guard_if_new_day():
+    global DAY_STAMP, HALT_TRADING
+    today = _today_local_date_str()
+    if today != DAY_STAMP:
+        HALT_TRADING = False
+        DAY_STAMP = today
+        print(f"[DAILY-GUARD] New day -> reset HALT_TRADING. Day={DAY_STAMP}", flush=True)
+
+def check_daily_guard_and_maybe_halt():
+    global HALT_TRADING
+    realized = _realized_day_pnl()
+    equity   = START_EQUITY + realized
+    up_lim   = START_EQUITY * (1.0 + DAILY_TP_PCT)
+    dn_lim   = START_EQUITY * (1.0 - DAILY_DD_PCT)
+
+    print(f"[DAILY-GUARD] eq={equity:.2f} start={START_EQUITY:.2f} realized={realized:+.2f} "
+          f"targets +{DAILY_TP_PCT*100:.1f}%({up_lim:.2f}) / -{DAILY_DD_PCT*100:.1f}%({dn_lim:.2f})",
+          flush=True)
+
+    if HALT_TRADING:
+        return
+
+    if equity >= up_lim:
+        HALT_TRADING = True
+        print("[DAILY-GUARD] ✅ Daily TP hit. Halting entries.", flush=True)
+        if DAILY_FLATTEN_ON_HIT:
+            flatten_all_open_positions()
+    elif equity <= dn_lim:
+        HALT_TRADING = True
+        print("[DAILY-GUARD] ⛔ Daily DD hit. Halting entries.", flush=True)
+        if DAILY_FLATTEN_ON_HIT:
+            flatten_all_open_positions()
+
+# ------------------------------
+# Router (scanner)
+# ------------------------------
+def compute_signal(strategy_name, symbol, tf_minutes, df1m=None):
+    df1m = df1m or fetch_polygon_1m(symbol, lookback_minutes=max(240, tf_minutes*240))
     if df1m is None or df1m.empty:
         return None
-    allow_shorts = SHORTS_ENABLED
-    return signal_ml_pattern(symbol, df1m, tf, allow_shorts=allow_shorts)
+    try:
+        df1m.index = df1m.index.tz_convert(MARKET_TZ)
+    except Exception:
+        df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
 
-# ==============================
+    # today's cum volume gate
+    today_mask = df1m.index.date == df1m.index[-1].date()
+    todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
+    if todays_vol < SCANNER_MIN_TODAY_VOL:
+        return None
+
+    if strategy_name == "ml_pattern":
+        return signal_ml_pattern(symbol, df1m, tf_minutes)
+    return None
+
+# ------------------------------
 # Replay (optional)
-# ==============================
-def replay_once():
+# ------------------------------
+def replay_signals_once():
     if not REPLAY_ON_START:
         return
     df1m = fetch_polygon_1m(REPLAY_SYMBOL, lookback_minutes=REPLAY_HOURS*60)
     if df1m is None or df1m.empty:
-        print("[REPLAY] no data", flush=True); return
+        print("[REPLAY] No data.", flush=True)
+        return
     try:
-        df1m.index = df1m.index.tz_convert("America/New_York")
+        df1m.index = df1m.index.tz_convert(MARKET_TZ)
     except Exception:
-        df1m.index = df1m.index.tz_localize("UTC").tz_convert("America/New_York")
+        df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
     bars = _resample(df1m, REPLAY_TF)
-    hits = 0; last_key = None
+    if bars.empty:
+        print("[REPLAY] Bars empty.", flush=True)
+        return
+    hits = 0
+    last_key = None
     for i in range(len(bars)):
         df_slice = df1m.loc[:bars.index[i]]
-        sig = signal_ml_pattern(REPLAY_SYMBOL, df_slice, REPLAY_TF, allow_shorts=SHORTS_ENABLED)
+        sig = signal_ml_pattern(REPLAY_SYMBOL, df_slice, REPLAY_TF)
         if sig:
+            if REPLAY_SEND_ORDERS:
+                handle_signal("ml_pattern", REPLAY_SYMBOL, REPLAY_TF, sig)
             k = (sig.get("barTime",""), sig.get("action",""))
             if k != last_key:
-                hits += 1; last_key = k
-    print(f"[REPLAY] {REPLAY_SYMBOL} {REPLAY_TF}m -> {hits} signal(s) in last {REPLAY_HOURS}h.", flush=True)
+                hits += 1
+                last_key = k
+    print(f"[REPLAY] ml_pattern {REPLAY_SYMBOL} {REPLAY_TF}m -> {hits} signals in {REPLAY_HOURS}h.", flush=True)
 
-# ==============================
+# ------------------------------
+# Signal handling
+# ------------------------------
+def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
+    combo_key = _combo_key(strat_name, symbol, tf_min)
+    COUNTS["signals"] += 1
+    COMBO_COUNTS[f"{combo_key}::signals"] += 1
+
+    meta = sig.get("meta", {})
+    meta["combo"] = combo_key
+    meta["timeframe"] = f"{int(tf_min)}m"
+    sig["meta"] = meta
+
+    # Record in ledger first
+    _record_open_trade(strat_name, symbol, tf_min, sig)
+
+    payload = build_payload(symbol, sig)
+    ok, info = send_to_traderspost(payload)
+    try:
+        if ok:
+            COUNTS["orders.ok"] += 1
+            COMBO_COUNTS[f"{combo_key}::orders.ok"] += 1
+        else:
+            COUNTS["orders.err"] += 1
+            COMBO_COUNTS[f"{combo_key}::orders.err"] += 1
+    except Exception:
+        pass
+    print(f"[ORDER] {combo_key} -> qty={sig.get('quantity')} ok={ok} info={info}", flush=True)
+
+# ------------------------------
 # Main
-# ==============================
+# ------------------------------
 def main():
     print("Scanner starting…", flush=True)
-    if REPLAY_ON_START:
-        replay_once()
+
+    # Universe
+    symbols = get_universe_symbols()
+    print(f"[UNIVERSE] symbols={len(symbols)}  TFs={TF_MIN_LIST}  vol_gate={SCANNER_MIN_TODAY_VOL}", flush=True)
+
+    replay_signals_once()
 
     while True:
         loop_start = time.time()
         try:
-            now_et = datetime.now(timezone.utc).astimezone()
-            universe = get_universe()
+            print("Tick…", flush=True)
 
-            # Compute sentiment once per loop (cached for SENTIMENT_CACHE_SEC)
-            current_sent = _compute_sentiment() if SENTIMENT_ON else "off"
-            if SENTIMENT_ON:
-                print(f"[SENTIMENT] {SENTIMENT_SYMBOL} {SENTIMENT_TF}m -> {current_sent}", flush=True)
+            # Sentiment (cache once per loop)
+            sentiment = compute_sentiment() if SENTIMENT_ONLY_GATE else "neutral"
+            print(f"[SENTIMENT] {sentiment}", flush=True)
 
-            for sym in universe:
-                # absolute liquidity
-                if (MIN_AVG_DAILY_VOL > 0) or (MIN_TODAY_VOL > 0):
-                    if not volume_ok(sym):
-                        continue
+            # Day guard
+            reset_daily_guard_if_new_day()
+            check_daily_guard_and_maybe_halt()
+
+            # close on last bars across open trades quickly (per unique (sym, tf))
+            touched = set((k[0], k[1]) for k in OPEN_TRADES.keys())
+            for (sym, tf) in touched:
+                try:
+                    df = fetch_polygon_1m(sym, lookback_minutes=max(60, tf*12))
+                    bars = _resample(df, tf)
+                    if bars is not None and not bars.empty:
+                        row = bars.iloc[-1]
+                        ts  = bars.index[-1]
+                        _maybe_close_on_bar(sym, tf, ts,
+                                            float(row["high"]), float(row["low"]), float(row["close"]))
+                except Exception as e:
+                    print(f"[CLOSE-PHASE ERROR] {sym} {tf}m: {e}", flush=True)
+
+            # If halted, skip opening new positions
+            if HALT_TRADING:
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # Max concurrent positions guard
+            open_positions = sum(1 for lst in OPEN_TRADES.values() for t in lst if t.is_open)
+            if open_positions >= MAX_CONCURRENT_POSITIONS:
+                print(f"[LIMIT] Max concurrent positions hit: {open_positions}/{MAX_CONCURRENT_POSITIONS}", flush=True)
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # Scan symbols & TFs (simple round-robin this loop)
+            for sym in symbols:
+                # quick per-symbol cap to avoid stampeding TP
+                if sum(1 for t in OPEN_TRADES.get((sym, TF_MIN_LIST[0]), []) if t.is_open) > 0:
+                    pass  # allow multiple TFs if desired; or skip to limit per-symbol
+
+                df1m = fetch_polygon_1m(sym, lookback_minutes= max(240, max(TF_MIN_LIST)*240))
+                if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
+                    continue
+                try:
+                    df1m.index = df1m.index.tz_convert(MARKET_TZ)
+                except Exception:
+                    df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
+
+                # today volume gate (re-check per symbol)
+                today_mask = df1m.index.date == df1m.index[-1].date()
+                todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
+                if todays_vol < SCANNER_MIN_TODAY_VOL:
+                    continue
 
                 for tf in TF_MIN_LIST:
-                    # Close phase first
-                    try:
-                        df1m_latest = fetch_polygon_1m(sym, lookback_minutes=max(90, tf*12))
-                        if df1m_latest is not None and not df1m_latest.empty:
-                            bars_latest = _resample(df1m_latest, tf)
-                            if bars_latest is not None and not bars_latest.empty:
-                                last_row = bars_latest.iloc[-1]
-                                last_ts  = bars_latest.index[-1]
-                                _maybe_close_on_bar(
-                                    sym, tf,
-                                    last_ts,
-                                    float(last_row["high"]),
-                                    float(last_row["low"]),
-                                    float(last_row["close"])
-                                )
-                    except Exception as e:
-                        print(f"[CLOSE-PHASE ERROR] {sym} {tf}m: {e}", flush=True)
-
-                    # Only enter during RTH
-                    if TRADE_ONLY_RTH and not _is_rth(now_et):
-                        continue
-
-                    # Cap open positions
-                    if _open_positions_count() >= MAX_OPEN_POS:
-                        continue
-
-                    sig = compute_signal(sym, tf)
+                    # produce a candidate signal
+                    sig = compute_signal("ml_pattern", sym, tf, df1m=df1m)
                     if not sig:
                         continue
 
-                    # Sentiment gate
-                    if not _sentiment_allows(sig.get("action","")):
-                        continue
-
-                    # Fill entry for ledger math if missing
-                    if "entry" not in sig:
-                        try:
-                            sig["entry"] = float(last_row["close"])
-                        except Exception:
-                            pass
-
-                    # Re-check liquidity immediately before posting
-                    if (MIN_AVG_DAILY_VOL > 0) or (MIN_TODAY_VOL > 0):
-                        if not volume_ok(sym):
+                    # sentiment gate
+                    if SENTIMENT_ONLY_GATE:
+                        if sentiment == "bull" and sig["action"] != "buy":
+                            continue
+                        if sentiment == "bear" and sig["action"] != "sell":
                             continue
 
-                    dk = _dedupe_key(sym, tf, sig.get("action",""), sig.get("barTime",""))
-                    if dk in _sent:
+                    # de-dupe by combo/action/time
+                    k = _dedupe_key("ml_pattern", sym, tf, sig["action"], sig.get("barTime",""))
+                    if k in _sent_keys:
                         continue
-                    _sent.add(dk)
+                    _sent_keys.add(k)
 
-                    try:
-                        _record_open_trade("ml_pattern", sym, tf, sig)
-                    except Exception as e:
-                        print(f"[LEDGER OPEN ERROR] {sym} {tf}m: {e}", flush=True)
+                    # one more positions cap just-in-time
+                    open_positions = sum(1 for lst in OPEN_TRADES.values() for t in lst if t.is_open)
+                    if open_positions >= MAX_CONCURRENT_POSITIONS:
+                        print(f"[LIMIT] Max concurrent reached mid-loop.", flush=True)
+                        break
 
-                    payload = build_payload(sym, sig)
-                    ok, info = send_to_traderspost(payload)
-                    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    print(f"[{stamp}] ml_pattern {sym} {tf}m -> {sig.get('action')} qty={sig.get('quantity')} | {info}", flush=True)
+                    # Record + send
+                    handle_signal("ml_pattern", sym, tf, sig)
 
-                    COUNTS["signals"] += 1
-                    if ok: COUNTS["orders.ok"] += 1
-                    else:  COUNTS["orders.err"] += 1
+            # EOD auto-flatten window (16:00–16:10 local)
+            now_et = _now_et()
+            if now_et.hour == 16 and now_et.minute < 10:
+                print("[EOD] Auto-flatten window.", flush=True)
+                flatten_all_open_positions()
 
         except Exception as e:
             import traceback
