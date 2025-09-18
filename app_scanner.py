@@ -521,17 +521,30 @@ def check_daily_guard_and_maybe_halt():
 # Router (scanner)
 # ------------------------------
 def compute_signal(strategy_name, symbol, tf_minutes, df1m=None):
-    df1m = df1m or fetch_polygon_1m(symbol, lookback_minutes=max(240, tf_minutes*240))
-    if df1m is None or df1m.empty:
-        return None
+    # fetch only if not provided or empty
+    if df1m is None or getattr(df1m, "empty", True):
+        df1m = fetch_polygon_1m(symbol, lookback_minutes=max(240, tf_minutes*240))
+        if df1m is None or df1m.empty:
+            return None
+
+    # ensure tz is ET and index is datetime
+    if not isinstance(df1m.index, pd.DatetimeIndex):
+        try:
+            df1m.index = pd.to_datetime(df1m.index, utc=True)
+        except Exception:
+            return None
     try:
         df1m.index = df1m.index.tz_convert(MARKET_TZ)
     except Exception:
         df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
 
-    # today's cum volume gate
-    today_mask = df1m.index.date == df1m.index[-1].date()
-    todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
+    # today's cumulative volume gate
+    try:
+        last_day = df1m.index[-1].date()
+        todays = df1m.loc[df1m.index.date == last_day]
+        todays_vol = float(todays["volume"].sum()) if not todays.empty else 0.0
+    except Exception:
+        todays_vol = 0.0
     if todays_vol < SCANNER_MIN_TODAY_VOL:
         return None
 
