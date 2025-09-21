@@ -1,5 +1,4 @@
-# Original_ML.py — scanner -> TradeStation (paper/live)
-# Uses YOUR env vars. Adds MIN_LAST_PRICE and strict daily guard flatten+block.
+# Original_ML.py — dynamic market scanner -> TradeStation (direct API)
 # Requires: pandas, numpy, requests, pandas_ta, scikit-learn
 
 import os, time, json, math, requests, hashlib, logging
@@ -9,10 +8,17 @@ from collections import defaultdict
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List, Tuple
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+# ==============================
+# LOGGING
+# ==============================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
 # ==============================
-# ENV / CONFIG (YOUR NAMES)
+# ENV / CONFIG (your variable names preserved)
 # ==============================
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY","")
 
@@ -26,14 +32,14 @@ TF_MIN_LIST = [int(x) for x in os.getenv("TF_MIN_LIST","5").split(",")]
 
 # Universe paging/size
 MAX_UNIVERSE_PAGES = int(os.getenv("MAX_UNIVERSE_PAGES", os.getenv("SCANNER_MAX_PAGES","3")))
-SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE","150"))
+SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE","150"))
 
-# Liquidity + price filters (use your existing names + one new MIN_LAST_PRICE)
-SCANNER_MIN_AVG_VOL = int(os.getenv("SCANNER_MIN_AVG_VOL", os.getenv("MIN_AVG_DAILY_VOL","1000000")))
+# Liquidity + price filters (existing names + new MIN_LAST_PRICE)
+SCANNER_MIN_AVG_VOL   = int(os.getenv("SCANNER_MIN_AVG_VOL", os.getenv("MIN_AVG_DAILY_VOL","1000000")))
 SCANNER_MIN_TODAY_VOL = int(os.getenv("SCANNER_MIN_TODAY_VOL", os.getenv("MIN_TODAY_VOL","0")))
-MIN_LAST_PRICE = float(os.getenv("MIN_LAST_PRICE","3.0"))  # <-- NEW: stock price floor (you can change freely)
+MIN_LAST_PRICE        = float(os.getenv("MIN_LAST_PRICE","3.0"))  # NEW: price floor
 
-# Exchange restriction (NYSE + NASDAQ only)
+# Exchanges: NYSE + NASDAQ by default
 ALLOW_EXCHANGES = set([s.strip().upper() for s in os.getenv("ALLOW_EXCHANGES","XNYS,XNAS").split(",") if s.strip()])
 
 # Position sizing (your names)
@@ -48,7 +54,7 @@ SCANNER_MARKET_HOURS_ONLY = os.getenv("SCANNER_MARKET_HOURS_ONLY","1").lower() i
 ALLOW_PREMARKET  = os.getenv("ALLOW_PREMARKET","0").lower() in ("1","true","yes")
 ALLOW_AFTERHOURS = os.getenv("ALLOW_AFTERHOURS","0").lower() in ("1","true","yes")
 
-# Sentiment: SHORTS_ENABLED controls neutrality/bull mode (your existing behavior)
+# Sentiment: SHORTS_ENABLED controls neutrality/bull mode (your behavior)
 SHORTS_ENABLED = os.getenv("SHORTS_ENABLED","1") in ("1","true","yes")
 
 # Daily guard (your names)
@@ -56,14 +62,14 @@ DAILY_GUARD_ENABLED = os.getenv("DAILY_GUARD_ENABLED","0") in ("1","true","yes")
 DAILY_DD_PCT = float(os.getenv("DAILY_DD_PCT","0.05"))   # 0.05 = 5% down
 DAILY_TP_PCT = float(os.getenv("DAILY_TP_PCT","0.25"))   # 0.25 = 25% up
 
-# KILL SWITCH (your name)
+# Kill switch (your name)
 KILL_SWITCH = os.getenv("KILL_SWITCH","OFF").strip().upper() == "ON"
 
-# EOD flatten (keep behavior; times in ET)
+# EOD flatten (optional, can add envs if you want)
 EOD_FLATTEN = os.getenv("EOD_FLATTEN","true").lower() in ("1","true","yes")
 EOD_FLATTEN_TIME = os.getenv("EOD_FLATTEN_TIME","15:59:30")
 
-# Rate limiting — use your MAX_ORDERS_PER_MIN env
+# Rate limiting — use your MAX_ORDERS_PER_MIN
 MAX_ORDERS_PER_MIN = max(1, int(os.getenv("MAX_ORDERS_PER_MIN","60")))
 
 RUN_ID = datetime.now().astimezone().strftime("%Y-%m-%d")
@@ -72,15 +78,24 @@ _sent = set(); _round_robin = 0
 NY = ZoneInfo("America/New_York")
 
 # ==============================
-# Helper: write TS token file from env (TS_TOKEN_JSON -> TS_TOKEN_PATH)
+# TRADESTATION CREDS + token bootstrap from env
 # ==============================
+TS_AUTH_BASE = "https://signin.tradestation.com"
+TS_API_BASE  = "https://api.tradestation.com/v3"
+TS_ACCOUNT_ID = os.getenv("TS_ACCOUNT_ID","")
+TS_TOKEN_PATH = os.getenv("TS_TOKEN_PATH","/app/ts_tokens.json")
+
 def _maybe_write_ts_token_from_env():
-    path = os.getenv("TS_TOKEN_PATH","/app/ts_tokens.json")
-    if not os.path.exists(path):
-        j = os.getenv("TS_TOKEN_JSON","").strip()
-        if j:
-            with open(path,"w") as f: f.write(j)
-            logging.info("[BOOT] wrote TradeStation tokens to %s from TS_TOKEN_JSON", path)
+    """Write TS_TOKEN_JSON env to TS_TOKEN_PATH (create folder if needed)."""
+    j = os.getenv("TS_TOKEN_JSON","").strip()
+    if not j:
+        return
+    folder = os.path.dirname(TS_TOKEN_PATH)
+    if folder and not os.path.exists(folder):
+        os.makedirs(folder, exist_ok=True)
+    with open(TS_TOKEN_PATH,"w") as f:
+        f.write(j)
+    logging.info(f"[BOOT] wrote TradeStation token file -> {TS_TOKEN_PATH}")
 
 # ==============================
 # Sessions, sizing, sentiment, dedupe, EOD
@@ -117,7 +132,7 @@ def _is_eod_now() -> bool:
     return datetime.now(NY).time().replace(microsecond=0) >= tgt
 
 # ==============================
-# Data fetchers (Polygon)
+# HTTP helper
 # ==============================
 def _get(url, params=None, timeout=15):
     params = params or {}
@@ -128,6 +143,9 @@ def _get(url, params=None, timeout=15):
         return None
     return r.json()
 
+# ==============================
+# Polygon data
+# ==============================
 def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
     end = datetime.now(timezone.utc); start = end - timedelta(minutes=lookback_minutes)
     url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
@@ -142,7 +160,8 @@ def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
 
 def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
     if df1m is None or df1m.empty: return pd.DataFrame()
-    bars = df1m.resample(f"{int(tf_min)}min", origin="start_day", label="right").agg(
+    rule = f"{int(tf_min)}min"
+    bars = df1m.resample(rule, origin="start_day", label="right").agg(
         {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
     ).dropna()
     try: bars.index = bars.index.tz_convert(NY)
@@ -160,6 +179,7 @@ def fetch_polygon_universe(max_pages: int = 3) -> list[str]:
         for row in js["results"]:
             sym = row.get("ticker")
             px  = (row.get("primary_exchange") or "").upper()
+            # Some rows won't have last price; we enforce price again later via grouped daily and per-trade
             if sym and sym.isalpha() and px in ALLOW_EXCHANGES:
                 out.append(sym)
         page_token = js.get("next_url", None)
@@ -173,7 +193,7 @@ def fetch_polygon_universe(max_pages: int = 3) -> list[str]:
     return out
 
 def filter_by_daily_volume_and_price(tickers: list[str], min_avg_vol: int, min_today_vol: int, min_last_price: float) -> list[str]:
-    """Fast daily filter using Polygon grouped daily; then price floor."""
+    """Fast daily filter using grouped daily; then price floor."""
     if not tickers: return []
     today = datetime.now(timezone.utc).astimezone().date().strftime("%Y-%m-%d")
     url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{today}"
@@ -195,7 +215,7 @@ def filter_by_daily_volume_and_price(tickers: list[str], min_avg_vol: int, min_t
     return out
 
 # ==============================
-# ML strategy (unchanged logic; long-only today)
+# ML strategy (long entries; same logic)
 # ==============================
 def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
                       conf_threshold: float = 0.8, n_estimators: int = 100,
@@ -254,14 +274,11 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
     return None
 
 # ==============================
-# TradeStation Broker (direct) with rate limiter tied to MAX_ORDERS_PER_MIN
+# TradeStation Broker (direct) + rate limiter
 # ==============================
-TS_AUTH_BASE = "https://signin.tradestation.com"
-TS_API_BASE  = "https://api.tradestation.com/v3"
-
 class RateLimiter:
     def __init__(self, per_min:int):
-        self.capacity = max(1, per_min)         # tokens per minute
+        self.capacity = max(1, per_min)
         self.tokens = float(self.capacity)
         self.refill_per_sec = self.capacity / 60.0
         self.last = time.time()
@@ -280,41 +297,19 @@ class TradeStationBroker:
     def __init__(self):
         self.s = requests.Session()
         self.limiter = RateLimiter(MAX_ORDERS_PER_MIN)
-        self.client_id = os.environ["TS_CLIENT_ID"]
-        self.client_secret = os.getenv("TS_CLIENT_SECRET")
-        self.redirect = os.environ["TS_REDIRECT_URI"]
-        self.account_id = os.environ["TS_ACCOUNT_ID"]
+        self.client_id = os.environ.get("TS_CLIENT_ID","")
+        self.client_secret = os.getenv("TS_CLIENT_SECRET","")
+        self.redirect = os.environ.get("TS_REDIRECT_URI","")
+        self.account_id = TS_ACCOUNT_ID
         self.paper = os.getenv("TS_PAPER","true").lower() == "true"
         self.token_store = os.getenv("TS_TOKEN_STORE","file")
-        self.token_path  = os.getenv("TS_TOKEN_PATH","/app/ts_tokens.json")
+        self.token_path  = TS_TOKEN_PATH
 
     def _load_token(self) -> Dict[str,Any]:
-        if self.token_store == "postgres":
-            import psycopg2, psycopg2.extras
-            with psycopg2.connect(os.environ["DATABASE_URL"]) as conn, conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute("SELECT access_token, refresh_token, token_type, extract(epoch from expires_at) AS expires_at FROM ts_oauth_tokens WHERE id=1")
-                row = cur.fetchone()
-                if not row: raise RuntimeError("ts_oauth_tokens empty; run OAuth bootstrap.")
-                return dict(row)
-        else:
-            with open(self.token_path,"r") as f: return json.load(f)
+        with open(self.token_path,"r") as f: return json.load(f)
 
     def _save_token(self, data: Dict[str,Any]):
-        if self.token_store == "postgres":
-            import psycopg2
-            with psycopg2.connect(os.environ["DATABASE_URL"]) as conn, conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO ts_oauth_tokens (id, access_token, refresh_token, scope, token_type, expires_at)
-                    VALUES (1,%s,%s,%s,%s, to_timestamp(%s))
-                    ON CONFLICT (id) DO UPDATE SET
-                    access_token=EXCLUDED.access_token,
-                    refresh_token=EXCLUDED.refresh_token,
-                    scope=EXCLUDED.scope,
-                    token_type=EXCLUDED.token_type,
-                    expires_at=EXCLUDED.expires_at
-                """, (data["access_token"], data["refresh_token"], data.get("scope",""), data.get("token_type","Bearer"), float(data["expires_at"])))
-        else:
-            with open(self.token_path,"w") as f: json.dump(data, f)
+        with open(self.token_path,"w") as f: json.dump(data, f)
 
     def _ensure_token(self) -> Dict[str,Any]:
         tok = self._load_token(); now = time.time()
@@ -370,7 +365,6 @@ class TradeStationBroker:
         return self._post(f"/orders?{self._acct_qs()}", body)
 
     def get_equity(self) -> float:
-        # Lightly rate-limited via .acquire() on GET as well
         self.limiter.acquire()
         r = self.s.get(f"{TS_API_BASE}/balances?{self._acct_qs()}", headers=self._headers(), timeout=15)
         r.raise_for_status()
@@ -381,12 +375,6 @@ class TradeStationBroker:
         self.limiter.acquire()
         r = self.s.get(f"{TS_API_BASE}/positions?{self._acct_qs()}", headers=self._headers(), timeout=15)
         r.raise_for_status(); return r.json().get("Positions", [])
-
-    def cancel(self, order_id: str):
-        self.limiter.acquire()
-        r = self.s.delete(f"{TS_API_BASE}/orders/{order_id}?{self._acct_qs()}", headers=self._headers(), timeout=15)
-        if r.status_code in (200,204): return
-        r.raise_for_status()
 
     def close_all(self):
         pos = self.list_positions()
@@ -403,7 +391,7 @@ def broker() -> TradeStationBroker:
     return BROKER
 
 # ==============================
-# Bracket helper & guards
+# Guards: daily equity + kill switch
 # ==============================
 _guard_blocked_for_day = False
 _day_open_equity: Optional[float] = None
@@ -437,11 +425,12 @@ def _daily_guard_check_and_act():
         try:
             broker().close_all()
         finally:
-            _guard_blocked_for_day = True  # block new entries
-            os.environ["KILL_SWITCH"] = "ON"  # optional: honor your KILL_SWITCH convention too
+            _guard_blocked_for_day = True
+            # Mirror your kill switch convention too
+            os.environ["KILL_SWITCH"] = "ON"
 
 def entries_allowed_now(side: str) -> bool:
-    if KILL_SWITCH or os.getenv("KILL_SWITCH","OFF").upper()=="ON": 
+    if os.getenv("KILL_SWITCH","OFF").upper()=="ON": 
         return False
     if _guard_blocked_for_day: 
         return False
@@ -449,6 +438,9 @@ def entries_allowed_now(side: str) -> bool:
         return False
     return True
 
+# ==============================
+# Bracket helper
+# ==============================
 def place_bracket(symbol: str, side: str, qty: int, stop_price: float, take_price: float, client_tag: str):
     if DRY_RUN:
         logging.info("(DRY) ENTRY %s %s qty=%s sl=%.2f tp=%.2f", symbol, side, qty, stop_price, take_price)
@@ -467,29 +459,30 @@ def build_universe():
     if not base:
         logging.error("[UNIVERSE] Empty; check POLYGON_API_KEY / permissions.")
         return []
-    # daily volume + price floor
+    # daily price + volume filter (today)
     filtered = filter_by_daily_volume_and_price(base, SCANNER_MIN_AVG_VOL, SCANNER_MIN_TODAY_VOL, MIN_LAST_PRICE)
     return filtered if filtered else base
 
 def scan_once(universe: list[str]):
     global _round_robin
+
     # EOD flatten
     if _is_eod_now():
         logging.warning("[EOD] Flatten trigger")
         try: broker().close_all()
         except Exception as e: logging.error("[EOD] flatten error: %s", e)
 
-    # Market hours gate
+    # Market hours check
     if SCANNER_MARKET_HOURS_ONLY and not _market_session_now():
         if SCANNER_DEBUG: logging.info("[SCAN] Skipping — market session closed.")
         return
     if not universe: return
 
-    # Ensure equity baseline & enforce guard each loop
+    # Equity baseline & guard
     ensure_day_open_equity()
     _daily_guard_check_and_act()
 
-    # Batch rotation
+    # Rotate batch
     N = len(universe)
     start = _round_robin % max(1,N); end = min(N, start + SCAN_BATCH_SIZE)
     batch = universe[start:end]; _round_robin = end if end < N else 0
@@ -508,11 +501,13 @@ def scan_once(universe: list[str]):
 
         for tf in TF_MIN_LIST:
             try:
-                sig = signal_ml_pattern(sym, df1m, tf_min=tf,
-                                        conf_threshold=float(os.getenv("SCANNER_CONF_THRESHOLD","0.8")),
-                                        n_estimators=100,
-                                        r_multiple=float(os.getenv("SCANNER_R_MULTIPLE","3.0")),
-                                        min_volume_mult=0.0)
+                sig = signal_ml_pattern(
+                    sym, df1m, tf_min=tf,
+                    conf_threshold=float(os.getenv("SCANNER_CONF_THRESHOLD","0.8")),
+                    n_estimators=100,
+                    r_multiple=float(os.getenv("SCANNER_R_MULTIPLE","3.0")),
+                    min_volume_mult=0.0
+                )
                 if not sig: continue
 
                 k = _dedupe_key(sym, tf, sig["action"], sig.get("barTime",""))
@@ -521,7 +516,7 @@ def scan_once(universe: list[str]):
 
                 if not entries_allowed_now(sig["action"]): 
                     continue
-                # Check again right before sending
+                # final guard check just before sending
                 _daily_guard_check_and_act()
                 if _guard_blocked_for_day or os.getenv("KILL_SWITCH","OFF").upper()=="ON":
                     continue
@@ -547,20 +542,23 @@ def scan_once(universe: list[str]):
 
 def main():
     logging.info("Scanner starting…")
+    _maybe_write_ts_token_from_env()
+
     if not POLYGON_API_KEY:
         logging.error("[FATAL] POLYGON_API_KEY missing."); return
 
-    _maybe_write_ts_token_from_env()
-
-    if not DRY_RUN:
-        try: _ = broker().get_equity()
+    # Soft-check TS token unless DRY_RUN
+    if not DRY_RUN and TS_ACCOUNT_ID:
+        try: 
+            _ = broker().get_equity()
         except FileNotFoundError:
             logging.error("[FATAL] TS_TOKEN_PATH not found. Ensure TS_TOKEN_JSON is set so we can write it."); return
         except Exception as e:
             logging.warning("[WARN] Could not fetch TS equity yet: %s", e)
 
     universe = build_universe()
-    logging.info("[READY] Universe size: %d  TFs: %s  Batch: %d  MIN_LAST_PRICE: %.2f", len(universe), TF_MIN_LIST, SCAN_BATCH_SIZE, MIN_LAST_PRICE)
+    logging.info("[READY] Universe size: %d  TFs: %s  Batch: %d  MIN_LAST_PRICE: %.2f",
+                 len(universe), TF_MIN_LIST, SCAN_BATCH_SIZE, MIN_LAST_PRICE)
 
     while True:
         loop_start = time.time()
