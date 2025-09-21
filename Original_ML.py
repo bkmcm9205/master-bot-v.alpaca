@@ -1,4 +1,7 @@
 # Original_ML.py — dynamic market scanner -> TradeStation (direct API)
+# Uses your existing env vars; adds MIN_LAST_PRICE; fixes weekend/holiday filtering;
+# safe token write; strict daily guard (flatten+block); NYSE+NASDAQ only.
+#
 # Requires: pandas, numpy, requests, pandas_ta, scikit-learn
 
 import os, time, json, math, requests, hashlib, logging
@@ -23,8 +26,8 @@ logging.basicConfig(
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY","")
 
 # Cadence & diagnostics
-POLL_SECONDS = int(os.getenv("POLL_SECONDS","10"))
-DRY_RUN = os.getenv("DRY_RUN","0").lower() in ("1","true","yes")
+POLL_SECONDS  = int(os.getenv("POLL_SECONDS","10"))
+DRY_RUN       = os.getenv("DRY_RUN","0").lower() in ("1","true","yes")
 SCANNER_DEBUG = os.getenv("SCANNER_DEBUG","0").lower() in ("1","true","yes")
 
 # Timeframes list
@@ -37,7 +40,7 @@ SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE","150"))
 # Liquidity + price filters (existing names + new MIN_LAST_PRICE)
 SCANNER_MIN_AVG_VOL   = int(os.getenv("SCANNER_MIN_AVG_VOL", os.getenv("MIN_AVG_DAILY_VOL","1000000")))
 SCANNER_MIN_TODAY_VOL = int(os.getenv("SCANNER_MIN_TODAY_VOL", os.getenv("MIN_TODAY_VOL","0")))
-MIN_LAST_PRICE        = float(os.getenv("MIN_LAST_PRICE","3.0"))  # NEW: price floor
+MIN_LAST_PRICE        = float(os.getenv("MIN_LAST_PRICE","3.0"))  # NEW: price floor (no price cap added)
 
 # Exchanges: NYSE + NASDAQ by default
 ALLOW_EXCHANGES = set([s.strip().upper() for s in os.getenv("ALLOW_EXCHANGES","XNYS,XNAS").split(",") if s.strip()])
@@ -78,24 +81,32 @@ _sent = set(); _round_robin = 0
 NY = ZoneInfo("America/New_York")
 
 # ==============================
-# TRADESTATION CREDS + token bootstrap from env
+# TRADESTATION CREDS + token bootstrap from env (safe in DRY mode)
 # ==============================
-TS_AUTH_BASE = "https://signin.tradestation.com"
-TS_API_BASE  = "https://api.tradestation.com/v3"
+TS_AUTH_BASE  = "https://signin.tradestation.com"
+TS_API_BASE   = "https://api.tradestation.com/v3"
 TS_ACCOUNT_ID = os.getenv("TS_ACCOUNT_ID","")
-TS_TOKEN_PATH = os.getenv("TS_TOKEN_PATH","/app/ts_tokens.json")
+TS_TOKEN_PATH = os.getenv("TS_TOKEN_PATH","/tmp/ts_tokens.json")  # default to /tmp (always writable)
 
 def _maybe_write_ts_token_from_env():
-    """Write TS_TOKEN_JSON env to TS_TOKEN_PATH (create folder if needed)."""
+    """Write TS_TOKEN_JSON env to TS_TOKEN_PATH (create folder if needed). Skip in DRY_RUN."""
+    if DRY_RUN:
+        return
     j = os.getenv("TS_TOKEN_JSON","").strip()
     if not j:
         return
-    folder = os.path.dirname(TS_TOKEN_PATH)
-    if folder and not os.path.exists(folder):
+    path = TS_TOKEN_PATH
+    folder = os.path.dirname(path) or "."
+    try:
         os.makedirs(folder, exist_ok=True)
-    with open(TS_TOKEN_PATH,"w") as f:
-        f.write(j)
-    logging.info(f"[BOOT] wrote TradeStation token file -> {TS_TOKEN_PATH}")
+    except Exception as e:
+        logging.warning("[BOOT] could not create folder %s: %s", folder, e)
+    try:
+        with open(path,"w") as f:
+            f.write(j)
+        logging.info("[BOOT] wrote TradeStation token file -> %s", path)
+    except Exception as e:
+        logging.warning("[BOOT] could not write token file %s: %s", path, e)
 
 # ==============================
 # Sessions, sizing, sentiment, dedupe, EOD
@@ -134,7 +145,7 @@ def _is_eod_now() -> bool:
 # ==============================
 # HTTP helper
 # ==============================
-def _get(url, params=None, timeout=15):
+def _get(url, params=None, timeout=20):
     params = params or {}
     if POLYGON_API_KEY: params["apiKey"] = POLYGON_API_KEY
     r = requests.get(url, params=params, timeout=timeout)
@@ -179,7 +190,6 @@ def fetch_polygon_universe(max_pages: int = 3) -> list[str]:
         for row in js["results"]:
             sym = row.get("ticker")
             px  = (row.get("primary_exchange") or "").upper()
-            # Some rows won't have last price; we enforce price again later via grouped daily and per-trade
             if sym and sym.isalpha() and px in ALLOW_EXCHANGES:
                 out.append(sym)
         page_token = js.get("next_url", None)
@@ -188,30 +198,62 @@ def fetch_polygon_universe(max_pages: int = 3) -> list[str]:
         pages += 1
         if not page_token: break
     if SCANNER_DEBUG:
-        logging.info("[UNIVERSE] fetched %d tickers across %d page(s) exchanges=%s",
+        logging.info("[UNIVERSE(BASE)] fetched %d tickers across %d page(s) exchanges=%s",
                      len(out), pages, sorted(list(ALLOW_EXCHANGES)))
     return out
 
-def filter_by_daily_volume_and_price(tickers: list[str], min_avg_vol: int, min_today_vol: int, min_last_price: float) -> list[str]:
-    """Fast daily filter using grouped daily; then price floor."""
-    if not tickers: return []
-    today = datetime.now(timezone.utc).astimezone().date().strftime("%Y-%m-%d")
-    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{today}"
-    js = _get(url, {"adjusted":"true"}); 
+# ---- Weekend/holiday safe grouped-daily date finder ----
+def _latest_grouped_date(max_backdays: int = 10) -> Optional[str]:
+    """
+    Find the most recent market day with grouped-daily data.
+    Returns YYYY-MM-DD or None if nothing found within max_backdays.
+    """
+    for back in range(max_backdays + 1):
+        d = (datetime.now(timezone.utc).astimezone().date() - timedelta(days=back)).strftime("%Y-%m-%d")
+        url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{d}"
+        js = _get(url, {"adjusted": "true"})
+        if js and js.get("results"):
+            if SCANNER_DEBUG:
+                logging.info("[GROUPED] Using market day %s (%d results)", d, len(js["results"]))
+            return d
+    logging.warning("[GROUPED] No grouped-daily data found in last %d day(s); skipping daily filters", max_backdays)
+    return None
+
+def filter_by_daily_volume_and_price(
+    tickers: List[str],
+    min_avg_vol: int,
+    min_today_vol: int,
+    min_last_price: float
+) -> List[str]:
+    """
+    Filter by daily volume & closing price using the most recent market day.
+    Applies price floor even on weekends/holidays.
+    """
+    if not tickers:
+        return []
+    d = _latest_grouped_date(max_backdays=10)
+    if not d:
+        # No grouped data found; fall back (per-trade price gate still enforced)
+        return tickers
+    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{d}"
+    js = _get(url, {"adjusted": "true"})
     if not js or not js.get("results"):
-        return tickers  # fallback
-    # Map: symbol -> (today_volume, close)
-    vol_map = {row["T"]: (row.get("v",0), row.get("c", None)) for row in js["results"] if "T" in row}
+        return tickers
+    rows = js["results"]
+    vol_close = {row["T"]: (row.get("v", 0), row.get("c", None)) for row in rows if "T" in row}
+
+    before = len(tickers)
     out = []
     for t in tickers:
-        v,c = vol_map.get(t, (0, None))
-        if min_today_vol and v < min_today_vol: 
+        v, c = vol_close.get(t, (0, None))
+        if min_today_vol and v < min_today_vol:
             continue
         if (c is not None) and (c < min_last_price):
             continue
         out.append(t)
-    if SCANNER_DEBUG:
-        logging.info("[VOL/PRICE FILTER] %d -> %d (min_today_vol=%s, min_last_price=%.2f)", len(tickers), len(out), min_today_vol, min_last_price)
+
+    logging.info("[UNIVERSE] base=%d  after_daily_filters=%d  date=%s  MIN_LAST_PRICE=%.2f  MIN_TODAY_VOL=%s",
+                 before, len(out), d, min_last_price, min_today_vol)
     return out
 
 # ==============================
@@ -297,13 +339,12 @@ class TradeStationBroker:
     def __init__(self):
         self.s = requests.Session()
         self.limiter = RateLimiter(MAX_ORDERS_PER_MIN)
-        self.client_id = os.environ.get("TS_CLIENT_ID","")
+        self.client_id     = os.environ.get("TS_CLIENT_ID","")
         self.client_secret = os.getenv("TS_CLIENT_SECRET","")
-        self.redirect = os.environ.get("TS_REDIRECT_URI","")
-        self.account_id = TS_ACCOUNT_ID
-        self.paper = os.getenv("TS_PAPER","true").lower() == "true"
-        self.token_store = os.getenv("TS_TOKEN_STORE","file")
-        self.token_path  = TS_TOKEN_PATH
+        self.redirect      = os.environ.get("TS_REDIRECT_URI","")
+        self.account_id    = TS_ACCOUNT_ID
+        self.paper         = os.getenv("TS_PAPER","true").lower() == "true"
+        self.token_path    = TS_TOKEN_PATH
 
     def _load_token(self) -> Dict[str,Any]:
         with open(self.token_path,"r") as f: return json.load(f)
@@ -336,11 +377,11 @@ class TradeStationBroker:
     def _post(self, path: str, body: Dict[str,Any]) -> Dict[str,Any]:
         self.limiter.acquire()
         url = f"{TS_API_BASE}{path}"
-        r = self.s.post(url, json=body, headers=self._headers(), timeout=15)
+        r = self.s.post(url, json=body, headers=self._headers(), timeout=20)
         if r.status_code == 429:
             logging.warning("TS 429: backing off and retrying...")
             time.sleep(1.0); self.limiter.acquire()
-            r = self.s.post(url, json=body, headers=self._headers(), timeout=15)
+            r = self.s.post(url, json=body, headers=self._headers(), timeout=20)
         r.raise_for_status(); return r.json()
 
     def place_market(self, symbol: str, side: str, qty: int, client_order_id: str) -> Dict[str,Any]:
@@ -366,14 +407,14 @@ class TradeStationBroker:
 
     def get_equity(self) -> float:
         self.limiter.acquire()
-        r = self.s.get(f"{TS_API_BASE}/balances?{self._acct_qs()}", headers=self._headers(), timeout=15)
+        r = self.s.get(f"{TS_API_BASE}/balances?{self._acct_qs()}", headers=self._headers(), timeout=20)
         r.raise_for_status()
         bal = r.json().get("Balances",[{}])[0]
         return float(bal.get("NetLiquidatingValue") or bal.get("AccountValue") or 0.0)
 
     def list_positions(self) -> List[Dict[str,Any]]:
         self.limiter.acquire()
-        r = self.s.get(f"{TS_API_BASE}/positions?{self._acct_qs()}", headers=self._headers(), timeout=15)
+        r = self.s.get(f"{TS_API_BASE}/positions?{self._acct_qs()}", headers=self._headers(), timeout=20)
         r.raise_for_status(); return r.json().get("Positions", [])
 
     def close_all(self):
@@ -398,7 +439,7 @@ _day_open_equity: Optional[float] = None
 
 def ensure_day_open_equity():
     global _day_open_equity
-    if _day_open_equity is None:
+    if _day_open_equity is None and not DRY_RUN and TS_ACCOUNT_ID:
         try:
             eq = broker().get_equity()
             if eq > 0: _day_open_equity = float(eq); logging.info("[GUARD] opened_equity=%.2f", eq)
@@ -412,6 +453,8 @@ def _daily_guard_check_and_act():
       - set _guard_blocked_for_day=True to block new entries until day changes
     """
     global _guard_blocked_for_day
+    if DRY_RUN:  # no guard action in DRY mode
+        return
     if not DAILY_GUARD_ENABLED or _day_open_equity is None or _guard_blocked_for_day:
         return
     try:
@@ -459,7 +502,7 @@ def build_universe():
     if not base:
         logging.error("[UNIVERSE] Empty; check POLYGON_API_KEY / permissions.")
         return []
-    # daily price + volume filter (today)
+    # daily price + volume filter (weekend/holiday safe)
     filtered = filter_by_daily_volume_and_price(base, SCANNER_MIN_AVG_VOL, SCANNER_MIN_TODAY_VOL, MIN_LAST_PRICE)
     return filtered if filtered else base
 
@@ -469,8 +512,10 @@ def scan_once(universe: list[str]):
     # EOD flatten
     if _is_eod_now():
         logging.warning("[EOD] Flatten trigger")
-        try: broker().close_all()
-        except Exception as e: logging.error("[EOD] flatten error: %s", e)
+        try: 
+            if not DRY_RUN: broker().close_all()
+        except Exception as e: 
+            logging.error("[EOD] flatten error: %s", e)
 
     # Market hours check
     if SCANNER_MARKET_HOURS_ONLY and not _market_session_now():
@@ -542,10 +587,12 @@ def scan_once(universe: list[str]):
 
 def main():
     logging.info("Scanner starting…")
-    _maybe_write_ts_token_from_env()
 
     if not POLYGON_API_KEY:
         logging.error("[FATAL] POLYGON_API_KEY missing."); return
+
+    # Only try to create token file if we’re not in DRY mode
+    _maybe_write_ts_token_from_env()
 
     # Soft-check TS token unless DRY_RUN
     if not DRY_RUN and TS_ACCOUNT_ID:
