@@ -1,9 +1,10 @@
-# Ranked_ML.py — TradersPost ML scanner with confidence ranking + verbose diagnostics
+# Ranked_ML.py — TradersPost ML scanner with confidence ranking + diagnostics
 # - Confidence-ranked dispatch (highest confidence first)
 # - Unlimited sends by default (MAX_ENTRIES_PER_CYCLE=0)
 # - Sentiment gate preserved
-# - Detailed per-loop diagnostics for gate reasons
-# - Dedupe happens at send-time (so candidates aren’t burned early)
+# - Detailed per-loop diagnostics (candidate summary + gate counters)
+# - BYPASS_SESSION env to allow after-hours/premarket testing without posting
+# - Dedupe at send-time so candidates aren’t “burned” early
 
 import os, time, json, math, hashlib, requests
 from collections import defaultdict, deque
@@ -13,6 +14,12 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import pytz
+
+# ==============================
+# BOOT TAG (so you know this file is running)
+# ==============================
+APP_TAG = "Ranked_ML v1.2 (diagnostics + bypass_session)"
+print(f"[BOOT] {APP_TAG}", flush=True)
 
 # ==============================
 # ENV / CONFIG
@@ -47,11 +54,12 @@ MAX_ORDERS_PER_MIN        = int(os.getenv("MAX_ORDERS_PER_MIN", "60"))
 MARKET_TZ                 = "America/New_York"
 ALLOW_PREMARKET           = os.getenv("ALLOW_PREMARKET", "0").lower() in ("1","true","yes")
 ALLOW_AFTERHOURS          = os.getenv("ALLOW_AFTERHOURS", "0").lower() in ("1","true","yes")
+BYPASS_SESSION            = os.getenv("BYPASS_SESSION","0").lower() in ("1","true","yes")  # test-only switch
 
 # Sentiment gate
 SENTIMENT_ONLY_GATE   = os.getenv("SENTIMENT_ONLY_GATE","1").lower() in ("1","true","yes")
 
-# Daily guard (simple realized-PnL version from your TP bot)
+# Daily guard (realized PnL)
 START_EQUITY         = float(os.getenv("START_EQUITY", "100000"))
 DAILY_TP_PCT         = float(os.getenv("DAILY_TP_PCT", "0.25"))
 DAILY_DD_PCT         = float(os.getenv("DAILY_DD_PCT", "0.05"))
@@ -89,6 +97,8 @@ class LiveTrade:
 def _now_et(): return datetime.now(timezone.utc).astimezone(ZoneInfo(MARKET_TZ))
 def _is_rth(ts): h,m=ts.hour,ts.minute; return ((h>9) or (h==9 and m>=30)) and (h<16)
 def _in_session(ts):
+    if BYPASS_SESSION:
+        return True
     if _is_rth(ts): return True
     if ALLOW_PREMARKET and (4 <= ts.hour < 9 or (ts.hour == 9 and ts.minute < 30)): return True
     if ALLOW_AFTERHOURS and (16 <= ts.hour < 20): return True
@@ -218,7 +228,7 @@ def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, c
             print(f"[CLOSE] {t.combo} {t.reason.upper()} qty={t.qty} entry={t.entry:.2f} exit={t.exit:.2f} pnl={pnl:+.2f}", flush=True)
 
 # ==============================
-# Sentiment (same logic as your file)
+# Sentiment (same structure as your file)
 # ==============================
 def _now_et_tz(): return datetime.now(timezone.utc).astimezone(pytz.timezone("America/New_York"))
 def _is_rth_tz(ts): h,m=ts.hour,ts.minute; return ((h>9) or (h==9 and m>=30)) and (h<16)
@@ -314,7 +324,7 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, conf_thresho
     return None
 
 # ==============================
-# Daily guard (realized only, same as your TP flow)
+# Daily guard (realized only)
 # ==============================
 DAY_STAMP = datetime.now().astimezone().strftime("%Y-%m-%d"); HALT_TRADING=False
 def _today_local_date_str(): return datetime.now().astimezone().strftime("%Y-%m-%d")
@@ -344,7 +354,7 @@ def check_daily_guard_and_maybe_halt():
     if not DAILY_GUARD_ENABLED: return
     realized=_realized_day_pnl(); equity=START_EQUITY + realized
     up_lim=START_EQUITY*(1.0+DAILY_TP_PCT); dn_lim=START_EQUITY*(1.0-DAILY_DD_PCT)
-    print(f"[DAILY-GUARD] eq={equality:=.2f}" if False else f"[DAILY-GUARD] eq={equity:.2f} start={START_EQUITY:.2f} realized={realized:+.2f} targets +{DAILY_TP_PCT*100:.1f}%({up_lim:.2f}) / -{DAILY_DD_PCT*100:.1f}%({dn_lim:.2f})", flush=True)
+    print(f"[DAILY-GUARD] eq={equity:.2f} start={START_EQUITY:.2f} realized={realized:+.2f} targets +{DAILY_TP_PCT*100:.1f}%({up_lim:.2f}) / -{DAILY_DD_PCT*100:.1f}%({dn_lim:.2f})", flush=True)
     if HALT_TRADING: return
     if equity>=up_lim:
         HALT_TRADING=True; print("[DAILY-GUARD] ✅ Daily TP hit. Halting entries.", flush=True)
@@ -364,7 +374,9 @@ def _log_candidate_summary(cands):
     print(f"[SCAN] candidates={len(cands)} | top5: {view}", flush=True)
 
 def _print_gate_counts(gc):
-    parts=[f"{k}={v}" for k,v in gc.items()]
+    # Always print the same keys for readability
+    keys = ["no_data","vol_gate","no_signal","conf_gate","sentiment_block","dedupe"]
+    parts=[f"{k}={gc.get(k,0)}" for k in keys]
     print("[GATES] " + " | ".join(parts), flush=True)
 
 # ==============================
@@ -480,7 +492,7 @@ def main():
                             gate_counts["sentiment_block"]+=1; continue
                         # neutral allows both
 
-                    # Just pre-check dedupe (but don't burn key yet)
+                    # Pre-check dedupe (don’t burn yet)
                     k = _dedupe_key("ml_pattern", sym, tf, sig["action"], sig.get("barTime",""))
                     if k in _sent_keys:
                         gate_counts["dedupe"]+=1; continue
