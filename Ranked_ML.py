@@ -1,5 +1,8 @@
 # Ranked_ML.py — ML scanner with confidence ranking, two-sided trades, guards, and diagnostics
-# v1.9: Adds DIAG_SIG_DETAILS to explain *why* signals are returning None (bars_short, nan_features, qty0, not_in_session, model_error).
+# v2.0: Fixes for model_error:
+#   - Explicit reasons (y_single_class, predict_fail)
+#   - Optional traceback (DIAG_MODEL_TRACE=1)
+#   - Graceful fallback to momentum-based probability when RF can't train
 import os, time, json, math, hashlib, requests, traceback
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
@@ -7,7 +10,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-APP_TAG = "Ranked_ML v1.9 (scan-always + full + nosig-diag)"
+APP_TAG = "Ranked_ML v2.0 (model-error fixes + fallback)"
 print(f"[BOOT] {APP_TAG}", flush=True)
 
 # -------- ENV HELPERS --------
@@ -73,7 +76,8 @@ INTROSPECT_TOP_K   = int(os.getenv("INTROSPECT_TOP_K","10"))
 LOG_REJECTIONS_N   = int(os.getenv("LOG_REJECTIONS_N","0"))  # 0=off
 DIAG_ON            = _env_bool("DIAG_ON","0")
 DIAG_SYMBOLS       = [s.strip().upper() for s in os.getenv("DIAG_SYMBOLS","SPY,QQQ,AAPL,NVDA").split(",") if s.strip()]
-DIAG_SIG_DETAILS   = _env_bool("DIAG_SIG_DETAILS","1")  # <-- new: print per (sym,tf) no-signal reason/details
+DIAG_SIG_DETAILS   = _env_bool("DIAG_SIG_DETAILS","1")       # explain every None signal
+DIAG_MODEL_TRACE   = _env_bool("DIAG_MODEL_TRACE","0")       # print traceback on model_error
 
 print("[CONFIG] "
       f"ALLOW_ENTRIES={ALLOW_ENTRIES} DRY_RUN={DRY_RUN} BYPASS_SESSION={BYPASS_SESSION} "
@@ -81,7 +85,7 @@ print("[CONFIG] "
       f"SHORTS_ENABLED={SHORTS_ENABLED} SENTIMENT_ONLY_GATE={SENTIMENT_ONLY_GATE} "
       f"CONF_THR={SCANNER_CONF_THRESHOLD} R_MULT={SCANNER_R_MULTIPLE} "
       f"MIN_TODAY_VOL={SCANNER_MIN_TODAY_VOL} TFs={TF_MIN_LIST} "
-      f"INTROSPECT={INTROSPECT} DIAG_ON={DIAG_ON} DIAG_SIG_DETAILS={DIAG_SIG_DETAILS} "
+      f"INTROSPECT={INTROSPECT} DIAG_ON={DIAG_ON} DIAG_SIG_DETAILS={DIAG_SIG_DETAILS} DIAG_MODEL_TRACE={DIAG_MODEL_TRACE} "
       f"DIAG_SYMBOLS={DIAG_SYMBOLS} LOG_REJ_N={LOG_REJECTIONS_N}",
       flush=True)
 
@@ -305,28 +309,58 @@ def _ml_features_from_resampled(bars: pd.DataFrame):
     out["volatility"] = out["close"].rolling(20).std()
     out.dropna(inplace=True); return out
 
+def _fallback_proba_from_momentum(feats: pd.DataFrame, look=20):
+    # Simple momentum → probability mapping (smooth via tanh)
+    if len(feats) < max(2, look+1): return 0.5
+    ret = (float(feats["close"].iloc[-1]) / float(feats["close"].iloc[-look])) - 1.0
+    # scale: ~1% move ~ 0.62 prob; 2% ~ 0.76, etc.
+    return 0.5 + float(np.tanh(ret * 50.0)) / 2.0
+
 def ml_score(symbol: str, df1m: pd.DataFrame, tf_min: int):
-    if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex): return None, None, "no_data"
+    if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
+        return None, None, "no_data"
     bars=_resample(df1m, tf_min)
-    if bars.empty or len(bars)<60: return None, None, "bars_short"
+    if bars.empty or len(bars)<60:
+        return None, None, "bars_short"
     feats=_ml_features_from_resampled(bars)
-    if feats.empty or len(feats)<50: return None, None, "nan_features"
+    if feats.empty or len(feats)<50:
+        return None, None, "nan_features"
     X=feats[["return","rsi","volatility"]].copy()
     y=(feats["close"].shift(-1) > feats["close"]).astype(int)
     X=X.iloc[:-1]; y=y.iloc[:-1]
-    if len(X)<50: return None, None, "bars_short"
+    if len(X)<50:
+        return None, None, "bars_short"
     try:
         from sklearn.ensemble import RandomForestClassifier
+        cut=int(len(X)*0.7)
+        X_train, y_train = X.iloc[:cut], y.iloc[:cut]
+        # ---- Handle single-class label sets gracefully ----
+        if getattr(y_train, "nunique", None) and y_train.nunique() < 2:
+            proba_up = _fallback_proba_from_momentum(feats)
+            ts = feats.index[-1]
+            if not _in_session(ts): return proba_up, ts, "not_in_session"
+            return proba_up, ts, "fallback_single_class"
         clf=RandomForestClassifier(n_estimators=100, random_state=42)
-        cut=int(len(X)*0.7); clf.fit(X.iloc[:cut], y.iloc[:cut])
+        clf.fit(X_train, y_train)
         x_live=X.iloc[[-1]]
         try: x_live=x_live[list(clf.feature_names_in_)]
         except Exception: pass
-        proba_up=float(clf.predict_proba(x_live)[0][1])
+        try:
+            proba_up=float(clf.predict_proba(x_live)[0][1])
+        except Exception as e:
+            if DIAG_MODEL_TRACE:
+                print(f"[TRACE] {symbol} {tf_min}m predict_proba failed: {e}\n{traceback.format_exc()}", flush=True)
+            # Fallback if predict_proba chokes
+            proba_up = _fallback_proba_from_momentum(feats)
+            ts = feats.index[-1]
+            if not _in_session(ts): return proba_up, ts, "not_in_session"
+            return proba_up, ts, "predict_fail"
         ts=feats.index[-1]
         if not _in_session(ts): return proba_up, ts, "not_in_session"
         return proba_up, ts, None
-    except Exception:
+    except Exception as e:
+        if DIAG_MODEL_TRACE:
+            print(f"[TRACE] {symbol} {tf_min}m model_error: {e}\n{traceback.format_exc()}", flush=True)
         return None, None, "model_error"
 
 def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, r_multiple=None):
@@ -366,12 +400,17 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, r_multiple=N
             print(f"[NOSIG] {symbol} {tf_min}m reason=qty0 price={price:.2f} sl={sl:.2f} score={score:.3f} r_mult={r_multiple}", flush=True)
         return None
 
+    # annotate reason if we used fallback model
+    meta_note = "ml_pattern"
+    if reason in ("fallback_single_class", "predict_fail"):
+        meta_note += f" ({reason})"
+
     return {
         "action":side,"orderType":"market","price":None,
         "takeProfit":tp,"stopLoss":sl,"barTime":ts.tz_convert("UTC").isoformat(),
         "entry":price,"quantity":int(qty),
         "confidence":score,"score":score,
-        "meta":{"note":"ml_pattern","confidence":score}
+        "meta":{"note":meta_note,"confidence":score}
     }
 
 # -------- TP I/O --------
@@ -460,9 +499,7 @@ def compute_signal(strategy_name, symbol, tf_minutes, df1m=None):
 
     if strategy_name=="ml_pattern":
         sig = signal_ml_pattern(symbol, df1m, tf_minutes, SCANNER_R_MULTIPLE)
-        if not sig and DIAG_SIG_DETAILS:
-            # Detailed reason already printed inside signal_ml_pattern/ml_score
-            pass
+        # detailed reasons printed in signal_ml_pattern/ml_score
         return sig
     return None
 
@@ -472,7 +509,6 @@ def main():
     symbols = get_universe_symbols()
     print(f"[UNIVERSE] symbols={len(symbols)}  TFs={TF_MIN_LIST}  vol_gate={SCANNER_MIN_TODAY_VOL}", flush=True)
 
-    # Optional replay probe
     if REPLAY_ON_START:
         try:
             df1m=fetch_polygon_1m(REPLAY_SYMBOL, lookback_minutes=REPLAY_HOURS*60)
@@ -495,16 +531,13 @@ def main():
         try:
             print("Tick…", flush=True)
 
-            # Sentiment
             sentiment = compute_sentiment() if SENTIMENT_ONLY_GATE else "neutral"
             print(f"[SENTIMENT] {sentiment}", flush=True)
 
-            # Daily guard housekeeping
             reset_daily_guard_if_new_day()
             if DAILY_GUARD_ENABLED: check_daily_guard_and_maybe_halt()
             allow_new_entries = (not (DAILY_GUARD_ENABLED and HALT_TRADING)) and ALLOW_ENTRIES
 
-            # Close phase: update PL on last bars
             touched=set((k[0],k[1]) for k in OPEN_TRADES.keys())
             for (sym, tf) in touched:
                 try:
@@ -516,17 +549,14 @@ def main():
                 except Exception as e:
                     print(f"[CLOSE-PHASE ERROR] {sym} {tf}m: {e}", flush=True)
 
-            # Optional diagnostic sweep (light list)
             if DIAG_ON:
                 _diag_sweep(DIAG_SYMBOLS, TF_MIN_LIST)
 
-            # EOD auto-flatten window (16:00–16:10 ET)
             now_et=_now_et()
             if now_et.hour==16 and now_et.minute<10:
                 print("[EOD] Auto-flatten window.", flush=True)
                 flatten_all_open_positions()
 
-            # -------- SCAN (ALWAYS) --------
             candidates=[]  # (score,symbol,tf,sig)
             gate_counts=defaultdict(int)
             rej_logged=0
@@ -557,7 +587,6 @@ def main():
                             print(f"[REJECT] {sym} {tf}m * no_signal", flush=True); rej_logged+=1
                         continue
 
-                    # Sentiment block
                     if SENTIMENT_ONLY_GATE:
                         if (sentiment=="bull" and sig["action"]!="buy") or (sentiment=="bear" and sig["action"]!="sell"):
                             gate_counts["sentiment_block"]+=1
@@ -565,7 +594,6 @@ def main():
                                 print(f"[REJECT] {sym} {tf}m * sentiment_block (sent={sentiment}, action={sig['action']})", flush=True); rej_logged+=1
                             continue
 
-                    # Dedupe
                     k = _dedupe_key("ml_pattern", sym, tf, sig["action"], sig.get("barTime",""))
                     if k in _sent_keys:
                         gate_counts["dedupe"]+=1
@@ -573,7 +601,6 @@ def main():
                             print(f"[REJECT] {sym} {tf}m * dedupe", flush=True); rej_logged+=1
                         continue
 
-                    # Symmetric confidence gate
                     score = float(sig.get("score", sig.get("confidence", 0.0)))
                     if score < SCANNER_CONF_THRESHOLD:
                         gate_counts["conf_gate"]+=1
@@ -583,8 +610,22 @@ def main():
 
                     candidates.append((score, sym, tf, sig))
 
-            _log_candidate_summary(candidates)
-            _print_gate_counts(gate_counts)
+            if INTROSPECT and candidates:
+                # quick peek at best 10
+                peek = sorted(candidates, key=lambda x: x[0], reverse=True)[:min(INTROSPECT_TOP_K, len(candidates))]
+                print("[INTROSPECT] top:", ", ".join([f"{s} {tf}m {sc:.3f}" for sc,s,tf,_ in peek]), flush=True)
+
+            # Summary
+            if not candidates:
+                print("[SCAN] candidates=0", flush=True)
+            else:
+                top = sorted(candidates, key=lambda x: x[0], reverse=True)[:5]
+                view = ", ".join([f"{sym} {tf}m {score:.3f}" for score, sym, tf, _ in top])
+                print(f"[SCAN] candidates={len(candidates)} | top5: {view}", flush=True)
+
+            keys=["no_data","vol_gate","no_signal","conf_gate","sentiment_block","dedupe"]
+            parts=[f"{k}={gate_counts.get(k,0)}" for k in keys]
+            print("[GATES] " + " | ".join(parts), flush=True)
 
             # -------- DISPATCH (ranked) --------
             if allow_new_entries and candidates:
