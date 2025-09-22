@@ -1,4 +1,6 @@
-requests
-pandas
-numpy
-boto3
+pandas==2.2.2
+numpy==1.26.4
+requests==2.32.3
+pytz==2024.1
+pandas-ta==0.3.14b0
+scikit-learn==1.5.1
