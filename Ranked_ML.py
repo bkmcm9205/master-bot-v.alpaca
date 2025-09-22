@@ -1,10 +1,5 @@
 # Ranked_ML.py — TradersPost ML scanner with confidence ranking + diagnostics
-# - Confidence-ranked dispatch (highest confidence first)
-# - Unlimited sends by default (MAX_ENTRIES_PER_CYCLE=0)
-# - Sentiment gate preserved
-# - Detailed per-loop diagnostics (candidate summary + gate counters)
-# - BYPASS_SESSION env to allow after-hours/premarket testing without posting
-# - Dedupe at send-time so candidates aren’t “burned” early
+# v1.3 — confidence gate moved OUT of ML function so diagnostics show conf_gate (not no_signal)
 
 import os, time, json, math, hashlib, requests
 from collections import defaultdict, deque
@@ -18,7 +13,7 @@ import pytz
 # ==============================
 # BOOT TAG (so you know this file is running)
 # ==============================
-APP_TAG = "Ranked_ML v1.2 (diagnostics + bypass_session)"
+APP_TAG = "Ranked_ML v1.3 (diag + bypass_session + outer_conf_gate)"
 print(f"[BOOT] {APP_TAG}", flush=True)
 
 # ==============================
@@ -166,7 +161,7 @@ def get_universe_symbols() -> list:
 def send_to_traderspost(payload: dict):
     try:
         if DRY_RUN or not ALLOW_ENTRIES:
-            print(f"[DRY/PAUSED] {json.dumps(payload)[:500]}", flush=True); return True, "dry/paused"
+            print(f("[DRY/PAUSED] {json.dumps(payload)[:500]}"), flush=True); return True, "dry/paused"
         if not TP_URL:
             print("[ERROR] TP_WEBHOOK_URL missing.", flush=True); return False, "no-webhook-url"
         # throttle per minute
@@ -228,7 +223,7 @@ def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, c
             print(f"[CLOSE] {t.combo} {t.reason.upper()} qty={t.qty} entry={t.entry:.2f} exit={t.exit:.2f} pnl={pnl:+.2f}", flush=True)
 
 # ==============================
-# Sentiment (same structure as your file)
+# Sentiment
 # ==============================
 def _now_et_tz(): return datetime.now(timezone.utc).astimezone(pytz.timezone("America/New_York"))
 def _is_rth_tz(ts): h,m=ts.hour,ts.minute; return ((h>9) or (h==9 and m>=30)) and (h<16)
@@ -279,15 +274,15 @@ def compute_sentiment():
     print(f"[SENTIMENT] avg_momentum={avg:+.4%} → {out}", flush=True); return out
 
 # ==============================
-# ML strategy with confidence
+# ML strategy with confidence reported (not gated here)
 # ==============================
-def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, conf_threshold=None, r_multiple=None):
+def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, r_multiple=None):
+    """Return a *candidate* when model predicts up; outer loop enforces confidence threshold."""
     try:
         from sklearn.ensemble import RandomForestClassifier
         import pandas_ta as ta
     except Exception:
         return None
-    conf_threshold=float(conf_threshold if conf_threshold is not None else SCANNER_CONF_THRESHOLD)
     r_multiple=float(r_multiple if r_multiple is not None else SCANNER_R_MULTIPLE)
     if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex): return None
     bars=_resample(df1m, tf_min)
@@ -312,30 +307,16 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, conf_thresho
     except Exception: pass
     proba=float(clf.predict_proba(x_live)[0][1]); pred=int(proba>=0.5)
     ts=bars.index[-1]
-    if not _in_session(ts):
-        return None
-    
-    if pred == 1:
-        price = float(bars["close"].iloc[-1])
-        sl    = price * 0.99
-        tp    = price * (1 + 0.01 * r_multiple)
-        qty   = _position_qty(price, sl)
-        if qty <= 0:
-            return None
-        return {
-            "action": "buy",
-            "orderType": "market",
-            "price": None,
-            "takeProfit": tp,
-            "stopLoss": sl,
-            "barTime": ts.tz_convert("UTC").isoformat(),
-            "entry": price,
-            "quantity": int(qty),
-            "confidence": float(proba),
-            "score": float(proba),
-            "meta": {"note": "ml_pattern", "confidence": float(proba)}
-        }
-
+    if not _in_session(ts): return None
+    if pred==1:
+        price=float(bars["close"].iloc[-1]); sl=price*0.99; tp=price*(1+0.01*r_multiple)
+        qty=_position_qty(price, sl)
+        if qty<=0: return None
+        return {"action":"buy","orderType":"market","price":None,
+                "takeProfit":tp,"stopLoss":sl,"barTime":ts.tz_convert("UTC").isoformat(),
+                "entry":price,"quantity":int(qty),
+                "confidence":proba,"score":proba,
+                "meta":{"note":"ml_pattern","confidence":proba}}
     return None
 
 # ==============================
@@ -389,7 +370,6 @@ def _log_candidate_summary(cands):
     print(f"[SCAN] candidates={len(cands)} | top5: {view}", flush=True)
 
 def _print_gate_counts(gc):
-    # Always print the same keys for readability
     keys = ["no_data","vol_gate","no_signal","conf_gate","sentiment_block","dedupe"]
     parts=[f"{k}={gc.get(k,0)}" for k in keys]
     print("[GATES] " + " | ".join(parts), flush=True)
@@ -415,7 +395,7 @@ def compute_signal(strategy_name, symbol, tf_minutes, df1m=None):
     if todays_vol < SCANNER_MIN_TODAY_VOL: return None
 
     if strategy_name=="ml_pattern":
-        return signal_ml_pattern(symbol, df1m, tf_minutes, SCANNER_CONF_THRESHOLD, SCANNER_R_MULTIPLE)
+        return signal_ml_pattern(symbol, df1m, tf_minutes, SCANNER_R_MULTIPLE)
     return None
 
 # ==============================
@@ -433,7 +413,7 @@ def main():
             hits=0; last_key=None
             for i in range(len(bars)):
                 df_slice=df1m.loc[:bars.index[i]]
-                sig=signal_ml_pattern(REPLAY_SYMBOL, df_slice, REPLAY_TF, SCANNER_CONF_THRESHOLD, SCANNER_R_MULTIPLE)
+                sig=signal_ml_pattern(REPLAY_SYMBOL, df_slice, REPLAY_TF, SCANNER_R_MULTIPLE)
                 if sig:
                     if REPLAY_SEND_ORDERS:
                         payload=build_payload(REPLAY_SYMBOL, sig); print("[REPLAY-ORDER]", json.dumps(payload)[:200], flush=True)
