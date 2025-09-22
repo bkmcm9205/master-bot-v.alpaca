@@ -312,15 +312,30 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, conf_thresho
     except Exception: pass
     proba=float(clf.predict_proba(x_live)[0][1]); pred=int(proba>=0.5)
     ts=bars.index[-1]
-    if not _in_session(ts): return None
-    if pred==1 and proba>=conf_threshold:
-        price=float(bars["close"].iloc[-1]); sl=price*0.99; tp=price*(1+0.01*r_multiple)
-        qty=_position_qty(price, sl)
-        if qty<=0: return None
-        return {"action":"buy","orderType":"market","price":None,
-                "takeProfit":tp,"stopLoss":sl,"barTime":ts.tz_convert("UTC").isoformat(),
-                "entry":price,"quantity":int(qty),"confidence":proba,"score":proba,
-                "meta":{"note":"ml_pattern","confidence":proba}}
+    if not _in_session(ts):
+        return None
+    
+    if pred == 1:
+        price = float(bars["close"].iloc[-1])
+        sl    = price * 0.99
+        tp    = price * (1 + 0.01 * r_multiple)
+        qty   = _position_qty(price, sl)
+        if qty <= 0:
+            return None
+        return {
+            "action": "buy",
+            "orderType": "market",
+            "price": None,
+            "takeProfit": tp,
+            "stopLoss": sl,
+            "barTime": ts.tz_convert("UTC").isoformat(),
+            "entry": price,
+            "quantity": int(qty),
+            "confidence": float(proba),
+            "score": float(proba),
+            "meta": {"note": "ml_pattern", "confidence": float(proba)}
+        }
+
     return None
 
 # ==============================
