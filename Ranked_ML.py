@@ -1,5 +1,5 @@
 # Ranked_ML.py — ML scanner with confidence ranking, two-sided trades, guards, and diagnostics
-# v1.7: Full features restored (daily guard, close-phase, EOD flatten, replay opt) + diag from v1.6
+# v1.8: Scan ALWAYS; dispatch obeys ALLOW_ENTRIES. Full features + diagnostics.
 import os, time, json, math, hashlib, requests, traceback
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
@@ -7,10 +7,9 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-APP_TAG = "Ranked_ML v1.7 (full + diag)"
+APP_TAG = "Ranked_ML v1.8 (scan-always + full + diag)"
 print(f"[BOOT] {APP_TAG}", flush=True)
 
-# ---------------- ENV ----------------
 def _env_bool(key, default="0"):
     return os.getenv(key, default).lower() in ("1","true","yes")
 
@@ -24,7 +23,7 @@ MARKET_TZ           = "America/New_York"
 SCANNER_CONF_THRESHOLD = float(os.getenv("SCANNER_CONF_THRESHOLD", "0.80"))
 SCANNER_R_MULTIPLE     = float(os.getenv("SCANNER_R_MULTIPLE", "3.0"))
 MAX_ENTRIES_PER_CYCLE  = int(os.getenv("MAX_ENTRIES_PER_CYCLE", "0"))  # 0/neg => unlimited
-ALLOW_ENTRIES          = _env_bool("ALLOW_ENTRIES","1")
+ALLOW_ENTRIES          = _env_bool("ALLOW_ENTRIES","1")                # gates DISPATCH only
 
 # Universe
 SCANNER_SYMBOLS       = os.getenv("SCANNER_SYMBOLS", "").strip()
@@ -52,7 +51,7 @@ SENTIMENT_ONLY_GATE      = _env_bool("SENTIMENT_ONLY_GATE","1")
 # Two-sided
 SHORTS_ENABLED           = _env_bool("SHORTS_ENABLED","1")
 
-# Daily guard (portfolio-level realized PnL)
+# Daily guard
 START_EQUITY         = float(os.getenv("START_EQUITY", "100000"))
 DAILY_TP_PCT         = float(os.getenv("DAILY_TP_PCT", "0.25"))
 DAILY_DD_PCT         = float(os.getenv("DAILY_DD_PCT", "0.05"))
@@ -83,25 +82,20 @@ print("[CONFIG] "
       f"INTROSPECT={INTROSPECT} DIAG_ON={DIAG_ON} DIAG_SYMBOLS={DIAG_SYMBOLS} LOG_REJ_N={LOG_REJECTIONS_N}",
       flush=True)
 
-# ---------------- State ----------------
+# ---------- State ----------
 COUNTS        = defaultdict(int)
 COMBO_COUNTS  = defaultdict(int)
-PERF          = {}  # combo -> stats
-OPEN_TRADES   = defaultdict(list)  # (symbol, tf) -> [LiveTrade]
+PERF          = {}
+OPEN_TRADES   = defaultdict(list)
 _sent_keys    = set()
 _order_times  = deque()
 
 DAY_STAMP     = datetime.now().astimezone().strftime("%Y-%m-%d")
 HALT_TRADING  = False
 
-# ---------------- Utils ----------------
-def _now_et():
-    return datetime.now(timezone.utc).astimezone(ZoneInfo(MARKET_TZ))
-
-def _is_rth(ts):
-    h,m=ts.hour,ts.minute
-    return ((h>9) or (h==9 and m>=30)) and (h<16)
-
+# ---------- Utils ----------
+def _now_et(): return datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+def _is_rth(ts): h,m=ts.hour,ts.minute; return ((h>9) or (h==9 and m>=30)) and (h<16)
 def _in_session(ts):
     if BYPASS_SESSION: return True
     if _is_rth(ts): return True
@@ -127,7 +121,7 @@ def _position_qty(entry_price: float, stop_price: float) -> int:
     qty = math.floor(max(min(qty_risk, qty_notional), 0) / max(1, ROUND_LOT)) * max(1, ROUND_LOT)
     return int(max(qty, MIN_QTY if qty > 0 else 0))
 
-# ---------------- Polygon ----------------
+# ---------- Polygon ----------
 def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
     if not POLYGON_API_KEY: return pd.DataFrame()
     end = datetime.now(timezone.utc); start = end - timedelta(minutes=lookback_minutes)
@@ -141,7 +135,7 @@ def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
         if not rows: return pd.DataFrame()
         df = pd.DataFrame(rows)
         df["ts"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-        df = df.set_index("ts").sort_index(); df.index = df.index.tz_convert(MARKET_TZ)
+        df = df.set_index("ts").sort_index(); df.index = df.index.tz_convert("America/New_York")
         return df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})[["open","high","low","close","volume"]]
     except: return pd.DataFrame()
 
@@ -163,7 +157,7 @@ def get_universe_symbols() -> list:
         pages+=1
     return [s for s in out if s.isalnum()]
 
-# ---------------- Sentiment ----------------
+# ---------- Sentiment ----------
 def compute_sentiment():
     import pytz
     def _now_et_tz(): return datetime.now(timezone.utc).astimezone(pytz.timezone("America/New_York"))
@@ -173,7 +167,7 @@ def compute_sentiment():
     symbols=[s.strip() for s in os.getenv("SENTS_SYMBOLS","SPY,QQQ").split(",") if s.strip()]
     look_min=int(os.getenv("SENTS_LOOKBACK_MIN","30")); tf_min=int(os.getenv("SENTS_TF","1"))
     gap_bp=float(os.getenv("SENTS_GAP_THRESHOLD_BP","20"))/10000.0
-    now_et=_now_et_tz(); is_rth=_is_rth_tz(now_et)
+    now_et=_now_et(); is_rth=_is_rth_tz(now_et)
 
     def _intraday_momentum(sym):
         df=fetch_polygon_1m(sym, lookback_minutes=max(look_min, tf_min*look_min))
@@ -213,7 +207,7 @@ def compute_sentiment():
     out="bull" if avg>=up_th else "bear" if avg<=dn_th else "neutral"
     print(f"[SENTIMENT] avg_momentum={avg:+.4%} → {out}", flush=True); return out
 
-# ---------------- Perf / ledger ----------------
+# ---------- Perf / ledger ----------
 def _combo_key(strategy: str, symbol: str, tf_min: int) -> str: return f"{strategy}|{symbol}|{int(tf_min)}"
 
 def _perf_init(combo: str):
@@ -258,7 +252,7 @@ def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, c
             _perf_update(t.combo, pnl)
             print(f"[CLOSE] {t.combo} {t.reason.upper()} qty={t.qty} entry={t.entry:.2f} exit={t.exit:.2f} pnl={pnl:+.2f}", flush=True)
 
-# ---------------- Daily guard ----------------
+# ---------- Daily guard ----------
 def _today_local_date_str(): return datetime.now().astimezone().strftime("%Y-%m-%d")
 def _realized_day_pnl()->float: return sum(float(p.get("net_pnl",0.0)) for p in PERF.values())
 def _opposite(a:str)->str: return "sell" if a=="buy" else "buy"
@@ -296,7 +290,7 @@ def check_daily_guard_and_maybe_halt():
         HALT_TRADING=True; print("[DAILY-GUARD] ⛔ Daily DD hit. Halting entries.", flush=True)
         if DAILY_FLATTEN_ON_HIT: flatten_all_open_positions()
 
-# ---------------- ML (two-sided) ----------------
+# ---------- ML (two-sided) ----------
 def _ml_features_from_resampled(bars: pd.DataFrame):
     out = bars.copy()
     out["return"] = out["close"].pct_change()
@@ -310,7 +304,6 @@ def _ml_features_from_resampled(bars: pd.DataFrame):
     out.dropna(inplace=True); return out
 
 def ml_score(symbol: str, df1m: pd.DataFrame, tf_min: int):
-    reason=None
     if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex): return None, None, "no_data"
     bars=_resample(df1m, tf_min)
     if bars.empty or len(bars)<60: return None, None, "bars_short"
@@ -355,7 +348,7 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, r_multiple=N
             "confidence":score,"score":score,
             "meta":{"note":"ml_pattern","confidence":score}}
 
-# ---------------- TP I/O ----------------
+# ---------- TP I/O ----------
 def send_to_traderspost(payload: dict):
     try:
         if DRY_RUN or not ALLOW_ENTRIES:
@@ -385,7 +378,7 @@ def build_payload(symbol: str, sig: dict):
     if sl_abs is not None: payload["stopLoss"]={"type":"stop","stopPrice": float(round(sl_abs,2))}
     return payload
 
-# ---------------- Diagnostics helpers ----------------
+# ---------- Diagnostics helpers ----------
 def _log_candidate_summary(cands):
     if not cands: print("[SCAN] candidates=0", flush=True); return
     top = sorted(cands, key=lambda x: x[0], reverse=True)[:5]
@@ -403,7 +396,7 @@ def _diag_sweep(symbols, tfs):
         df1m=fetch_polygon_1m(sym, lookback_minutes=max(240, max(tfs)*240))
         if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
             print(f"[DIAG] {sym}: no_data", flush=True); continue
-        try: df1m.index=df1m.index.tz_convert(MARKET_TZ)
+        try: df1m.index=df1m.index.tz_convert("America/New_York")
         except Exception: pass
         today_mask = df1m.index.date == df1m.index[-1].date()
         todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
@@ -417,7 +410,7 @@ def _diag_sweep(symbols, tfs):
                 else: side="sell" if SHORTS_ENABLED else "buy?disabled_short"; score=max(proba_up, 1-proba_up) if SHORTS_ENABLED else proba_up
                 print(f"[DIAG] {sym} {tf}m -> proba_up={proba_up:.3f} side={side} score={score:.3f} vol={int(todays_vol)} sess_ok={sess_ok} reason={reason}", flush=True)
 
-# ---------------- Router ----------------
+# ---------- Router ----------
 def compute_signal(strategy_name, symbol, tf_minutes, df1m=None):
     if df1m is None or getattr(df1m, "empty", True):
         df1m = fetch_polygon_1m(symbol, lookback_minutes=max(240, tf_minutes*240))
@@ -425,8 +418,8 @@ def compute_signal(strategy_name, symbol, tf_minutes, df1m=None):
     if not isinstance(df1m.index, pd.DatetimeIndex):
         try: df1m.index = pd.to_datetime(df1m.index, utc=True)
         except Exception: return None
-    try: df1m.index = df1m.index.tz_convert(MARKET_TZ)
-    except Exception: df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
+    try: df1m.index = df1m.index.tz_convert("America/New_York")
+    except Exception: df1m.index = df1m.index.tz_localize("UTC").tz_convert("America/New_York")
 
     today_mask = df1m.index.date == df1m.index[-1].date()
     todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
@@ -436,7 +429,7 @@ def compute_signal(strategy_name, symbol, tf_minutes, df1m=None):
         return signal_ml_pattern(symbol, df1m, tf_minutes, SCANNER_R_MULTIPLE)
     return None
 
-# ---------------- Main ----------------
+# ---------- Main ----------
 def main():
     print("Scanner starting…", flush=True)
     symbols = get_universe_symbols()
@@ -486,7 +479,7 @@ def main():
                 except Exception as e:
                     print(f"[CLOSE-PHASE ERROR] {sym} {tf}m: {e}", flush=True)
 
-            # Optional diagnostic sweep (lightweight list)
+            # Optional diagnostic sweep (light list)
             if DIAG_ON:
                 _diag_sweep(DIAG_SYMBOLS, TF_MIN_LIST)
 
@@ -496,17 +489,7 @@ def main():
                 print("[EOD] Auto-flatten window.", flush=True)
                 flatten_all_open_positions()
 
-            # If entries paused, skip new scans
-            if not allow_new_entries:
-                time.sleep(POLL_SECONDS); continue
-
-            # Max concurrent guard
-            open_positions=sum(1 for lst in OPEN_TRADES.values() for t in lst if t.is_open)
-            if open_positions >= MAX_CONCURRENT_POSITIONS:
-                print(f"[LIMIT] Max concurrent positions hit: {open_positions}/{MAX_CONCURRENT_POSITIONS}", flush=True)
-                time.sleep(POLL_SECONDS); continue
-
-            # -------- SCAN --------
+            # -------- SCAN (ALWAYS) --------
             candidates=[]  # (score,symbol,tf,sig)
             gate_counts=defaultdict(int)
             rej_logged=0
@@ -518,8 +501,8 @@ def main():
                     if LOG_REJECTIONS_N and rej_logged<LOG_REJECTIONS_N:
                         print(f"[REJECT] {sym} * no_data", flush=True); rej_logged+=1
                     continue
-                try: df1m.index=df1m.index.tz_convert(MARKET_TZ)
-                except Exception: df1m.index=df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
+                try: df1m.index=df1m.index.tz_convert("America/New_York")
+                except Exception: df1m.index=df1m.index.tz_localize("UTC").tz_convert("America/New_York")
 
                 today_mask = df1m.index.date == df1m.index[-1].date()
                 todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
@@ -545,7 +528,7 @@ def main():
                                 print(f"[REJECT] {sym} {tf}m * sentiment_block (sent={sentiment}, action={sig['action']})", flush=True); rej_logged+=1
                             continue
 
-                    # De-dupe
+                    # Dedupe
                     k = _dedupe_key("ml_pattern", sym, tf, sig["action"], sig.get("barTime",""))
                     if k in _sent_keys:
                         gate_counts["dedupe"]+=1
@@ -567,7 +550,7 @@ def main():
             _print_gate_counts(gate_counts)
 
             # -------- DISPATCH (ranked) --------
-            if candidates:
+            if allow_new_entries and candidates:
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 sent_ct=0
                 for score, sym, tf, sig in candidates:
