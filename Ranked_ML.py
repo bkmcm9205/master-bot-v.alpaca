@@ -27,7 +27,7 @@ SCANNER_MIN_TODAY_VOL = int(os.getenv("SCANNER_MIN_TODAY_VOL", "500000")) # toda
 SCANNER_CONF_THRESHOLD = float(os.getenv("SCANNER_CONF_THRESHOLD", "0.8")) # confidence threshold for ML signals
 SCANNER_R_MULTIPLE = float(os.getenv("SCANNER_R_MULTIPLE", "3.0")) # risk-reward ratio for TP
 TF_MIN_LIST = [int(x) for x in os.getenv("TF_MIN_LIST", "1,2,3,5,10").split(",") if x.strip()]
-# Price + exchange filters
+# Price / exchange filters
 MIN_PRICE = float(os.getenv("MIN_PRICE", "5.0")) # last trade must be >= this
 ALLOWED_EXCHANGES = set(
     x.strip().upper()
@@ -128,6 +128,7 @@ def _position_qty(entry_price: float, stop_price: float,
 def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
     """Return tz-aware ET 1m bars with o/h/l/c/volume."""
     if not POLYGON_API_KEY:
+        print("[ERROR] POLYGON_API_KEY missing in fetch_polygon_1m", flush=True)
         return pd.DataFrame()
     end = datetime.now(timezone.utc)
     start = end - timedelta(minutes=lookback_minutes)
@@ -139,9 +140,11 @@ def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
     try:
         r = requests.get(url, timeout=15)
         if r.status_code != 200:
+            print(f"[ERROR] Polygon API failed for {symbol}: {r.status_code}", flush=True)
             return pd.DataFrame()
         rows = r.json().get("results", [])
         if not rows:
+            print(f"[WARN] No data from Polygon for {symbol}", flush=True)
             return pd.DataFrame()
         df = pd.DataFrame(rows)
         df["ts"] = pd.to_datetime(df["t"], unit="ms", utc=True)
@@ -149,13 +152,15 @@ def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
         df.index = df.index.tz_convert(MARKET_TZ)
         df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
         return df[["open","high","low","close","volume"]]
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] fetch_polygon_1m for {symbol}: {e}", flush=True)
         return pd.DataFrame()
 def get_universe_symbols() -> list:
     """Env override OR Polygon reference tickers filtered by ALLOWED_EXCHANGES."""
     if SCANNER_SYMBOLS:
         return [s.strip().upper() for s in SCANNER_SYMBOLS.split(",") if s.strip()]
     if not POLYGON_API_KEY:
+        print("[ERROR] POLYGON_API_KEY missing in get_universe_symbols", flush=True)
         return []
     out, cursor, pages = [], None, 0
     while pages < SCANNER_MAX_PAGES:
@@ -168,6 +173,7 @@ def get_universe_symbols() -> list:
         url = "https://api.polygon.io/v3/reference/tickers"
         r = requests.get(url, params=params, timeout=20)
         if r.status_code != 200:
+            print(f"[ERROR] Polygon API tickers failed: {r.status_code}", flush=True)
             break
         j = r.json()
         for x in j.get("results", []):
@@ -212,6 +218,7 @@ def send_to_traderspost(payload: dict):
         info = f"{r.status_code} {r.text[:300]}"
         return (200 <= r.status_code < 300), info
     except Exception as e:
+        print(f"[ERROR] send_to_traderspost: {e}", flush=True)
         return False, f"exception: {e}"
 def build_payload(symbol: str, sig: dict):
     """Normalize legacy and absolute TP/SL into TradersPost nested fields."""
@@ -312,6 +319,7 @@ def compute_sentiment():
     for s in SENTIMENT_SYMBOLS:
         df = fetch_polygon_1m(s, lookback_minutes=look_min*2)
         if df is None or df.empty:
+            print(f"[WARN] No sentiment data for {s}", flush=True)
             continue
         try:
             df.index = df.index.tz_convert(MARKET_TZ)
@@ -320,9 +328,11 @@ def compute_sentiment():
         # simple momentum over last look_min minutes
         window = df.iloc[-look_min:]
         if len(window) < 2:
+            print(f"[WARN] Insufficient data for {s} sentiment", flush=True)
             continue
         vals.append(float(window["close"].iloc[-1]) / float(window["close"].iloc[0]) - 1.0)
     if not vals:
+        print("[WARN] No valid sentiment data, defaulting to neutral", flush=True)
         return "neutral"
     avg = sum(vals) / len(vals)
     if avg >= SENTIMENT_NEUTRAL_BAND:
@@ -335,30 +345,36 @@ def compute_sentiment():
 # =============================
 def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
     if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
+        print("[WARN] Invalid DataFrame for resampling", flush=True)
         return pd.DataFrame()
     rule = f"{int(tf_min)}min"
     agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
     try:
         bars = df1m.resample(rule, origin="start_day", label="right").agg(agg).dropna()
-    except Exception:
-        bars = pd.DataFrame()
+    except Exception as e:
+        print(f"[ERROR] Resampling failed: {e}", flush=True)
+        return pd.DataFrame()
     return bars
 def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, sentiment: str, conf_threshold=SCANNER_CONF_THRESHOLD, r_multiple=SCANNER_R_MULTIPLE):
     try:
         from sklearn.ensemble import RandomForestClassifier
         import pandas_ta as ta
-    except Exception:
+    except ImportError as e:
+        print(f"[ERROR] Failed to import sklearn or pandas_ta: {e}", flush=True)
         return None
     if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
+        print(f"[WARN] Invalid data for {symbol} {tf_min}m", flush=True)
         return None
     bars = _resample(df1m, tf_min)
     if bars.empty or len(bars) < 120:
+        print(f"[WARN] Insufficient bars for {symbol} {tf_min}m: {len(bars)}", flush=True)
         return None
     bars = bars.copy()
     bars["return"] = bars["close"].pct_change()
     try:
         bars["rsi"] = ta.rsi(bars["close"], length=14)
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] RSI calculation failed for {symbol}: {e}", flush=True)
         delta = bars["close"].diff()
         up = delta.clip(lower=0).rolling(14).mean()
         down = -delta.clip(upper=0).rolling(14).mean()
@@ -367,10 +383,12 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, sentiment: s
     bars["volatility"] = bars["close"].rolling(20).std()
     bars.dropna(inplace=True)
     if len(bars) < 60:
+        print(f"[WARN] Insufficient data after dropna for {symbol} {tf_min}m: {len(bars)}", flush=True)
         return None
     X = bars[["return","rsi","volatility"]].iloc[:-1]
     y = (bars["close"].shift(-1) > bars["close"]).astype(int).iloc[:-1]
     if len(X) < 50:
+        print(f"[WARN] Insufficient training data for {symbol} {tf_min}m: {len(X)}", flush=True)
         return None
     cut = int(len(X) * 0.7)
     clf = RandomForestClassifier(n_estimators=100, random_state=42)
@@ -384,6 +402,7 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, sentiment: s
     proba_down = 1 - proba_up
     ts = bars.index[-1]
     if not _in_session(ts):
+        print(f"[INFO] {symbol} {tf_min}m outside trading session", flush=True)
         return None
     price = float(bars["close"].iloc[-1])
     action = None
@@ -414,10 +433,13 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, sentiment: s
                 sl = price * 1.01
                 tp = price * (1 - 0.01 * r_multiple)
     if action is None:
+        print(f"[INFO] No signal for {symbol} {tf_min}m (proba_up={proba_up:.3f}, proba_down={proba_down:.3f}, sentiment={sentiment})", flush=True)
         return None
     qty = _position_qty(price, sl)
     if qty <= 0:
+        print(f"[WARN] Invalid quantity for {symbol} {tf_min}m: qty={qty}", flush=True)
         return None
+    print(f"[SIGNAL] {symbol} {tf_min}m {action.upper()} confidence={confidence:.3f}", flush=True)
     return {
         "action": action,
         "orderType": "market",
@@ -516,6 +538,7 @@ def compute_signal(strategy_name, symbol, tf_minutes, sentiment, df1m=None):
         try:
             df1m.index = pd.to_datetime(df1m.index, utc=True)
         except Exception:
+            print(f"[ERROR] Invalid index for {symbol} {tf_minutes}m", flush=True)
             return None
     try:
         df1m.index = df1m.index.tz_convert(MARKET_TZ)
@@ -526,12 +549,15 @@ def compute_signal(strategy_name, symbol, tf_minutes, sentiment, df1m=None):
         last_px = float(df1m["close"].iloc[-1])
         LAST_PRICE[symbol] = last_px # update MTM cache
         if last_px < MIN_PRICE:
+            print(f"[INFO] {symbol} price {last_px:.2f} below MIN_PRICE {MIN_PRICE}", flush=True)
             return None
-    except Exception:
+    except Exception as e:
+        print(f"[ERROR] Price check failed for {symbol}: {e}", flush=True)
         return None
     today_mask = df1m.index.date == df1m.index[-1].date()
     todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
     if todays_vol < SCANNER_MIN_TODAY_VOL:
+        print(f"[INFO] {symbol} volume {todays_vol:.0f} below SCANNER_MIN_TODAY_VOL {SCANNER_MIN_TODAY_VOL}", flush=True)
         return None
     if strategy_name == "ml_pattern":
         return signal_ml_pattern(symbol, df1m, tf_minutes, sentiment)
@@ -588,11 +614,12 @@ def main():
                     except Exception:
                         df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
                     bars = _resample(df, tf)
-                    if bars is not None and not bars.empty:
-                        row = bars.iloc[-1]
-                        ts = bars.index[-1]
-                        LAST_PRICE[sym] = float(row["close"]) # refresh MTM
-                        _maybe_close_on_bar(sym, tf, ts, float(row["high"]), float(row["low"]), float(row["close"]))
+                    if bars is None or bars.empty:
+                        continue
+                    row = bars.iloc[-1]
+                    ts = bars.index[-1]
+                    LAST_PRICE[sym] = float(row["close"]) # refresh MTM
+                    _maybe_close_on_bar(sym, tf, ts, float(row["high"]), float(row["low"]), float(row["close"]))
                 except Exception as e:
                     print(f"[CLOSE-PHASE ERROR] {sym} {tf}m: {e}", flush=True)
             # Guard check after exits & price refresh
@@ -600,6 +627,7 @@ def main():
                 check_daily_guard_and_maybe_halt()
             allow_entries = not (DAILY_GUARD_ENABLED and HALT_TRADING)
             if not allow_entries:
+                print("[INFO] Trading halted by daily guard", flush=True)
                 time.sleep(POLL_SECONDS)
                 continue
             # Max concurrent positions guard
@@ -632,6 +660,7 @@ def main():
                     # De-dupe
                     k = hashlib.sha256(f"ml_pattern|{sym}|{tf}|{sig['action']}|{sig.get('barTime','')}".encode()).hexdigest()
                     if k in _sent_keys:
+                        print(f"[INFO] Duplicate signal skipped for {sym} {tf}m", flush=True)
                         continue
                     _sent_keys.add(k)
                     signals_list.append((sym, tf, sig))
@@ -640,7 +669,7 @@ def main():
             for sym, tf, sig in signals_list:
                 open_positions = sum(1 for lst in OPEN_TRADES.values() for t in lst if t.is_open)
                 if open_positions >= MAX_CONCURRENT_POSITIONS:
-                    print(f"[LIMIT] Max concurrent reached during execution.", flush=True)
+                    print(f"[LIMIT] Max concurrent reached during execution: {open_positions}/{MAX_CONCURRENT_POSITIONS}", flush=True)
                     break
                 handle_signal("ml_pattern", sym, tf, sig)
             # EOD auto-flatten window (16:00–16:10 ET)
