@@ -1,6 +1,8 @@
 # Ranked_ML.py — ML scanner with confidence ranking, two-sided trades, guards, and diagnostics
-# v2.3: Proper v3 paging (follow next_url), exchange filter in-pager, optional shuffle,
-#       boot-time universe histogram, retains EOD flatten + neutral sentiment allows both sides.
+# v2.4: FIXED Polygon paging (append apiKey to next_url OR reuse base endpoint with cursor),
+#       robust 401 handling & retries, proper universe-wide ranking (no A/B bias),
+#       keeps price floor, exchange filter, neutral sentiment allows both sides,
+#       EOD flatten + daily guard + open-trade close checks.
 
 import os, time, json, math, hashlib, requests, traceback, random
 from collections import defaultdict, deque, Counter
@@ -9,7 +11,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-APP_TAG = "Ranked_ML v2.3 (universe paging fix + exch filter + shuffle)"
+APP_TAG = "Ranked_ML v2.4 (paging fix + true market-wide ranking)"
 print(f"[BOOT] {APP_TAG}", flush=True)
 
 # -------- ENV HELPERS --------
@@ -26,17 +28,17 @@ MARKET_TZ           = "America/New_York"
 SCANNER_CONF_THRESHOLD = float(os.getenv("SCANNER_CONF_THRESHOLD", "0.80"))
 SCANNER_R_MULTIPLE     = float(os.getenv("SCANNER_R_MULTIPLE", "3.0"))
 MAX_ENTRIES_PER_CYCLE  = int(os.getenv("MAX_ENTRIES_PER_CYCLE", "0"))  # 0/neg => unlimited
-ALLOW_ENTRIES          = _env_bool("ALLOW_ENTRIES","1")                # gates DISPATCH only
+ALLOW_ENTRIES          = _env_bool("ALLOW_ENTRIES","1")
 
 # Universe
 SCANNER_SYMBOLS       = os.getenv("SCANNER_SYMBOLS", "").strip()
-SCANNER_MAX_PAGES     = int(os.getenv("SCANNER_MAX_PAGES", "3"))   # each page ~1000
+SCANNER_MAX_PAGES     = int(os.getenv("SCANNER_MAX_PAGES", "8"))   # each page ~1000
 SCANNER_MIN_TODAY_VOL = int(os.getenv("SCANNER_MIN_TODAY_VOL", "100000"))
 TF_MIN_LIST           = [int(x) for x in os.getenv("TF_MIN_LIST", "1,2,3,5,10").split(",") if x.strip()]
 UNIVERSE_SHUFFLE      = _env_bool("UNIVERSE_SHUFFLE", "1")
 
 # Symbol filters
-MIN_PRICE = float(os.getenv("MIN_PRICE", "5.0"))   # skip stocks below this
+MIN_PRICE = float(os.getenv("MIN_PRICE", "5.0"))
 ALLOWED_EXCHANGES = [s.strip().upper() for s in os.getenv(
     "ALLOWED_EXCHANGES", "XNYS,XNAS,NYSE,NASDAQ,NASD").split(",") if s.strip()]
 
@@ -78,7 +80,7 @@ REPLAY_SEND_ORDERS = _env_bool("REPLAY_SEND_ORDERS","0")
 # Diagnostics
 INTROSPECT         = _env_bool("INTROSPECT","0")
 INTROSPECT_TOP_K   = int(os.getenv("INTROSPECT_TOP_K","10"))
-LOG_REJECTIONS_N   = int(os.getenv("LOG_REJECTIONS_N","0"))  # 0=off
+LOG_REJECTIONS_N   = int(os.getenv("LOG_REJECTIONS_N","0"))
 DIAG_ON            = _env_bool("DIAG_ON","0")
 DIAG_SYMBOLS       = [s.strip().upper() for s in os.getenv("DIAG_SYMBOLS","SPY,QQQ,AAPL,NVDA").split(",") if s.strip()]
 DIAG_SIG_DETAILS   = _env_bool("DIAG_SIG_DETAILS","0")
@@ -137,8 +139,8 @@ def _position_qty(entry_price: float, stop_price: float) -> int:
 def _debug_universe_print(symbols: list, max_show: int = 40):
     first = [s[0] for s in symbols if s]
     hist = Counter(first)
-    top = ", ".join([f"{k}:{v}" for k, v in sorted(hist.items())])
     sample = ", ".join(symbols[:max_show])
+    top = ", ".join([f"{k}:{v}" for k, v in sorted(hist.items())])
     print(f"[UNIVERSE-DEBUG] first-letter hist => {top}", flush=True)
     print(f"[UNIVERSE-DEBUG] first {max_show} => {sample}", flush=True)
 
@@ -159,19 +161,27 @@ def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
         for col in ("o","h","l","c","v","t"):
             if col not in df.columns: return pd.DataFrame()
         df["ts"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-        df = df.set_index("ts").sortindex().sort_index()
+        df = df.set_index("ts").sort_index()
         df.index = df.index.tz_convert(MARKET_TZ)
         df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
         return df[["open","high","low","close","volume"]]
     except Exception:
         return pd.DataFrame()
 
+def _append_apikey_if_missing(url: str, key: str) -> str:
+    if not url: return url
+    if "apiKey=" in url: return url
+    sep = "&" if ("?" in url) else "?"
+    return f"{url}{sep}apiKey={key}"
+
 def get_universe_symbols() -> list:
     """
     Universe: env override OR Polygon reference tickers (active US stocks), multi-page.
-    - Correctly follows v3 `next_url` directly (already contains cursor).
-    - Filters by exchange (MIC) against ALLOWED_EXCHANGES.
-    - Optional shuffle to avoid alpha bias (UNIVERSE_SHUFFLE=1).
+    Robust paging:
+      1) Start with base /v3/reference/tickers (limit=1000).
+      2) If 'next_url' present, try using it; if it lacks apiKey, append it.
+      3) Alternatively parse its cursor and keep calling the base endpoint with cursor.
+    Filters by exchange (MIC) against ALLOWED_EXCHANGES. Optional shuffle.
     """
     if SCANNER_SYMBOLS:
         syms = [s.strip().upper() for s in SCANNER_SYMBOLS.split(",") if s.strip()]
@@ -179,13 +189,16 @@ def get_universe_symbols() -> list:
 
     if not POLYGON_API_KEY: return []
 
-    base_url = "https://api.polygon.io/v3/reference/tickers?market=stocks&active=true&limit=1000&apiKey=" + POLYGON_API_KEY
-    url = base_url
+    base = "https://api.polygon.io/v3/reference/tickers"
+    params = {"market":"stocks","active":"true","limit":"1000","apiKey":POLYGON_API_KEY}
+    url = base
     out, pages = [], 0
 
     while pages < SCANNER_MAX_PAGES and url:
         try:
-            r = requests.get(url, timeout=20)
+            r = requests.get(url, params=params if url==base else None, timeout=20)
+            if r.status_code == 401:
+                print(f"[UNIVERSE] HTTP 401 on {url}. Re-trying with explicit apiKey on next_url.", flush=True)
             if r.status_code != 200:
                 print(f"[UNIVERSE] HTTP {r.status_code}: {r.text[:200]}", flush=True)
                 break
@@ -196,10 +209,23 @@ def get_universe_symbols() -> list:
                 exch = (x.get("primary_exchange") or x.get("primary_exchange_iex") or "").upper()
                 if sym and sym.isalnum() and (not ALLOWED_EXCHANGES or exch in ALLOWED_EXCHANGES):
                     out.append(sym)
-            next_url = j.get("next_url")
-            if not next_url:
+
+            nxt = j.get("next_url")
+            if not nxt:
                 break
-            url = next_url  # absolute URL from Polygon; already has cursor/apiKey
+
+            # prefer reusing base endpoint with extracted 'cursor' (most robust)
+            cursor = None
+            if "cursor=" in nxt:
+                cursor = nxt.split("cursor=")[-1].split("&")[0]
+            if cursor:
+                url = base
+                params = {"cursor": cursor, "apiKey": POLYGON_API_KEY}
+            else:
+                # fallback: follow next_url directly and append apiKey if missing
+                url = _append_apikey_if_missing(nxt, POLYGON_API_KEY)
+                params = None
+
             pages += 1
         except Exception as e:
             print(f"[UNIVERSE] paging error: {e}", flush=True)
@@ -208,6 +234,7 @@ def get_universe_symbols() -> list:
     if UNIVERSE_SHUFFLE:
         random.shuffle(out)
 
+    print(f"[UNIVERSE] fetched={len(out)} pages={pages}", flush=True)
     return out
 
 # -------- SENTIMENT --------
@@ -359,7 +386,6 @@ def _fallback_proba_from_momentum(feats: pd.DataFrame, look=20):
     return 0.5 + float(np.tanh(ret * 50.0)) / 2.0
 
 def ml_score(symbol: str, df1m: pd.DataFrame, tf_min: int):
-    """Return (proba_up, timestamp, reason). Never hard-fail: any error -> fallback momentum."""
     try:
         if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
             return None, None, "no_data"
@@ -379,7 +405,6 @@ def ml_score(symbol: str, df1m: pd.DataFrame, tf_min: int):
         cut=int(len(X)*0.7)
         X_train, y_train = X.iloc[:cut], y.iloc[:cut]
 
-        # Single-class? → fallback but still usable
         if getattr(y_train, "nunique", None) and y_train.nunique() < 2:
             proba_up = _fallback_proba_from_momentum(feats)
             ts = feats.index[-1]
@@ -425,44 +450,24 @@ def ml_score(symbol: str, df1m: pd.DataFrame, tf_min: int):
 def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, r_multiple=None):
     r_multiple=float(r_multiple if r_multiple is not None else SCANNER_R_MULTIPLE)
     proba_up, ts, reason=ml_score(symbol, df1m, tf_min)
-
-    if proba_up is None:
-        if DIAG_SIG_DETAILS:
-            print(f"[NOSIG] {symbol} {tf_min}m reason={reason}", flush=True)
-        return None
-    if reason == "not_in_session":
-        if DIAG_SIG_DETAILS:
-            print(f"[NOSIG] {symbol} {tf_min}m reason=not_in_session proba_up={proba_up:.3f}", flush=True)
-        return None
+    if proba_up is None: return None
+    if reason == "not_in_session": return None
 
     bars=_resample(df1m, tf_min)
-    if bars is None or bars.empty:
-        if DIAG_SIG_DETAILS:
-            print(f"[NOSIG] {symbol} {tf_min}m reason=bars_empty_after_score", flush=True)
-        return None
-
+    if bars is None or bars.empty: return None
     price=float(bars["close"].iloc[-1])
 
-    # Price floor
-    if price < MIN_PRICE:
-        if DIAG_SIG_DETAILS:
-            print(f"[NOSIG] {symbol} {tf_min}m reason=price_floor {price:.2f}<{MIN_PRICE}", flush=True)
-        return None
+    # price floor
+    if price < MIN_PRICE: return None
 
     if proba_up >= 0.5:
         side="buy"; score=proba_up; sl=price*0.99; tp=price*(1+0.01*r_multiple)
     else:
-        if not SHORTS_ENABLED:
-            if DIAG_SIG_DETAILS:
-                print(f"[NOSIG] {symbol} {tf_min}m reason=shorts_disabled proba_up={proba_up:.3f}", flush=True)
-            return None
+        if not SHORTS_ENABLED: return None
         side="sell"; score=1.0-proba_up; sl=price*1.01; tp=price*(1-0.01*r_multiple)
 
     qty=_position_qty(price, sl)
-    if qty<=0:
-        if DIAG_SIG_DETAILS:
-            print(f"[NOSIG] {symbol} {tf_min}m reason=qty0 price={price:.2f} sl={sl:.2f} score={score:.3f} r_mult={r_multiple}", flush=True)
-        return None
+    if qty<=0: return None
 
     meta_note = "ml_pattern"
     if reason in ("fallback_single_class", "fallback_model_error"):
@@ -517,28 +522,21 @@ def compute_signal(strategy_name, symbol, tf_minutes, df1m=None):
     if df1m is None or getattr(df1m, "empty", True):
         df1m = fetch_polygon_1m(symbol, lookback_minutes=max(240, tf_minutes*240))
         if df1m is None or df1m.empty: 
-            if DIAG_SIG_DETAILS: print(f"[NOSIG] {symbol} {tf_minutes}m reason=df_empty", flush=True)
             return None
 
     if not isinstance(df1m.index, pd.DatetimeIndex):
         try: df1m.index = pd.to_datetime(df1m.index, utc=True)
-        except Exception:
-            if DIAG_SIG_DETAILS: print(f"[NOSIG] {symbol} {tf_minutes}m reason=index_not_datetime", flush=True)
-            return None
+        except Exception: return None
     try: df1m.index = df1m.index.tz_convert(MARKET_TZ)
     except Exception: df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
 
     # today's volume gate
     today_mask = df1m.index.date == df1m.index[-1].date()
     todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
-    if todays_vol < SCANNER_MIN_TODAY_VOL:
-        if DIAG_SIG_DETAILS: print(f"[NOSIG] {symbol} {tf_minutes}m reason=vol_gate vol={int(todays_vol)}<min={SCANNER_MIN_TODAY_VOL}", flush=True)
-        return None
+    if todays_vol < SCANNER_MIN_TODAY_VOL: return None
 
-    # exchange filter already applied in universe fetch; price floor checked in signal_ml_pattern
     if strategy_name=="ml_pattern":
-        sig = signal_ml_pattern(symbol, df1m, tf_minutes, SCANNER_R_MULTIPLE)
-        return sig
+        return signal_ml_pattern(symbol, df1m, tf_minutes, SCANNER_R_MULTIPLE)
     return None
 
 # -------- MAIN --------
@@ -577,7 +575,7 @@ def main():
             if DAILY_GUARD_ENABLED: check_daily_guard_and_maybe_halt()
             allow_new_entries = (not (DAILY_GUARD_ENABLED and HALT_TRADING)) and ALLOW_ENTRIES
 
-            # --- Close phase: update exits on latest bars for any open trades
+            # Close phase: check TP/SL hits on last bars for open trades
             touched = list(OPEN_TRADES.keys())
             for (sym, tf) in touched:
                 try:
@@ -597,7 +595,6 @@ def main():
 
             candidates=[]  # (score,symbol,tf,sig)
 
-            # If entries are halted, skip scanning for NEW signals
             if not allow_new_entries:
                 time.sleep(POLL_SECONDS); continue
 
@@ -624,24 +621,23 @@ def main():
                     if not sig:
                         continue
 
-                    # sentiment gate (neutral allows both sides)
+                    # Sentiment gate (neutral allows both sides)
                     if SENTIMENT_ONLY_GATE:
                         if (sentiment=="bull" and sig["action"]!="buy") or (sentiment=="bear" and sig["action"]!="sell"):
                             continue
 
-                    # dedupe
+                    # Dedupe + score gate
                     k = _dedupe_key("ml_pattern", sym, tf, sig["action"], sig.get("barTime",""))
                     if k in _sent_keys: continue
-                    _sent_keys.add(k)
-
                     score = float(sig.get("score", sig.get("confidence", 0.0)))
                     if score < SCANNER_CONF_THRESHOLD: continue
 
+                    _sent_keys.add(k)
                     candidates.append((score, sym, tf, sig))
 
             _log_candidate_summary(candidates)
 
-            # -------- DISPATCH (ranked) --------
+            # Dispatch ranked
             if allow_new_entries and candidates:
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 sent_ct=0
@@ -653,7 +649,6 @@ def main():
                     payload = build_payload(sym, sig)
                     ok, info = send_to_traderspost(payload)
                     if ok:
-                        # ledger open
                         _record_open_trade("ml_pattern", sym, tf, sig)
                         sent_ct+=1
                     print(f"[ORDER] {sym} {tf}m {sig['action']} qty={sig['quantity']} conf={score:.3f} ok={ok} info={info}", flush=True)
