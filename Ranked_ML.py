@@ -161,31 +161,42 @@ def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
         return pd.DataFrame()
 
 def get_universe_symbols() -> list:
-    # If user provided explicit list, trust it and filter later by price
+    """Universe: env override OR Polygon reference tickers (active US stocks), multi-page."""
     if SCANNER_SYMBOLS:
-        return [s.strip().upper() for s in SCANNER_SYMBOLS.split(",") if s.strip()]
+        syms = [s.strip().upper() for s in SCANNER_SYMBOLS.split(",") if s.strip()]
+        return [s for s in syms if s.isalnum()]
 
-    if not POLYGON_API_KEY: return []
-    out=[]; cursor=None; pages=0
-    while pages < SCANNER_MAX_PAGES:
-        params={"market":"stocks","active":"true","limit":"1000","apiKey":POLYGON_API_KEY}
-        if cursor: params["cursor"]=cursor
-        url="https://api.polygon.io/v3/reference/tickers"
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code != 200: break
-        j=r.json(); results=j.get("results", [])
-        for x in results:
-            t = x.get("ticker")
-            if not t: continue
-            exch = (x.get("primary_exchange") or x.get("primary_exchange_code") or x.get("listing_exchange") or "").upper()
-            if ALLOWED_EXCHANGES and exch and exch not in ALLOWED_EXCHANGES:
-                continue
-            out.append(t)
-        cursor = j.get("next_url", None)
-        if not cursor: break
-        pages+=1
-    # Fall back to alnum tickers only
-    return [s for s in out if s.isalnum()]
+    if not POLYGON_API_KEY:
+        return []
+
+    url = "https://api.polygon.io/v3/reference/tickers"
+    params = {"market": "stocks", "active": "true", "limit": "1000", "apiKey": POLYGON_API_KEY}
+    out, pages = [], 0
+
+    while pages < SCANNER_MAX_PAGES and url:
+        try:
+            r = requests.get(url, params=params if "apiKey" in params else None, timeout=20)
+            if r.status_code != 200:
+                break
+            j = r.json()
+            results = j.get("results", [])
+            out.extend([x["ticker"] for x in results if x.get("ticker")])
+            next_url = j.get("next_url")
+            if not next_url:
+                break
+            # Follow the absolute next_url directly (Polygon v3 style).
+            url = next_url
+            params = {}  # clear; next_url already carries the cursor & apiKey
+            pages += 1
+        except Exception:
+            break
+
+    # Hygiene + optional randomization to avoid alpha bias
+    out = [s for s in out if s.isalnum()]
+    if os.getenv("UNIVERSE_SHUFFLE", "1").lower() in ("1", "true", "yes"):
+        import random
+        random.shuffle(out)
+    return out
 
 # -------- SENTIMENT --------
 def compute_sentiment():
