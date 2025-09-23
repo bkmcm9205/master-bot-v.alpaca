@@ -1,6 +1,6 @@
-# Ranked_ML.py — ML scanner with confidence ranking, two-sided trades, guards, and diagnostics
-# v2.1: Robust against any model_error. On ANY sklearn/data error we log a one-liner and
-#       FALL BACK to a momentum probability so the scan still produces candidates.
+# Ranked_ML.py — ML scanner with confidence ranking, two-sided trades, guards, diagnostics, and exchange/price filters
+# v2.2 (final): Adds MIN_PRICE + ALLOWED_EXCHANGES gates (both universe- and loop-level),
+#               caches symbol metadata from Polygon reference, and price-gates each symbol.
 
 import os, time, json, math, hashlib, requests, traceback
 from collections import defaultdict, deque
@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-APP_TAG = "Ranked_ML v2.1 (unconditional fallback on errors)"
+APP_TAG = "Ranked_ML v2.2 (final: exch+price filters)"
 print(f"[BOOT] {APP_TAG}", flush=True)
 
 # -------- ENV HELPERS --------
@@ -51,6 +51,16 @@ BYPASS_SESSION           = _env_bool("BYPASS_SESSION","0")
 # Sentiment
 SENTIMENT_ONLY_GATE      = _env_bool("SENTIMENT_ONLY_GATE","1")
 
+# ----------------- SYMBOL FILTERS (NEW) -----------------
+# You can also set these via env if you prefer:
+# MIN_PRICE, ALLOWED_EXCHANGES_CSV ("NYSE,NASDAQ" by default)
+MIN_PRICE = float(os.getenv("MIN_PRICE", "2.0"))   # skip stocks trading below this price
+ALLOWED_EXCHANGES = {e.strip().upper() for e in os.getenv("ALLOWED_EXCHANGES_CSV", "NYSE,NASDAQ").split(",") if e.strip()}
+
+# We accept both "NYSE"/"NASDAQ" and their MICs like "XNYS"/"XNAS"
+_ALLOWED_EX_MIC = {"NYSE","NASDAQ","XNYS","XNAS","NASD"}  # NASD sometimes appears
+ALLOWED_EX_ALL = ALLOWED_EXCHANGES.union(_ALLOWED_EX_MIC)
+
 # Two-sided
 SHORTS_ENABLED           = _env_bool("SHORTS_ENABLED","1")
 
@@ -84,6 +94,7 @@ print("[CONFIG] "
       f"SHORTS_ENABLED={SHORTS_ENABLED} SENTIMENT_ONLY_GATE={SENTIMENT_ONLY_GATE} "
       f"CONF_THR={SCANNER_CONF_THRESHOLD} R_MULT={SCANNER_R_MULTIPLE} "
       f"MIN_TODAY_VOL={SCANNER_MIN_TODAY_VOL} TFs={TF_MIN_LIST} "
+      f"MIN_PRICE={MIN_PRICE} ALLOWED_EXCHANGES={sorted(list(ALLOWED_EX_ALL))} "
       f"INTROSPECT={INTROSPECT} DIAG_ON={DIAG_ON} DIAG_SIG_DETAILS={DIAG_SIG_DETAILS} DIAG_MODEL_TRACE={DIAG_MODEL_TRACE} "
       f"DIAG_SYMBOLS={DIAG_SYMBOLS} LOG_REJ_N={LOG_REJECTIONS_N}",
       flush=True)
@@ -98,6 +109,9 @@ _order_times  = deque()
 
 DAY_STAMP     = datetime.now().astimezone().strftime("%Y-%m-%d")
 HALT_TRADING  = False
+
+# Polygon symbol metadata cache (ticker -> {"primary_exchange": "...", ...})
+SYMBOL_INFO = {}
 
 # -------- UTILS --------
 def _now_et(): return datetime.now(timezone.utc).astimezone(ZoneInfo(MARKET_TZ))
@@ -127,6 +141,14 @@ def _position_qty(entry_price: float, stop_price: float) -> int:
     qty = math.floor(max(min(qty_risk, qty_notional), 0) / max(1, ROUND_LOT)) * max(1, ROUND_LOT)
     return int(max(qty, MIN_QTY if qty > 0 else 0))
 
+def _is_allowed_exchange(ex: str) -> bool:
+    if not ex: return False
+    exu = ex.strip().upper()
+    # Normalize some common forms
+    if exu.startswith("NYSE"): exu = "NYSE"
+    if exu.startswith("NAS"): exu = "NASDAQ"
+    return exu in ALLOWED_EX_ALL
+
 # -------- POLYGON --------
 def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
     if not POLYGON_API_KEY: return pd.DataFrame()
@@ -141,7 +163,6 @@ def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
         rows = js.get("results", [])
         if not rows: return pd.DataFrame()
         df = pd.DataFrame(rows)
-        # Ensure required columns exist
         for col in ("o","h","l","c","v","t"):
             if col not in df.columns: return pd.DataFrame()
         df["ts"] = pd.to_datetime(df["t"], unit="ms", utc=True)
@@ -151,9 +172,40 @@ def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
+def get_symbol_info(symbol: str) -> dict:
+    """Pull reference metadata for a ticker; cached. We only need primary_exchange here."""
+    sym = symbol.upper()
+    if sym in SYMBOL_INFO: return SYMBOL_INFO[sym]
+    if not POLYGON_API_KEY: 
+        SYMBOL_INFO[sym] = {}
+        return SYMBOL_INFO[sym]
+    url = f"https://api.polygon.io/v3/reference/tickers/{sym}?apiKey={POLYGON_API_KEY}"
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code != 200:
+            SYMBOL_INFO[sym] = {}
+            return SYMBOL_INFO[sym]
+        j = r.json().get("results", {}) or {}
+        SYMBOL_INFO[sym] = {
+            "primary_exchange": j.get("primary_exchange") or j.get("primary_exchange_name") or j.get("listing_exchange")
+        }
+        return SYMBOL_INFO[sym]
+    except Exception:
+        SYMBOL_INFO[sym] = {}
+        return SYMBOL_INFO[sym]
+
 def get_universe_symbols() -> list:
+    # If explicit symbols provided, still apply exchange filter via metadata (best-effort).
     if SCANNER_SYMBOLS:
-        return [s.strip().upper() for s in SCANNER_SYMBOLS.split(",") if s.strip()]
+        raw = [s.strip().upper() for s in SCANNER_SYMBOLS.split(",") if s.strip()]
+        out = []
+        for s in raw:
+            info = get_symbol_info(s)
+            ex = (info or {}).get("primary_exchange", "")
+            if not ex or _is_allowed_exchange(ex):
+                out.append(s)
+        return out
+
     if not POLYGON_API_KEY: return []
     out=[]; page_token=None; pages=0
     while pages < SCANNER_MAX_PAGES:
@@ -163,10 +215,19 @@ def get_universe_symbols() -> list:
         r = requests.get(url, params=params, timeout=20)
         if r.status_code != 200: break
         j=r.json(); results=j.get("results", [])
-        out.extend([x["ticker"] for x in results if x.get("ticker")])
+        for x in results:
+            t = x.get("ticker")
+            ex = x.get("primary_exchange") or x.get("primary_exchange_name") or x.get("listing_exchange") or ""
+            if not t: 
+                continue
+            if ex and not _is_allowed_exchange(ex):
+                continue
+            SYMBOL_INFO[t] = {"primary_exchange": ex}
+            out.append(t)
         page_token=j.get("next_url", None)
         if not page_token: break
         pages+=1
+    # Keep to alnum tickers only (as before)
     return [s for s in out if s.isalnum()]
 
 # -------- SENTIMENT --------
@@ -358,11 +419,9 @@ def ml_score(symbol: str, df1m: pd.DataFrame, tf_min: int):
         return proba_up, ts, None
 
     except Exception as e:
-        # Unconditional fallback on any unexpected modeling/data error
         try:
             feats = feats if 'feats' in locals() else _ml_features_from_resampled(bars if 'bars' in locals() else pd.DataFrame())
             if feats is None or feats.empty:
-                # no features at all — hard fail
                 if DIAG_SIG_DETAILS:
                     print(f"[NOSIG] {symbol} {tf_min}m reason=model_error msg={str(e)[:120]}", flush=True)
                 if DIAG_MODEL_TRACE:
@@ -489,6 +548,7 @@ def compute_signal(strategy_name, symbol, tf_minutes, df1m=None):
         if DIAG_SIG_DETAILS: print(f"[NOSIG] {symbol} {tf_minutes}m reason=vol_gate vol={int(todays_vol)}<min={SCANNER_MIN_TODAY_VOL}", flush=True)
         return None
 
+    # NOTE: price filter is handled in the main loop (after last close computed)
     if strategy_name=="ml_pattern":
         sig = signal_ml_pattern(symbol, df1m, tf_minutes, SCANNER_R_MULTIPLE)
         return sig
@@ -536,29 +596,42 @@ def main():
                 flatten_all_open_positions()
 
             candidates=[]  # (score,symbol,tf,sig)
-            gate_no_sig=0
 
             for sym in symbols:
+                # Exchange filter (best-effort; may have been pre-filtered already)
+                ex = (SYMBOL_INFO.get(sym) or {}).get("primary_exchange", "")
+                if ex and not _is_allowed_exchange(ex):
+                    if DIAG_SIG_DETAILS: print(f"[REJECT] {sym} * exchange_gate ex='{ex}'", flush=True)
+                    continue
+
                 df1m=fetch_polygon_1m(sym, lookback_minutes=max(240, max(TF_MIN_LIST)*240))
                 if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
                     continue
                 try: df1m.index=df1m.index.tz_convert(MARKET_TZ)
                 except Exception: df1m.index=df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
 
+                # Volume gate (today)
                 today_mask = df1m.index.date == df1m.index[-1].date()
                 todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
                 if todays_vol < SCANNER_MIN_TODAY_VOL:
+                    if DIAG_SIG_DETAILS: print(f"[REJECT] {sym} * vol_gate {int(todays_vol)}<{SCANNER_MIN_TODAY_VOL}", flush=True)
+                    continue
+
+                # Price gate (NEW)
+                last_price = float(df1m["close"].iloc[-1])
+                if last_price < MIN_PRICE:
+                    if DIAG_SIG_DETAILS: print(f"[REJECT] {sym} * price_gate {last_price:.2f} < {MIN_PRICE:.2f}", flush=True)
                     continue
 
                 for tf in TF_MIN_LIST:
                     sig = compute_signal("ml_pattern", sym, tf, df1m=df1m)
                     if not sig:
-                        gate_no_sig+=1
                         continue
 
                     # sentiment gate
                     if SENTIMENT_ONLY_GATE:
                         if (sentiment=="bull" and sig["action"]!="buy") or (sentiment=="bear" and sig["action"]!="sell"):
+                            if DIAG_SIG_DETAILS: print(f"[REJECT] {sym} {tf}m * sentiment_block", flush=True)
                             continue
 
                     # dedupe
@@ -569,6 +642,7 @@ def main():
 
                     score = float(sig.get("score", sig.get("confidence", 0.0)))
                     if score < SCANNER_CONF_THRESHOLD:
+                        if DIAG_SIG_DETAILS: print(f"[REJECT] {sym} {tf}m * conf_gate {score:.3f} < {SCANNER_CONF_THRESHOLD:.3f}", flush=True)
                         continue
 
                     candidates.append((score, sym, tf, sig))
