@@ -1,4 +1,4 @@
-# app_scanner.py — dynamic market scanner -> TradersPost (paper/live)
+# app_scanner.py — dynamic market scanner -> TradersPost (paper/live) + DAILY_GUARD + KILL_SWITCH
 # Requires: pandas, numpy, requests, pandas_ta, scikit-learn
 
 import os, time, json, math, requests
@@ -13,6 +13,11 @@ from zoneinfo import ZoneInfo
 # ==============================
 TP_URL = os.getenv("TP_WEBHOOK_URL", "")
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
+
+# Optional TradersPost REST (for equity & flatten)
+TP_BASE_URL = os.getenv("TP_BASE_URL", "").rstrip("/")
+TP_REST_TOKEN = os.getenv("TP_REST_TOKEN", "")
+TP_ACCOUNT_ID = os.getenv("TP_ACCOUNT_ID", "")
 
 # Poll cadence & diagnostics
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
@@ -30,7 +35,7 @@ SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "150"))        # how many tic
 # Liquidity filter (daily volume)
 SCANNER_MIN_AVG_VOL = int(os.getenv("SCANNER_MIN_AVG_VOL", "1000000"))  # default 1,000,000 shares
 
-RUN_ID = datetime.now().astimezone().strftime("%Y-%m-%d")
+RUN_ID = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
 COUNTS = defaultdict(int)        # global counters
 COMBO_COUNTS = defaultdict(int)  # per symbol|tf
 _sent = set()                    # dedupe key set
@@ -46,6 +51,25 @@ ROUND_LOT   = int(os.getenv("ROUND_LOT","1"))
 SCANNER_MARKET_HOURS_ONLY = os.getenv("SCANNER_MARKET_HOURS_ONLY","1").lower() in ("1","true","yes")
 ALLOW_PREMARKET  = os.getenv("ALLOW_PREMARKET","0").lower() in ("1","true","yes")
 ALLOW_AFTERHOURS = os.getenv("ALLOW_AFTERHOURS","0").lower() in ("1","true","yes")
+
+# ---- New: Guards & Kill Switch ----
+DAILY_GUARD_ENABLED = os.getenv("DAILY_GUARD_ENABLED", "0").lower() in ("1","true","yes")
+DAILY_GUARD_UP_PCT = float(os.getenv("DAILY_GUARD_UP_PCT", "0.25"))      # +25% default
+DAILY_GUARD_DOWN_PCT = float(os.getenv("DAILY_GUARD_DOWN_PCT", "0.25"))  # -25% default
+KILL_SWITCH = os.getenv("KILL_SWITCH", "OFF").lower() in ("1","true","yes","on")
+KILL_SWITCH_MODE = os.getenv("KILL_SWITCH_MODE", "halt").lower()         # 'halt' or 'flatten'
+
+RENDER_GIT_COMMIT = os.getenv("RENDER_GIT_COMMIT", "unknown")[:12]
+RENDER_GIT_BRANCH = os.getenv("RENDER_GIT_BRANCH", os.getenv("BRANCH", "unknown"))
+
+# Session equity baseline (prefer explicit, else pull once from TP, else fall back to EQUITY_USD)
+SESSION_START_EQUITY_ENV = os.getenv("SESSION_START_EQUITY", "").strip()
+SESSION_START_EQUITY = float(SESSION_START_EQUITY_ENV) if SESSION_START_EQUITY_ENV else None
+
+# Halt state (set when guard trips or kill switch)
+HALTED = False
+HALTED_REASON = ""
+HALTED_AT = None
 
 def _market_session_now():
     now_et = datetime.now(ZoneInfo("America/New_York"))
@@ -80,6 +104,127 @@ def _position_qty(entry_price: float, stop_price: float,
     qty_notional = (equity * max_pos_pct) / max(1e-9, entry_price)
     qty = math.floor(max(min(qty_risk, qty_notional), 0) / max(1, round_lot)) * max(1, round_lot)
     return int(max(qty, min_qty if qty > 0 else 0))
+
+# ==============================
+# TradersPost REST helpers (optional)
+# ==============================
+def _tp_headers():
+    return {"Authorization": f"Bearer {TP_REST_TOKEN}", "Content-Type": "application/json"}
+
+def _tp_rest_ok():
+    return bool(TP_BASE_URL and TP_REST_TOKEN and TP_ACCOUNT_ID)
+
+def get_equity_from_tp(default_equity: float) -> float:
+    """
+    Best-effort: fetch account equity from TradersPost REST.
+    If not configured or errors, fall back to provided default.
+    """
+    if not _tp_rest_ok():
+        return default_equity
+    try:
+        # NOTE: Endpoint path may vary by TP account type; adjust if needed.
+        # Common pattern: GET /api/v2/accounts/{accountId}
+        url = f"{TP_BASE_URL}/api/v2/accounts/{TP_ACCOUNT_ID}"
+        r = requests.get(url, headers=_tp_headers(), timeout=12)
+        if r.status_code >= 300:
+            if SCANNER_DEBUG:
+                print(f"[TP EQUITY] HTTP {r.status_code}: {r.text[:300]}", flush=True)
+            return default_equity
+        js = r.json()
+        # heuristics: look for 'equity' or 'cash' fields
+        eq = js.get("equity") or js.get("cash") or js.get("netLiquidation") or default_equity
+        return float(eq)
+    except Exception as e:
+        if SCANNER_DEBUG:
+            import traceback
+            print("[TP EQUITY EXC]", e, traceback.format_exc(), flush=True)
+        return default_equity
+
+def list_open_positions_tp():
+    if not _tp_rest_ok():
+        return []
+    try:
+        # Common pattern: GET /api/v2/accounts/{id}/positions
+        url = f"{TP_BASE_URL}/api/v2/accounts/{TP_ACCOUNT_ID}/positions"
+        r = requests.get(url, headers=_tp_headers(), timeout=15)
+        if r.status_code >= 300:
+            if SCANNER_DEBUG:
+                print(f"[TP POS] HTTP {r.status_code}: {r.text[:300]}", flush=True)
+            return []
+        js = r.json()
+        if isinstance(js, dict) and "data" in js:
+            return js["data"]
+        if isinstance(js, list):
+            return js
+        return []
+    except Exception as e:
+        if SCANNER_DEBUG:
+            import traceback
+            print("[TP POS EXC]", e, traceback.format_exc(), flush=True)
+        return []
+
+def close_position_tp(symbol: str, qty: float | int | None = None):
+    """
+    Best-effort close a single symbol using REST.
+    Fallback: try webhook 'sell' with 'all' quantity if REST not configured.
+    """
+    if _tp_rest_ok():
+        try:
+            # Common pattern: POST /api/v2/accounts/{id}/orders with side='sell' and quantity
+            url = f"{TP_BASE_URL}/api/v2/accounts/{TP_ACCOUNT_ID}/orders"
+            payload = {
+                "symbol": symbol,
+                "side": "sell",
+                "type": "market",
+                # quantity: if None, try 'close' semantics some APIs support via 'closePosition': True
+            }
+            if qty and qty > 0:
+                payload["quantity"] = qty
+            else:
+                payload["closePosition"] = True  # if supported
+            r = requests.post(url, headers=_tp_headers(), json=payload, timeout=15)
+            ok = 200 <= r.status_code < 300
+            if not ok and SCANNER_DEBUG:
+                print(f"[TP CLOSE {symbol}] HTTP {r.status_code}: {r.text[:300]}", flush=True)
+            return ok
+        except Exception as e:
+            if SCANNER_DEBUG:
+                import traceback
+                print(f"[TP CLOSE EXC {symbol}]", e, traceback.format_exc(), flush=True)
+            # fall through to webhook attempt
+
+    # Webhook fallback (not all setups support this for closing)
+    if TP_URL and not DRY_RUN:
+        payload = {
+            "ticker": symbol,
+            "action": "sell",
+            "orderType": "market",
+            "quantity": "all",  # some bridges accept 'all'; if not, REST is required
+            "meta": {"environment": "paper" if PAPER_MODE else "live", "runId": RUN_ID, "intent": "flatten"}
+        }
+        try:
+            r = requests.post(TP_URL, json=payload, timeout=12)
+            return 200 <= r.status_code < 300
+        except Exception:
+            return False
+    return False
+
+def flatten_all_positions():
+    pos = list_open_positions_tp()
+    if not pos:
+        print("[FLATTEN] No positions found or REST not configured; nothing to do.", flush=True)
+        return
+    print(f"[FLATTEN] Attempting to close {len(pos)} positions…", flush=True)
+    closed = 0
+    for p in pos:
+        sym = p.get("symbol") or p.get("ticker") or ""
+        qty = p.get("quantity") or p.get("qty") or None
+        if not sym:
+            continue
+        ok = close_position_tp(sym, qty)
+        closed += 1 if ok else 0
+        time.sleep(0.2)  # small pacing
+    print(f"[FLATTEN] Done. Requested close on {closed}/{len(pos)} positions.", flush=True)
 
 # ==============================
 # Data fetchers (Polygon)
@@ -253,7 +398,6 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
     if (last["prediction"] == 1) and (last["confidence"] >= conf_threshold):
         if min_volume_mult > 0.0:
             try:
-                # guard if rolling mean NaN very early
                 i = len(bars_live) - 1
                 if not (last["volume"] > min_volume_mult * avg_volume.iloc[i]):
                     return None
@@ -263,7 +407,7 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
         entry = float(last["close"])
         sl = entry * 0.99                            # 1% stop
         tp = entry * (1.0 + 0.01 * r_multiple)       # r_multiple * 1% take profit
-        qty = _position_qty(entry, sl)
+        qty = _position_qty(entry, sl, equity=EQUITY_USD)
 
         if qty <= 0:
             return None
@@ -282,7 +426,7 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
     return None
 
 # ==============================
-# TradersPost helpers
+# TradersPost helpers (webhook)
 # ==============================
 def _dedupe_key(symbol: str, tf: int, action: str, bar_time: str) -> str:
     raw = f"{symbol}|{tf}|{action}|{bar_time}"
@@ -336,6 +480,55 @@ def send_to_traderspost(payload: dict):
         return False, f"exception: {e}"
 
 # ==============================
+# Guards & Kill switch enforcement
+# ==============================
+def ensure_session_start_equity() -> float:
+    global SESSION_START_EQUITY
+    if SESSION_START_EQUITY is not None:
+        return SESSION_START_EQUITY
+    # try TP; else EQUITY_USD
+    eq = get_equity_from_tp(EQUITY_USD)
+    SESSION_START_EQUITY = float(eq if eq else EQUITY_USD)
+    print(f"[SESSION] start_equity={SESSION_START_EQUITY:.2f}", flush=True)
+    return SESSION_START_EQUITY
+
+def check_kill_switch() -> bool:
+    global HALTED, HALTED_REASON, HALTED_AT
+    if KILL_SWITCH and not HALTED:
+        HALTED = True
+        HALTED_REASON = "KILL_SWITCH"
+        HALTED_AT = datetime.now().isoformat()
+        print(f"[GUARD] Kill switch is ON (mode={KILL_SWITCH_MODE}). Trading halted.", flush=True)
+        if KILL_SWITCH_MODE == "flatten":
+            flatten_all_positions()
+        return True
+    return HALTED
+
+def check_daily_guard() -> bool:
+    """Return True if trading should be halted by daily guard (and set HALTED)."""
+    global HALTED, HALTED_REASON, HALTED_AT
+    if not DAILY_GUARD_ENABLED or HALTED:
+        return HALTED
+    start_eq = ensure_session_start_equity()
+    eq_now = get_equity_from_tp(start_eq)
+    change = (eq_now - start_eq) / max(1e-9, start_eq)
+    if change >= DAILY_GUARD_UP_PCT:
+        HALTED = True
+        HALTED_REASON = f"DAILY_GUARD_UP ({change:.2%} >= {DAILY_GUARD_UP_PCT:.0%})"
+        HALTED_AT = datetime.now().isoformat()
+        print(f"[GUARD] Profit target reached: start={start_eq:.2f} now={eq_now:.2f} change={change:.2%}.", flush=True)
+        if KILL_SWITCH_MODE == "flatten":
+            flatten_all_positions()
+    elif change <= -abs(DAILY_GUARD_DOWN_PCT):
+        HALTED = True
+        HALTED_REASON = f"DAILY_GUARD_DOWN ({change:.2%} <= -{DAILY_GUARD_DOWN_PCT:.0%})"
+        HALTED_AT = datetime.now().isoformat()
+        print(f"[GUARD] Drawdown limit reached: start={start_eq:.2f} now={eq_now:.2f} change={change:.2%}.", flush=True)
+        if KILL_SWITCH_MODE == "flatten":
+            flatten_all_positions()
+    return HALTED
+
+# ==============================
 # Scanner loop
 # ==============================
 def build_universe():
@@ -354,6 +547,11 @@ def build_universe():
 
 def scan_once(universe: list[str]):
     global _round_robin
+
+    if HALTED:
+        if SCANNER_DEBUG:
+            print(f"[SCAN] Skipping — halted ({HALTED_REASON}).", flush=True)
+        return
 
     if SCANNER_MARKET_HOURS_ONLY and not _market_session_now():
         if SCANNER_DEBUG:
@@ -374,6 +572,10 @@ def scan_once(universe: list[str]):
         print(f"[SCAN] symbols {start}:{end} / {N}  (batch={len(batch)})", flush=True)
 
     for sym in batch:
+        if HALTED:
+            if SCANNER_DEBUG:
+                print(f"[SCAN] Early stop — halted ({HALTED_REASON}).", flush=True)
+            return
         # pull once and reuse for all TFs to save API calls
         try:
             df1m = fetch_polygon_1m(sym, lookback_minutes=2400)  # ~ 40 hours
@@ -396,7 +598,7 @@ def scan_once(universe: list[str]):
                     conf_threshold=0.8,
                     n_estimators=100,
                     r_multiple=3.0,
-                    min_volume_mult=0.0  # you said you only care that it's tradable; set >0 to enforce volume spike
+                    min_volume_mult=0.0  # set >0 to enforce volume spike
                 )
                 if not sig:
                     continue
@@ -407,7 +609,12 @@ def scan_once(universe: list[str]):
                 _sent.add(k)
 
                 if SCANNER_MARKET_HOURS_ONLY and not _market_session_now():
-                    continue  # if the session flipped while scanning, skip sends
+                    continue  # if session flipped mid-scan, skip sends
+
+                if HALTED:
+                    if SCANNER_DEBUG:
+                        print(f"[ORDER] Suppressed — halted ({HALTED_REASON}).", flush=True)
+                    return
 
                 payload = build_payload(sym, sig)
                 ok, info = send_to_traderspost(payload)
@@ -426,7 +633,12 @@ def scan_once(universe: list[str]):
                 continue
 
 def main():
-    print("Scanner starting…", flush=True)
+    # ---- Boot banner (tiny hardening) ----
+    start_cmd = "python app.py"
+    print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD={start_cmd}", flush=True)
+    print(f"[BOOT] PAPER_MODE={'paper' if PAPER_MODE else 'live'} POLL_SECONDS={POLL_SECONDS} TFs={TF_MIN_LIST}", flush=True)
+    print(f"[BOOT] DAILY_GUARD_ENABLED={int(DAILY_GUARD_ENABLED)} UP={DAILY_GUARD_UP_PCT:.0%} DOWN={DAILY_GUARD_DOWN_PCT:.0%} KILL_SWITCH={'ON' if KILL_SWITCH else 'OFF'} MODE={KILL_SWITCH_MODE}", flush=True)
+
     if not POLYGON_API_KEY:
         print("[FATAL] POLYGON_API_KEY missing.", flush=True)
         return
@@ -434,13 +646,25 @@ def main():
         print("[FATAL] TP_WEBHOOK_URL missing (or set DRY_RUN=1).", flush=True)
         return
 
+    # initialize session baseline before trading (so logs show it)
+    ensure_session_start_equity()
+
     universe = build_universe()
     print(f"[READY] Universe size: {len(universe)}  TFs: {TF_MIN_LIST}  Batch: {SCAN_BATCH_SIZE}", flush=True)
 
     while True:
         loop_start = time.time()
         try:
-            scan_once(universe)
+            # Enforce kill switch & guard every loop
+            if check_kill_switch():
+                # If halted, we still sleep & loop to print minimal heartbeat
+                pass
+            elif check_daily_guard():
+                pass
+
+            # Only scan if not halted
+            if not HALTED:
+                scan_once(universe)
         except Exception as e:
             import traceback
             print("[LOOP ERROR]", e, traceback.format_exc(), flush=True)
