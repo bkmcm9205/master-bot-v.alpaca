@@ -1,6 +1,9 @@
-# Ranked_ML.py — ML scanner with confidence ranking, two-sided trades, guards, diagnostics, and exchange/price filters
-# v2.2 (final): Adds MIN_PRICE + ALLOWED_EXCHANGES gates (both universe- and loop-level),
-#               caches symbol metadata from Polygon reference, and price-gates each symbol.
+# Ranked_ML.py — ML scanner with confidence ranking, two-sided trades, guards, and diagnostics
+# v2.2.1 (final): 
+# - FIX: track open trades and flatten at EOD (16:00–16:10 ET)
+# - Fallback flattener if local ledger missing (mirrors what we sent today)
+# - Exchange + min-price filters (applied via Polygon ref data + last bar price)
+# - Neutral sentiment now allows BOTH long & short (SENTIMENT_ONLY_GATE only blocks in bull/bear)
 
 import os, time, json, math, hashlib, requests, traceback
 from collections import defaultdict, deque
@@ -9,7 +12,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-APP_TAG = "Ranked_ML v2.2 (final: exch+price filters)"
+APP_TAG = "Ranked_ML v2.2.1 (EOD fix + exch/price filters)"
 print(f"[BOOT] {APP_TAG}", flush=True)
 
 # -------- ENV HELPERS --------
@@ -49,17 +52,12 @@ ALLOW_AFTERHOURS         = _env_bool("ALLOW_AFTERHOURS","0")
 BYPASS_SESSION           = _env_bool("BYPASS_SESSION","0")
 
 # Sentiment
-SENTIMENT_ONLY_GATE      = _env_bool("SENTIMENT_ONLY_GATE","1")
+SENTIMENT_ONLY_GATE      = _env_bool("SENTIMENT_ONLY_GATE","1")  # blocks direction only in bull/bear; neutral passes both
 
-# ----------------- SYMBOL FILTERS (NEW) -----------------
-# You can also set these via env if you prefer:
-# MIN_PRICE, ALLOWED_EXCHANGES_CSV ("NYSE,NASDAQ" by default)
-MIN_PRICE = float(os.getenv("MIN_PRICE", "2.0"))   # skip stocks trading below this price
-ALLOWED_EXCHANGES = {e.strip().upper() for e in os.getenv("ALLOWED_EXCHANGES_CSV", "NYSE,NASDAQ").split(",") if e.strip()}
-
-# We accept both "NYSE"/"NASDAQ" and their MICs like "XNYS"/"XNAS"
-_ALLOWED_EX_MIC = {"NYSE","NASDAQ","XNYS","XNAS","NASD"}  # NASD sometimes appears
-ALLOWED_EX_ALL = ALLOWED_EXCHANGES.union(_ALLOWED_EX_MIC)
+# ----------------- SYMBOL FILTERS -----------------
+MIN_PRICE = float(os.getenv("MIN_PRICE", "5.0"))   # skip stocks trading below this price
+ALLOWED_EXCHANGES = set([s.strip().upper() for s in os.getenv(
+    "ALLOWED_EXCHANGES", "NASD,NASDAQ,NYSE,XNAS,XNYS").split(",") if s.strip()])
 
 # Two-sided
 SHORTS_ENABLED           = _env_bool("SHORTS_ENABLED","1")
@@ -85,16 +83,16 @@ INTROSPECT_TOP_K   = int(os.getenv("INTROSPECT_TOP_K","10"))
 LOG_REJECTIONS_N   = int(os.getenv("LOG_REJECTIONS_N","0"))  # 0=off
 DIAG_ON            = _env_bool("DIAG_ON","0")
 DIAG_SYMBOLS       = [s.strip().upper() for s in os.getenv("DIAG_SYMBOLS","SPY,QQQ,AAPL,NVDA").split(",") if s.strip()]
-DIAG_SIG_DETAILS   = _env_bool("DIAG_SIG_DETAILS","1")       # explain every None signal
-DIAG_MODEL_TRACE   = _env_bool("DIAG_MODEL_TRACE","0")       # full trace on model errors
+DIAG_SIG_DETAILS   = _env_bool("DIAG_SIG_DETAILS","0")
+DIAG_MODEL_TRACE   = _env_bool("DIAG_MODEL_TRACE","0")
 
 print("[CONFIG] "
       f"ALLOW_ENTRIES={ALLOW_ENTRIES} DRY_RUN={DRY_RUN} BYPASS_SESSION={BYPASS_SESSION} "
       f"ALLOW_PREMARKET={ALLOW_PREMARKET} ALLOW_AFTERHOURS={ALLOW_AFTERHOURS} "
       f"SHORTS_ENABLED={SHORTS_ENABLED} SENTIMENT_ONLY_GATE={SENTIMENT_ONLY_GATE} "
       f"CONF_THR={SCANNER_CONF_THRESHOLD} R_MULT={SCANNER_R_MULTIPLE} "
-      f"MIN_TODAY_VOL={SCANNER_MIN_TODAY_VOL} TFs={TF_MIN_LIST} "
-      f"MIN_PRICE={MIN_PRICE} ALLOWED_EXCHANGES={sorted(list(ALLOWED_EX_ALL))} "
+      f"MIN_TODAY_VOL={SCANNER_MIN_TODAY_VOL} TFs={TF_MIN_LIST} MIN_PRICE={MIN_PRICE} "
+      f"ALLOWED_EXCHANGES={sorted(ALLOWED_EXCHANGES)} "
       f"INTROSPECT={INTROSPECT} DIAG_ON={DIAG_ON} DIAG_SIG_DETAILS={DIAG_SIG_DETAILS} DIAG_MODEL_TRACE={DIAG_MODEL_TRACE} "
       f"DIAG_SYMBOLS={DIAG_SYMBOLS} LOG_REJ_N={LOG_REJECTIONS_N}",
       flush=True)
@@ -103,15 +101,13 @@ print("[CONFIG] "
 COUNTS        = defaultdict(int)
 COMBO_COUNTS  = defaultdict(int)
 PERF          = {}
-OPEN_TRADES   = defaultdict(list)
+OPEN_TRADES   = defaultdict(list)  # tracked live positions (local)
 _sent_keys    = set()
 _order_times  = deque()
+SENT_TODAY    = []                 # fallback record of what we sent (for EOD flatten if ledger empty)
 
 DAY_STAMP     = datetime.now().astimezone().strftime("%Y-%m-%d")
 HALT_TRADING  = False
-
-# Polygon symbol metadata cache (ticker -> {"primary_exchange": "...", ...})
-SYMBOL_INFO = {}
 
 # -------- UTILS --------
 def _now_et(): return datetime.now(timezone.utc).astimezone(ZoneInfo(MARKET_TZ))
@@ -141,14 +137,6 @@ def _position_qty(entry_price: float, stop_price: float) -> int:
     qty = math.floor(max(min(qty_risk, qty_notional), 0) / max(1, ROUND_LOT)) * max(1, ROUND_LOT)
     return int(max(qty, MIN_QTY if qty > 0 else 0))
 
-def _is_allowed_exchange(ex: str) -> bool:
-    if not ex: return False
-    exu = ex.strip().upper()
-    # Normalize some common forms
-    if exu.startswith("NYSE"): exu = "NYSE"
-    if exu.startswith("NAS"): exu = "NASDAQ"
-    return exu in ALLOWED_EX_ALL
-
 # -------- POLYGON --------
 def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
     if not POLYGON_API_KEY: return pd.DataFrame()
@@ -172,62 +160,31 @@ def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-def get_symbol_info(symbol: str) -> dict:
-    """Pull reference metadata for a ticker; cached. We only need primary_exchange here."""
-    sym = symbol.upper()
-    if sym in SYMBOL_INFO: return SYMBOL_INFO[sym]
-    if not POLYGON_API_KEY: 
-        SYMBOL_INFO[sym] = {}
-        return SYMBOL_INFO[sym]
-    url = f"https://api.polygon.io/v3/reference/tickers/{sym}?apiKey={POLYGON_API_KEY}"
-    try:
-        r = requests.get(url, timeout=10)
-        if r.status_code != 200:
-            SYMBOL_INFO[sym] = {}
-            return SYMBOL_INFO[sym]
-        j = r.json().get("results", {}) or {}
-        SYMBOL_INFO[sym] = {
-            "primary_exchange": j.get("primary_exchange") or j.get("primary_exchange_name") or j.get("listing_exchange")
-        }
-        return SYMBOL_INFO[sym]
-    except Exception:
-        SYMBOL_INFO[sym] = {}
-        return SYMBOL_INFO[sym]
-
 def get_universe_symbols() -> list:
-    # If explicit symbols provided, still apply exchange filter via metadata (best-effort).
+    # If user provided explicit list, trust it and filter later by price
     if SCANNER_SYMBOLS:
-        raw = [s.strip().upper() for s in SCANNER_SYMBOLS.split(",") if s.strip()]
-        out = []
-        for s in raw:
-            info = get_symbol_info(s)
-            ex = (info or {}).get("primary_exchange", "")
-            if not ex or _is_allowed_exchange(ex):
-                out.append(s)
-        return out
+        return [s.strip().upper() for s in SCANNER_SYMBOLS.split(",") if s.strip()]
 
     if not POLYGON_API_KEY: return []
-    out=[]; page_token=None; pages=0
+    out=[]; cursor=None; pages=0
     while pages < SCANNER_MAX_PAGES:
         params={"market":"stocks","active":"true","limit":"1000","apiKey":POLYGON_API_KEY}
-        if page_token: params["cursor"]=page_token
+        if cursor: params["cursor"]=cursor
         url="https://api.polygon.io/v3/reference/tickers"
         r = requests.get(url, params=params, timeout=20)
         if r.status_code != 200: break
         j=r.json(); results=j.get("results", [])
         for x in results:
             t = x.get("ticker")
-            ex = x.get("primary_exchange") or x.get("primary_exchange_name") or x.get("listing_exchange") or ""
-            if not t: 
+            if not t: continue
+            exch = (x.get("primary_exchange") or x.get("primary_exchange_code") or x.get("listing_exchange") or "").upper()
+            if ALLOWED_EXCHANGES and exch and exch not in ALLOWED_EXCHANGES:
                 continue
-            if ex and not _is_allowed_exchange(ex):
-                continue
-            SYMBOL_INFO[t] = {"primary_exchange": ex}
             out.append(t)
-        page_token=j.get("next_url", None)
-        if not page_token: break
+        cursor = j.get("next_url", None)
+        if not cursor: break
         pages+=1
-    # Keep to alnum tickers only (as before)
+    # Fall back to alnum tickers only
     return [s for s in out if s.isalnum()]
 
 # -------- SENTIMENT --------
@@ -257,7 +214,8 @@ def compute_sentiment():
         except: df.index=df.index.tz_localize("UTC").tz_convert("America/New_York")
         dates=sorted({d.date() for d in df.index}); 
         if len(dates)<2: return 0.0
-        yday=dates[-2]; y_rth=df[(df.index.date==yday) & (df.index.map(_is_rth_tz))]
+        def _rth_mask(ts): h,m=ts.hour,ts.minute; return ((h>9) or (h==9 and m>=30)) and (h<16)
+        yday=dates[-2]; y_rth=df[(df.index.date==yday) & (df.index.map(_rth_mask))]
         if y_rth.empty: return 0.0
         y_close=float(y_rth["close"].iloc[-1]); last_px=float(df["close"].iloc[-1])
         return (last_px/y_close)-1.0
@@ -304,9 +262,10 @@ class LiveTrade:
 
 def _record_open_trade(strat_name: str, symbol: str, tf_min: int, sig: dict):
     combo=_combo_key(strat_name, symbol, tf_min); _perf_init(combo)
-    tp=sig.get("tp_abs", sig.get("takeProfit")); sl=sig.get("sl_abs", sig.get("stopLoss"))
-    t=LiveTrade(combo, symbol, tf_min, sig["action"], sig["entry"], float(tp), float(sl),
-                int(sig["quantity"]), sig.get("barTime"))
+    tp=sig.get("tp_abs", sig.get("takeProfit"))
+    sl=sig.get("sl_abs", sig.get("stopLoss"))
+    t=LiveTrade(combo, symbol, tf_min, sig["action"], sig["entry"], float(tp or 0.0), float(sl or 0.0),
+                int(sig.get("quantity",0)), sig.get("barTime"))
     OPEN_TRADES[(symbol, tf_min)].append(t)
 
 def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, close: float):
@@ -329,20 +288,38 @@ def _opposite(a:str)->str: return "sell" if a=="buy" else "buy"
 
 def flatten_all_open_positions():
     posted=0
+    # 1) Primary: tracked ledger
+    any_tracked=False
     for (sym, tf), trades in list(OPEN_TRADES.items()):
         for t in trades:
             if not t.is_open or not t.qty or not t.symbol: continue
+            any_tracked=True
             payload={"ticker":t.symbol,"action":_opposite(t.side),"orderType":"market","quantity":int(t.qty),
                      "meta":{"note":"daily-guard-flatten","combo":t.combo,"triggeredAt":datetime.now(timezone.utc).isoformat()}}
             ok,info=send_to_traderspost(payload); print(f"[DAILY-GUARD] Flatten {t.combo} -> ok={ok} info={info}", flush=True)
             t.is_open=False; t.exit_time=datetime.now(timezone.utc).isoformat(); t.exit=t.entry; t.reason="daily_guard"; posted+=1
+
+    # 2) Fallback: mirror what we sent today if ledger empty
+    if not any_tracked and SENT_TODAY:
+        print("[DAILY-GUARD] No tracked open trades; using SENT_TODAY fallback.", flush=True)
+        net = defaultdict(int)  # key: (symbol, side)
+        for rec in SENT_TODAY:
+            net[(rec["symbol"], rec["action"])] += int(rec["qty"])
+        for (sym, side), q in net.items():
+            opp=_opposite(side)
+            payload={"ticker":sym,"action":opp,"orderType":"market","quantity":int(q),
+                     "meta":{"note":"daily-guard-flatten-fallback","triggeredAt":datetime.now(timezone.utc).isoformat()}}
+            ok,info=send_to_traderspost(payload)
+            print(f"[DAILY-GUARD] Fallback flatten {sym} {opp} qty={q} -> ok={ok} info={info}", flush=True)
+            posted+=1
+
     print(f"[DAILY-GUARD] Flatten requests posted: {posted}", flush=True)
 
 def reset_daily_guard_if_new_day():
-    global DAY_STAMP, HALT_TRADING
+    global DAY_STAMP, HALT_TRADING, SENT_TODAY
     today=_today_local_date_str()
     if today!=DAY_STAMP:
-        HALT_TRADING=False; DAY_STAMP=today
+        HALT_TRADING=False; DAY_STAMP=today; SENT_TODAY.clear()
         print(f"[DAILY-GUARD] New day -> reset HALT_TRADING. Day={DAY_STAMP}", flush=True)
 
 def check_daily_guard_and_maybe_halt():
@@ -399,7 +376,6 @@ def ml_score(symbol: str, df1m: pd.DataFrame, tf_min: int):
         cut=int(len(X)*0.7)
         X_train, y_train = X.iloc[:cut], y.iloc[:cut]
 
-        # Single-class? → fallback but still usable
         if getattr(y_train, "nunique", None) and y_train.nunique() < 2:
             proba_up = _fallback_proba_from_momentum(feats)
             ts = feats.index[-1]
@@ -447,28 +423,29 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, r_multiple=N
     proba_up, ts, reason=ml_score(symbol, df1m, tf_min)
 
     if proba_up is None:
-        if DIAG_SIG_DETAILS:
-            print(f"[NOSIG] {symbol} {tf_min}m reason={reason}", flush=True)
+        if DIAG_SIG_DETAILS: print(f"[NOSIG] {symbol} {tf_min}m reason={reason}", flush=True)
         return None
     if reason == "not_in_session":
-        if DIAG_SIG_DETAILS:
-            print(f"[NOSIG] {symbol} {tf_min}m reason=not_in_session proba_up={proba_up:.3f}", flush=True)
+        if DIAG_SIG_DETAILS: print(f"[NOSIG] {symbol} {tf_min}m reason=not_in_session proba_up={proba_up:.3f}", flush=True)
         return None
 
     bars=_resample(df1m, tf_min)
     if bars is None or bars.empty:
-        if DIAG_SIG_DETAILS:
-            print(f"[NOSIG] {symbol} {tf_min}m reason=bars_empty_after_score", flush=True)
+        if DIAG_SIG_DETAILS: print(f"[NOSIG] {symbol} {tf_min}m reason=bars_empty_after_score", flush=True)
         return None
 
     price=float(bars["close"].iloc[-1])
+
+    # Min price filter here (even if universe gave us symbol)
+    if price < MIN_PRICE:
+        if DIAG_SIG_DETAILS: print(f"[NOSIG] {symbol} {tf_min}m reason=price_gate price={price:.2f}<min={MIN_PRICE}", flush=True)
+        return None
 
     if proba_up >= 0.5:
         side="buy"; score=proba_up; sl=price*0.99; tp=price*(1+0.01*r_multiple)
     else:
         if not SHORTS_ENABLED:
-            if DIAG_SIG_DETAILS:
-                print(f"[NOSIG] {symbol} {tf_min}m reason=shorts_disabled proba_up={proba_up:.3f}", flush=True)
+            if DIAG_SIG_DETAILS: print(f"[NOSIG] {symbol} {tf_min}m reason=shorts_disabled proba_up={proba_up:.3f}", flush=True)
             return None
         side="sell"; score=1.0-proba_up; sl=price*1.01; tp=price*(1-0.01*r_multiple)
 
@@ -514,7 +491,7 @@ def build_payload(symbol: str, sig: dict):
     payload={"ticker":symbol,"action":action,"orderType":order_type,"quantity":qty,"meta":{}}
     if isinstance(sig.get("meta"), dict): payload["meta"].update(sig["meta"])
     if sig.get("barTime"): payload["meta"]["barTime"]=sig["barTime"]
-    if order_type.lower()=="limit" and sig.get("price") is not None: payload["limitPrice"]=float(round(sig["price"],2))
+    if order_type.lower()=="limit" and sig.get("price") is not None: payload["limitPrice"]=float(round(sig.get("price"),2))
     tp_abs=sig.get("tp_abs", sig.get("takeProfit")); sl_abs=sig.get("sl_abs", sig.get("stopLoss"))
     if tp_abs is not None: payload["takeProfit"]={"limitPrice": float(round(tp_abs,2))}
     if sl_abs is not None: payload["stopLoss"]={"type":"stop","stopPrice": float(round(sl_abs,2))}
@@ -548,7 +525,6 @@ def compute_signal(strategy_name, symbol, tf_minutes, df1m=None):
         if DIAG_SIG_DETAILS: print(f"[NOSIG] {symbol} {tf_minutes}m reason=vol_gate vol={int(todays_vol)}<min={SCANNER_MIN_TODAY_VOL}", flush=True)
         return None
 
-    # NOTE: price filter is handled in the main loop (after last close computed)
     if strategy_name=="ml_pattern":
         sig = signal_ml_pattern(symbol, df1m, tf_minutes, SCANNER_R_MULTIPLE)
         return sig
@@ -598,29 +574,15 @@ def main():
             candidates=[]  # (score,symbol,tf,sig)
 
             for sym in symbols:
-                # Exchange filter (best-effort; may have been pre-filtered already)
-                ex = (SYMBOL_INFO.get(sym) or {}).get("primary_exchange", "")
-                if ex and not _is_allowed_exchange(ex):
-                    if DIAG_SIG_DETAILS: print(f"[REJECT] {sym} * exchange_gate ex='{ex}'", flush=True)
-                    continue
-
                 df1m=fetch_polygon_1m(sym, lookback_minutes=max(240, max(TF_MIN_LIST)*240))
                 if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
                     continue
                 try: df1m.index=df1m.index.tz_convert(MARKET_TZ)
                 except Exception: df1m.index=df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
 
-                # Volume gate (today)
                 today_mask = df1m.index.date == df1m.index[-1].date()
                 todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
                 if todays_vol < SCANNER_MIN_TODAY_VOL:
-                    if DIAG_SIG_DETAILS: print(f"[REJECT] {sym} * vol_gate {int(todays_vol)}<{SCANNER_MIN_TODAY_VOL}", flush=True)
-                    continue
-
-                # Price gate (NEW)
-                last_price = float(df1m["close"].iloc[-1])
-                if last_price < MIN_PRICE:
-                    if DIAG_SIG_DETAILS: print(f"[REJECT] {sym} * price_gate {last_price:.2f} < {MIN_PRICE:.2f}", flush=True)
                     continue
 
                 for tf in TF_MIN_LIST:
@@ -628,13 +590,12 @@ def main():
                     if not sig:
                         continue
 
-                    # sentiment gate
+                    # sentiment gate (neutral allows both)
                     if SENTIMENT_ONLY_GATE:
                         if (sentiment=="bull" and sig["action"]!="buy") or (sentiment=="bear" and sig["action"]!="sell"):
-                            if DIAG_SIG_DETAILS: print(f"[REJECT] {sym} {tf}m * sentiment_block", flush=True)
                             continue
 
-                    # dedupe
+                    # dedupe by (symbol, tf, side, barTime)
                     k = _dedupe_key("ml_pattern", sym, tf, sig["action"], sig.get("barTime",""))
                     if k in _sent_keys:
                         continue
@@ -642,7 +603,6 @@ def main():
 
                     score = float(sig.get("score", sig.get("confidence", 0.0)))
                     if score < SCANNER_CONF_THRESHOLD:
-                        if DIAG_SIG_DETAILS: print(f"[REJECT] {sym} {tf}m * conf_gate {score:.3f} < {SCANNER_CONF_THRESHOLD:.3f}", flush=True)
                         continue
 
                     candidates.append((score, sym, tf, sig))
@@ -658,11 +618,30 @@ def main():
                     open_positions=sum(1 for lst in OPEN_TRADES.values() for t in lst if t.is_open)
                     if open_positions >= MAX_CONCURRENT_POSITIONS:
                         print(f"[LIMIT] Max concurrent reached mid-loop.", flush=True); break
+
                     payload = build_payload(sym, sig)
                     ok, info = send_to_traderspost(payload)
-                    if ok:
-                        sent_ct+=1
                     print(f"[ORDER] {sym} {tf}m {sig['action']} qty={sig['quantity']} conf={score:.3f} ok={ok} info={info}", flush=True)
+
+                    # --- NEW: record locally so flattener can close it ---
+                    if ok:
+                        sent_ct += 1
+                        try:
+                            _record_open_trade("ml_pattern", sym, tf, {
+                                "action": sig["action"],
+                                "entry": float(sig.get("entry", 0.0)),
+                                "tp_abs": float(sig.get("takeProfit") or sig.get("tp_abs") or 0.0),
+                                "sl_abs": float(sig.get("stopLoss")   or sig.get("sl_abs") or 0.0),
+                                "quantity": int(sig.get("quantity", 0)),
+                                "barTime": sig.get("barTime")
+                            })
+                        except Exception as e:
+                            print(f"[WARN] failed to record open trade for {sym} {tf}m: {e}", flush=True)
+                        # Fallback log of what we sent today
+                        try:
+                            SENT_TODAY.append({"symbol": sym, "tf": int(tf), "action": sig["action"], "qty": int(sig["quantity"]), "ts": datetime.now(timezone.utc).isoformat()})
+                        except Exception:
+                            pass
 
         except Exception as e:
             print("[LOOP ERROR]", e, traceback.format_exc(), flush=True)
