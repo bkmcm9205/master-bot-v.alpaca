@@ -1,6 +1,6 @@
 pandas==2.0.3
 numpy==1.23.5
 requests==2.31.0
-pytz==2024.1
-scikit-learn==1.2.2
 pandas_ta==0.3.14b0
+scikit-learn==1.2.2
+pytz==2024.1
