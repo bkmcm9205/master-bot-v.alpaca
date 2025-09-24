@@ -1,13 +1,19 @@
-FROM python:3.10.10
+FROM python:3.11-slim
+
+# Keep Python output unbuffered and pip lean
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
 WORKDIR /app
-COPY requirements.txt .
-# Install other dependencies
-RUN pip install --no-cache-dir -r requirements.txt
-# Manually download and install pandas_ta
-RUN wget https://github.com/twopirllc/pandas-ta/archive/refs/tags/v0.3.14b0.tar.gz && \
-    tar -xzf v0.3.14b0.tar.gz && \
-    cd pandas-ta-0.3.14b0 && \
-    pip install --no-cache-dir . && \
-    cd .. && rm -rf pandas-ta-0.3.14b0 v0.3.14b0.tar.gz
-COPY . .
+
+# Install Python deps from requirements.txt
+COPY requirements.txt /app/requirements.txt
+RUN python -m pip install --upgrade pip && \
+    pip install -r /app/requirements.txt
+
+# Copy your app code
+COPY . /app
+
+# Start your strategy
 CMD ["python", "Ranked_ML.py"]
