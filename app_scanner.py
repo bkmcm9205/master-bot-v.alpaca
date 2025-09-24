@@ -106,7 +106,7 @@ class LiveTrade:
         self.combo = combo
         self.symbol = symbol
         self.tf_min = int(tf_min)
-        self.side = side            # "buy" or "sell_short"
+        self.side = side            # "buy" or "sell" (normalized)
         self.entry = float(entry) if entry is not None else float("nan")
         self.tp = float(tp) if tp is not None else float("nan")
         self.sl = float(sl) if sl is not None else float("nan")
@@ -227,6 +227,23 @@ def _throttle_ok():
     _order_times.append(now)
     return True, ""
 
+def _tp_translate_action(action: str) -> str:
+    """
+    Normalize internal actions to TradersPost-accepted actions.
+    - buy, sell are passthrough
+    - sell_short -> sell (open short)
+    - buy_to_cover -> buy (close short)
+    - exit/flatten/close -> exit
+    """
+    a = (action or "").lower()
+    if a in ("sell_short", "short", "sell_to_open"):
+        return "sell"
+    if a in ("buy_to_cover", "cover", "buy_to_close"):
+        return "buy"
+    if a in ("close", "flatten", "exit"):
+        return "exit"
+    return a
+
 def send_to_traderspost(payload: dict):
     try:
         if DRY_RUN:
@@ -248,8 +265,9 @@ def send_to_traderspost(payload: dict):
         return False, f"exception: {e}"
 
 def build_payload(symbol: str, sig: dict):
-    """Normalize legacy and absolute TP/SL into TradersPost nested fields."""
-    action     = sig.get("action")
+    """Normalize legacy and absolute TP/SL into TradersPost nested fields + translate action."""
+    raw_action = sig.get("action")
+    action     = _tp_translate_action(raw_action)
     order_type = sig.get("orderType","market")
     qty        = int(sig.get("quantity", 0))
     payload = {"ticker": symbol, "action": action, "orderType": order_type, "quantity": qty, "meta": {}}
@@ -303,11 +321,13 @@ def _record_open_trade(strat_name: str, symbol: str, tf_min: int, sig: dict):
     _perf_init(combo)
     tp = sig.get("tp_abs", sig.get("takeProfit"))
     sl = sig.get("sl_abs", sig.get("stopLoss"))
+    # Normalize side for local accounting: shorts -> "sell"
+    side_norm = "sell" if sig["action"] in ("sell", "sell_short") else "buy"
     t = LiveTrade(
         combo=combo,
         symbol=symbol,
         tf_min=int(tf_min),
-        side=sig["action"],  # "buy" or "sell_short"
+        side=side_norm,  # "buy" or "sell"
         entry=float(sig.get("entry") or sig.get("price") or sig.get("lastClose") or 0.0),
         tp=float(tp) if tp is not None else float("nan"),
         sl=float(sl) if sl is not None else float("nan"),
@@ -329,11 +349,9 @@ def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, c
             t.is_open = False
             t.exit_time = ts.tz_convert("UTC").isoformat() if hasattr(ts, "tzinfo") else str(ts)
             if hit_tp:
-                t.exit = t.tp
-                t.reason = "tp"
+                t.exit = t.tp; t.reason = "tp"
             else:
-                t.exit = t.sl
-                t.reason = "sl"
+                t.exit = t.sl; t.reason = "sl"
             pnl = (t.exit - t.entry) * t.qty if t.side == "buy" else (t.entry - t.exit) * t.qty
             _perf_update(t.combo, pnl)
             print(f"[CLOSE] {t.combo} {t.reason.upper()} qty={t.qty} entry={t.entry:.2f} exit={t.exit:.2f} pnl={pnl:+.2f}", flush=True)
@@ -479,6 +497,7 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
     if want_short:
         qty = _position_qty(price, short_sl)
         if qty > 0:
+            # keep internal "sell_short"; translator sends "sell" to TP
             return {
                 "action": "sell_short",
                 "orderType": "market",
@@ -513,20 +532,12 @@ def _unrealized_day_pnl() -> float:
                 continue
             if t.side == "buy":
                 tot += (px - t.entry) * t.qty
-            else:  # sell_short
+            else:  # normalized short == "sell"
                 tot += (t.entry - px) * t.qty
     return float(tot)
 
 def _current_equity() -> float:
     return START_EQUITY + _realized_day_pnl() + _unrealized_day_pnl()
-
-def _opposite(action: str) -> str:
-    """Return correct closing action for a given open action."""
-    mapping = {
-        "buy": "sell",               # close long
-        "sell_short": "buy_to_cover" # close short
-    }
-    return mapping.get(action, "sell")
 
 def flatten_all_open_positions():
     posted = 0
@@ -536,9 +547,8 @@ def flatten_all_open_positions():
                 continue
             payload = {
                 "ticker": t.symbol,
-                "action": _opposite(t.side),
+                "action": "exit",  # generic close (TP will close long or short)
                 "orderType": "market",
-                "quantity": int(t.qty),
                 "meta": {"note": "daily-guard-flatten", "combo": t.combo, "triggeredAt": datetime.now(timezone.utc).isoformat()}
             }
             ok, info = send_to_traderspost(payload)
@@ -731,6 +741,7 @@ def main():
                         print(f"[LIMIT] Max concurrent reached mid-loop.", flush=True)
                         break
 
+                    # Build payload (with action translation) and send
                     handle_signal("ml_pattern", sym, tf, sig)
 
             # EOD auto-flatten window (16:00–16:10 ET)
