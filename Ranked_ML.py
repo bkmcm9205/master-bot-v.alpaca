@@ -13,6 +13,45 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
+
+# ===== POLYGON PROBE (paste near the top, after imports) =====
+import os, requests, datetime as dt
+
+POLY_BASE = os.getenv("POLYGON_BASE_URL", "https://api.polygon.io").rstrip("/")
+POLY_KEY  = os.getenv("POLYGON_API_KEY", "")
+
+def polygon_probe():
+    if not POLY_KEY:
+        print("[PROBE] Missing POLYGON_API_KEY env var")
+        return
+
+    # Use yesterday so market is definitely closed and data exists
+    y = (dt.date.today() - dt.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # 1) Reference tickers (v3) – basic stocks list
+    u1 = f"{POLY_BASE}/v3/reference/tickers"
+    p1 = {"market":"stocks","active":"true","limit":"1","apiKey":POLY_KEY}
+    r1 = requests.get(u1, params=p1, timeout=15)
+    print(f"[PROBE] {u1} -> {r1.status_code}")
+    print(f"[PROBE] url: {r1.url}")
+    if r1.status_code != 200:
+        print(f"[PROBE] body: {r1.text[:600]}")
+
+    # 2) Minute bars (v2 aggs) – SPY for yesterday
+    u2 = f"{POLY_BASE}/v2/aggs/ticker/SPY/range/1/minute/{y}/{y}"
+    p2 = {"adjusted":"true","sort":"asc","limit":"50000","apiKey":POLY_KEY}
+    r2 = requests.get(u2, params=p2, timeout=15)
+    print(f"[PROBE] {u2} -> {r2.status_code}")
+    print(f"[PROBE] url: {r2.url}")
+    if r2.status_code != 200:
+        print(f"[PROBE] body: {r2.text[:600]}")
+    else:
+        js = r2.json()
+        print(f"[PROBE] resultsCount={js.get('resultsCount')}, queryCount={js.get('queryCount')}")
+
+polygon_probe()
+# ===== END POLYGON PROBE =====
+
 # =============================
 # ENV / CONFIG
 # =============================
