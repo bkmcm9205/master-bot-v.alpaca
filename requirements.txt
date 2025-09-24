@@ -2,5 +2,5 @@ pandas==2.2.2
 numpy==2.0.2
 requests==2.32.3
 scikit-learn==1.5.1
-git+https://github.com/twopirllc/pandas-ta.git@0.3.14b0#egg=pandas-ta
+pandas-ta @ https://codeload.github.com/twopirllc/pandas-ta/tar.gz/refs/tags/0.3.14b0
 pytz==2024.1
