@@ -22,13 +22,13 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10")) # main loop sleep
 RUN_ID = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
 # Universe / scan config
 SCANNER_SYMBOLS = os.getenv("SCANNER_SYMBOLS", "").strip() # comma list to override universe (optional)
-SCANNER_MAX_PAGES = int(os.getenv("SCANNER_MAX_PAGES", "1")) # pages of Polygon ref tickers (1000 per page)
-SCANNER_MIN_TODAY_VOL = int(os.getenv("SCANNER_MIN_TODAY_VOL", "500000")) # today volume gate per symbol
-SCANNER_CONF_THRESHOLD = float(os.getenv("SCANNER_CONF_THRESHOLD", "0.8")) # confidence threshold for ML signals
+SCANNER_MAX_PAGES = int(os.getenv("SCANNER_MAX_PAGES", "20")) # pages of Polygon ref tickers (1000 per page)
+SCANNER_MIN_TODAY_VOL = int(os.getenv("SCANNER_MIN_TODAY_VOL", "20000")) # today volume gate per symbol
+SCANNER_CONF_THRESHOLD = float(os.getenv("SCANNER_CONF_THRESHOLD", "0.7")) # confidence threshold for ML signals
 SCANNER_R_MULTIPLE = float(os.getenv("SCANNER_R_MULTIPLE", "3.0")) # risk-reward ratio for TP
 TF_MIN_LIST = [int(x) for x in os.getenv("TF_MIN_LIST", "1,2,3,5,10").split(",") if x.strip()]
 # Price / exchange filters
-MIN_PRICE = float(os.getenv("MIN_PRICE", "5.0")) # last trade must be >= this
+MIN_PRICE = float(os.getenv("MIN_PRICE", "3.0")) # last trade must be >= this
 ALLOWED_EXCHANGES = set(
     x.strip().upper()
     for x in os.getenv("ALLOWED_EXCHANGES", "NASD,NASDAQ,NYSE,XNAS,XNYS").split(",")
@@ -42,20 +42,20 @@ MIN_QTY = int(os.getenv("MIN_QTY", "1"))
 ROUND_LOT = int(os.getenv("ROUND_LOT","1"))
 # Daily portfolio guard (manual baseline each morning)
 START_EQUITY = float(os.getenv("START_EQUITY", "100000")) # <-- YOU update this daily
-DAILY_TP_PCT = float(os.getenv("DAILY_TP_PCT", "0.03")) # +3%
+DAILY_TP_PCT = float(os.getenv("DAILY_TP_PCT", "0.25")) # +25%
 DAILY_DD_PCT = float(os.getenv("DAILY_DD_PCT", "0.05")) # -5%
 DAILY_FLATTEN_ON_HIT = os.getenv("DAILY_FLATTEN_ON_HIT","1").lower() in ("1","true","yes")
 DAILY_GUARD_ENABLED = os.getenv("DAILY_GUARD_ENABLED","1").lower() in ("1","true","yes")
 HALT_TRADING = False
 DAY_STAMP = datetime.now().astimezone().strftime("%Y-%m-%d")
 # Engine guards
-MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "100"))
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "200"))
 MAX_ORDERS_PER_MIN = int(os.getenv("MAX_ORDERS_PER_MIN", "60"))
 MARKET_TZ = "America/New_York"
 ALLOW_PREMARKET = os.getenv("ALLOW_PREMARKET", "0").lower() in ("1","true","yes")
 ALLOW_AFTERHOURS = os.getenv("ALLOW_AFTERHOURS", "0").lower() in ("1","true","yes")
 # Sentiment gate
-SENTIMENT_LOOKBACK_MIN = int(os.getenv("SENTIMENT_LOOKBACK_MIN", "60"))
+SENTIMENT_LOOKBACK_MIN = int(os.getenv("SENTIMENT_LOOKBACK_MIN", "5"))
 SENTIMENT_NEUTRAL_BAND = float(os.getenv("SENTIMENT_NEUTRAL_BAND", "0.0015"))
 SENTIMENT_ONLY_GATE = os.getenv("SENTIMENT_ONLY_GATE","1").lower() in ("1","true","yes")
 SENTIMENT_SYMBOLS = [s.strip() for s in os.getenv("SENTIMENT_SYMBOLS", "SPY,QQQ").split(",") if s.strip()]
@@ -375,10 +375,11 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, sentiment: s
         bars["rsi"] = ta.rsi(bars["close"], length=14)
     except Exception as e:
         print(f"[ERROR] RSI calculation failed for {symbol}: {e}", flush=True)
+        # Fallback RSI calculation
         delta = bars["close"].diff()
-        up = delta.clip(lower=0).rolling(14).mean()
-        down = -delta.clip(upper=0).rolling(14).mean()
-        rs = up / (down.replace(0, np.nan))
+        up = delta.where(delta > 0, 0).rolling(window=14).mean()
+        down = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = up / down.replace(0, np.nan)
         bars["rsi"] = 100 - (100 / (1 + rs))
     bars["volatility"] = bars["close"].rolling(20).std()
     bars.dropna(inplace=True)
@@ -584,7 +585,7 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
 # =============================
 def main():
     # ---- Boot banner ----
-    print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD=python app.py", flush=True)
+    print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD=python Ranked_ML.py", flush=True)
     print(f"[BOOT] PAPER_MODE=paper POLL_SECONDS={POLL_SECONDS} TFs={TF_MIN_LIST} CONF_THRESHOLD={SCANNER_CONF_THRESHOLD} R_MULTIPLE={SCANNER_R_MULTIPLE}", flush=True)
     print(f"[BOOT] DAILY_GUARD_ENABLED={int(DAILY_GUARD_ENABLED)} UP={DAILY_TP_PCT:.0%} DOWN={DAILY_DD_PCT:.0%} FLATTEN={int(DAILY_FLATTEN_ON_HIT)} START_EQUITY={START_EQUITY:.2f}", flush=True)
     print(f"[BOOT] SENTIMENT_LOOKBACK_MIN={SENTIMENT_LOOKBACK_MIN} SENTIMENT_ONLY_GATE={int(SENTIMENT_ONLY_GATE)} NEUTRAL_ACTION={SENTIMENT_NEUTRAL_ACTION.upper()}", flush=True)
