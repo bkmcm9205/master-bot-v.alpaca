@@ -7,12 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# System deps for pip + GitHub installs
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends git ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
-
-# Upgrade pip and install Python deps
+# Upgrade pip and install Python deps from requirements.txt
 COPY requirements.txt /app/requirements.txt
 RUN python -m pip install --upgrade pip && \
     pip install -r /app/requirements.txt
