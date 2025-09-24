@@ -1,11 +1,14 @@
-# app_scanner_merged.py — bi-directional ML scanner with sentiment regime
+# ml_merged_app.py — bi-directional ML scanner with sentiment regime
 # + REST equity/positions (TradersPost), kill switch, grouped-daily prefilter & batch scan,
 # + local realized/unrealized MTM guard, + broker-equity guard, + trailing high-water guard,
 # + EOD auto-flatten, throttle, max-concurrent, price/exchange/volume gates.
 #
-# Actions (TradersPost):
-# - Long open:  action="buy"           ; close: "sell"
-# - Short open: action="sell_short"    ; close: "buy_to_cover"
+# Actions (your internal model → TradersPost webhook)
+#   Long open:   "buy"         -> buy
+#   Long close:  "sell"        -> sell
+#   Short open:  "sell_short"  -> sell        (translated)
+#   Short close: "buy_to_cover"-> buy         (translated)
+#   Generic flatten:            -> exit
 #
 # Requirements: pandas, numpy, requests, scikit-learn, (optional) pandas_ta
 
@@ -35,7 +38,7 @@ DRY_RUN         = os.getenv("DRY_RUN", "0").lower() in ("1","true","yes")
 PAPER_MODE      = os.getenv("PAPER_MODE", "true").lower() != "false"
 SCANNER_DEBUG   = os.getenv("SCANNER_DEBUG", "0").lower() in ("1","true","yes")
 
-RUN_ID          = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
+RUN_ID            = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
 RENDER_GIT_COMMIT = os.getenv("RENDER_GIT_COMMIT", "unknown")[:12]
 RENDER_GIT_BRANCH = os.getenv("RENDER_GIT_BRANCH", os.getenv("BRANCH", "unknown"))
 
@@ -93,10 +96,10 @@ DAILY_DD_PCT         = float(os.getenv("DAILY_DD_PCT","0.05"))     # -5%
 DAILY_FLATTEN_ON_HIT = os.getenv("DAILY_FLATTEN_ON_HIT","1").lower() in ("1","true","yes")
 
 # --- Broker-equity guard (uses REST equity vs session baseline)
-USE_BROKER_EQUITY_GUARD = os.getenv("USE_BROKER_EQUITY_GUARD","0").lower() in ("1","true","yes")
-SESSION_START_EQUITY_ENV = os.getenv("SESSION_START_EQUITY","").strip()  # optional fixed baseline
-SESSION_START_EQUITY     = float(SESSION_START_EQUITY_ENV) if SESSION_START_EQUITY_ENV else None
-SESSION_BASELINE_AT_0930 = os.getenv("SESSION_BASELINE_AT_0930","1").lower() in ("1","true","yes")
+USE_BROKER_EQUITY_GUARD   = os.getenv("USE_BROKER_EQUITY_GUARD","0").lower() in ("1","true","yes")
+SESSION_START_EQUITY_ENV  = os.getenv("SESSION_START_EQUITY","").strip()  # optional fixed baseline
+SESSION_START_EQUITY      = float(SESSION_START_EQUITY_ENV) if SESSION_START_EQUITY_ENV else None
+SESSION_BASELINE_AT_0930  = os.getenv("SESSION_BASELINE_AT_0930","1").lower() in ("1","true","yes")
 
 # --- Trailing high-water guard (applies to whichever equity mode you use)
 TRAIL_GUARD_ENABLED   = os.getenv("TRAIL_GUARD_ENABLED","1").lower() in ("1","true","yes")
@@ -136,7 +139,7 @@ class LiveTrade:
         self.combo = combo
         self.symbol = symbol
         self.tf_min = int(tf_min)
-        self.side = side            # "buy" or "sell_short"
+        self.side = side            # "buy" or "sell" (normalized)
         self.entry = float(entry) if entry is not None else float("nan")
         self.tp = float(tp) if tp is not None else float("nan")
         self.sl = float(sl) if sl is not None else float("nan")
@@ -249,8 +252,8 @@ def close_position_tp(symbol: str, qty: float | int | None = None):
                 print(f"[TP CLOSE EXC {symbol}]", e, traceback.format_exc(), flush=True)
     # Webhook fallback (best-effort)
     if TP_URL and not DRY_RUN:
-        payload = {"ticker": symbol, "action": "sell", "orderType": "market",
-                   "quantity": "all", "meta": {"environment": "paper" if PAPER_MODE else "live", "runId": RUN_ID, "intent": "flatten"}}
+        payload = {"ticker": symbol, "action": "exit", "orderType": "market",
+                   "meta": {"environment": "paper" if PAPER_MODE else "live", "runId": RUN_ID, "intent": "flatten"}}
         try:
             r = requests.post(TP_URL, json=payload, timeout=12)
             return 200 <= r.status_code < 300
@@ -383,8 +386,26 @@ def _throttle_ok():
     _order_times.append(now)
     return True, ""
 
+def _tp_translate_action(action: str) -> str:
+    """
+    Normalize internal actions to TradersPost-accepted actions.
+    - buy, sell are passthrough
+    - sell_short -> sell
+    - buy_to_cover -> buy
+    - exit/flatten/close -> exit
+    """
+    a = (action or "").lower()
+    if a in ("sell_short", "short", "sell_to_open"):
+        return "sell"
+    if a in ("buy_to_cover", "cover", "buy_to_close"):
+        return "buy"
+    if a in ("close", "flatten", "exit"):
+        return "exit"
+    return a
+
 def build_payload(symbol: str, sig: dict):
-    action     = sig.get("action")
+    raw_action = sig.get("action")
+    action     = _tp_translate_action(raw_action)
     order_type = sig.get("orderType","market")
     qty        = int(sig.get("quantity", 0))
     payload = {"ticker": symbol, "action": action, "orderType": order_type, "quantity": qty, "meta": {}}
@@ -451,8 +472,10 @@ def _record_open_trade(strat_name: str, symbol: str, tf_min: int, sig: dict):
     _perf_init(combo)
     tp = sig.get("tp_abs", sig.get("takeProfit"))
     sl = sig.get("sl_abs", sig.get("stopLoss"))
+    # Normalize side to "buy" or "sell" (shorts treated as "sell")
+    side_norm = "sell" if sig["action"] in ("sell", "sell_short") else "buy"
     t = LiveTrade(
-        combo=combo, symbol=symbol, tf_min=int(tf_min), side=sig["action"],
+        combo=combo, symbol=symbol, tf_min=int(tf_min), side=side_norm,
         entry=float(sig.get("entry") or sig.get("price") or sig.get("lastClose") or 0.0),
         tp=float(tp) if tp is not None else float("nan"),
         sl=float(sl) if sl is not None else float("nan"),
@@ -591,6 +614,7 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
     if want_short:
         qty = _position_qty(price, short_sl)
         if qty > 0:
+            # keep your internal intent as "sell_short" (translator will map to "sell")
             return {"action":"sell_short","orderType":"market","price":None,
                     "takeProfit": short_tp,"stopLoss": short_sl,
                     "barTime": ts.tz_convert("UTC").isoformat(),"entry": price,
@@ -623,7 +647,12 @@ def _current_equity_local() -> float:
     return START_EQUITY + _realized_day_pnl() + _unrealized_day_pnl()
 
 def _opposite(action: str) -> str:
-    return {"buy":"sell","sell_short":"buy_to_cover"}.get(action, "sell")
+    a = (action or "").lower()
+    if a == "buy":
+        return "sell"
+    if a == "sell":
+        return "buy"
+    return "exit"
 
 def flatten_all_open_positions_webhook():
     posted = 0
@@ -631,9 +660,12 @@ def flatten_all_open_positions_webhook():
         for t in trades:
             if not t.is_open or not t.qty or not t.symbol:
                 continue
-            payload = {"ticker": t.symbol, "action": _opposite(t.side), "orderType": "market",
-                       "quantity": int(t.qty),
-                       "meta": {"note": "auto-flatten", "combo": t.combo, "triggeredAt": datetime.now(timezone.utc).isoformat()}}
+            payload = {
+                "ticker": t.symbol,
+                "action": "exit",  # generic close on TP
+                "orderType": "market",
+                "meta": {"note": "auto-flatten", "combo": t.combo, "triggeredAt": datetime.now(timezone.utc).isoformat()}
+            }
             ok, info = send_to_traderspost(payload)
             print(f"[FLATTEN-LOCAL] {t.combo} -> ok={ok} info={info}", flush=True)
             posted += 1
@@ -823,7 +855,7 @@ def _batched_symbols(universe: list):
 # Main
 # =============================
 def main():
-    print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD=python ml_merged_app.py", flush=True)
+    print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD=python app_scanner_merged.py", flush=True)
     print(f"[BOOT] PAPER_MODE={'paper' if PAPER_MODE else 'live'} POLL_SECONDS={POLL_SECONDS} TFs={TF_MIN_LIST}", flush=True)
     print(f"[BOOT] CONF_THR={CONF_THR} R_MULT={R_MULT} SHORTS_ENABLED={int(SHORTS_ENABLED)} USE_SENTIMENT_REGIME={int(USE_SENTIMENT_REGIME)}", flush=True)
     print(f"[BOOT] DAILY_GUARD_ENABLED={int(DAILY_GUARD_ENABLED)} UP={DAILY_TP_PCT:.0%} DOWN={DAILY_DD_PCT:.0%} FLATTEN={int(DAILY_FLATTEN_ON_HIT)}", flush=True)
