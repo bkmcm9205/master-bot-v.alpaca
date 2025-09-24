@@ -1,11 +1,17 @@
 # app_scanner.py — market scanner + auto-trader (TradersPost + Polygon)
-# - Dynamic symbol universe (Polygon reference, or env override)
-# - Multiple TFs; volume gate; sentiment gate; position sizing
-# - Daily profit target / drawdown guard (+ optional flatten), uses START_EQUITY + realized + unrealized(MTM)
+# Bi-directional regime logic with sentiment:
+# - Bull: allow confident longs only
+# - Bear: allow confident shorts only (requires SHORTS_ENABLED=1)
+# - Neutral: allow confident longs or shorts (shorts require SHORTS_ENABLED=1)
+#
+# Other features (unchanged core):
+# - Dynamic universe (Polygon reference, or env override)
+# - Multiple TFs; volume gate; price gate; exchange filter
+# - Position sizing by per-share risk and notional caps
+# - Daily TP/DD guard (+ optional flatten), uses START_EQUITY + realized + unrealized (MTM)
 # - Max concurrent positions; per-minute order throttle
-# - End-of-day flatten (16:00–16:10 ET) + TP/SL bar-based exit checks
+# - EOD auto-flatten (16:00–16:10 ET)
 # - Proper TradersPost TP/SL payload shape
-# - Allowed exchanges filter + Min-price gate
 # - Boot banner for Render logs
 
 import os, time, json, math, hashlib, requests
@@ -46,8 +52,15 @@ MAX_POS_PCT         = float(os.getenv("MAX_POS_PCT", "0.10"))     # 10% notional
 MIN_QTY             = int(os.getenv("MIN_QTY", "1"))
 ROUND_LOT           = int(os.getenv("ROUND_LOT","1"))
 
+# Model thresholds
+CONF_THR            = float(os.getenv("CONF_THR", "0.80"))        # prob threshold for direction
+R_MULT              = float(os.getenv("R_MULT", "3.0"))           # TP = 1% * R_MULT; SL = 1% opposite
+
+# Shorts toggle
+SHORTS_ENABLED      = os.getenv("SHORTS_ENABLED","0").lower() in ("1","true","yes")
+
 # Daily portfolio guard (manual baseline each morning)
-START_EQUITY              = float(os.getenv("START_EQUITY", "100000"))   # <-- YOU update this daily
+START_EQUITY              = float(os.getenv("START_EQUITY", "100000"))   # <-- update daily if desired
 DAILY_TP_PCT              = float(os.getenv("DAILY_TP_PCT", "0.03"))     # +3%
 DAILY_DD_PCT              = float(os.getenv("DAILY_DD_PCT", "0.05"))     # -5%
 DAILY_FLATTEN_ON_HIT      = os.getenv("DAILY_FLATTEN_ON_HIT","1").lower() in ("1","true","yes")
@@ -65,8 +78,9 @@ ALLOW_AFTERHOURS          = os.getenv("ALLOW_AFTERHOURS", "0").lower() in ("1","
 # Sentiment gate
 SENTIMENT_LOOKBACK_MIN    = int(os.getenv("SENTIMENT_LOOKBACK_MIN", "60"))
 SENTIMENT_NEUTRAL_BAND    = float(os.getenv("SENTIMENT_NEUTRAL_BAND", "0.0015"))
-SENTIMENT_ONLY_GATE       = os.getenv("SENTIMENT_ONLY_GATE","1").lower() in ("1","true","yes")
 SENTIMENT_SYMBOLS         = [s.strip() for s in os.getenv("SENTIMENT_SYMBOLS", "SPY,QQQ").split(",") if s.strip()]
+# If you want to disable regime enforcement, set USE_SENTIMENT_REGIME=0
+USE_SENTIMENT_REGIME      = os.getenv("USE_SENTIMENT_REGIME","1").lower() in ("1","true","yes")
 
 # Diagnostics / replay
 DRY_RUN                   = os.getenv("DRY_RUN","0") == "1"
@@ -92,7 +106,7 @@ class LiveTrade:
         self.combo = combo
         self.symbol = symbol
         self.tf_min = int(tf_min)
-        self.side = side            # "buy" or "sell"
+        self.side = side            # "buy" or "sell_short"
         self.entry = float(entry) if entry is not None else float("nan")
         self.tp = float(tp) if tp is not None else float("nan")
         self.sl = float(sl) if sl is not None else float("nan")
@@ -293,7 +307,7 @@ def _record_open_trade(strat_name: str, symbol: str, tf_min: int, sig: dict):
         combo=combo,
         symbol=symbol,
         tf_min=int(tf_min),
-        side=sig["action"],
+        side=sig["action"],  # "buy" or "sell_short"
         entry=float(sig.get("entry") or sig.get("price") or sig.get("lastClose") or 0.0),
         tp=float(tp) if tp is not None else float("nan"),
         sl=float(sl) if sl is not None else float("nan"),
@@ -308,6 +322,7 @@ def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, c
     for t in trades:
         if not t.is_open:
             continue
+        # TP/SL detection by side
         hit_tp = (high >= t.tp) if t.side == "buy" else (low <= t.tp)
         hit_sl = (low <= t.sl) if t.side == "buy" else (high >= t.sl)
         if hit_tp or hit_sl:
@@ -329,7 +344,6 @@ def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, c
 def compute_sentiment():
     """Simple intraday momentum on SENTIMENT_SYMBOLS within SENTIMENT_NEUTRAL_BAND."""
     look_min = max(5, SENTIMENT_LOOKBACK_MIN)
-    tf_min   = 1
     vals = []
     for s in SENTIMENT_SYMBOLS:
         df = fetch_polygon_1m(s, lookback_minutes=look_min*2)
@@ -339,7 +353,6 @@ def compute_sentiment():
             df.index = df.index.tz_convert(MARKET_TZ)
         except Exception:
             df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
-        # simple momentum over last look_min minutes
         window = df.iloc[-look_min:]
         if len(window) < 2:
             continue
@@ -354,7 +367,7 @@ def compute_sentiment():
     return "neutral"
 
 # =============================
-# Strategy: ML Pattern (live adapter)
+# Strategy: ML Pattern (live adapter) with regime logic
 # =============================
 def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
     if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
@@ -367,37 +380,36 @@ def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
         bars = pd.DataFrame()
     return bars
 
-def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, conf_threshold=0.8, r_multiple=3.0):
+def _ml_features_and_pred(bars: pd.DataFrame):
+    """Train quick RF on rolling features; return (timestamp, proba_up, pred_up) for last bar."""
     try:
         from sklearn.ensemble import RandomForestClassifier
         import pandas_ta as ta
     except Exception:
-        return None
-    if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
-        return None
-    bars = _resample(df1m, tf_min)
-    if bars.empty or len(bars) < 120:
-        return None
+        return None, None, None
 
-    bars = bars.copy()
-    bars["return"]     = bars["close"].pct_change()
+    if bars is None or bars.empty or len(bars) < 120:
+        return None, None, None
+
+    df = bars.copy()
+    df["return"]     = df["close"].pct_change()
     try:
-        bars["rsi"]    = ta.rsi(bars["close"], length=14)
+        df["rsi"]    = ta.rsi(df["close"], length=14)
     except Exception:
-        delta = bars["close"].diff()
+        delta = df["close"].diff()
         up = delta.clip(lower=0).rolling(14).mean()
         down = -delta.clip(upper=0).rolling(14).mean()
         rs = up / (down.replace(0, np.nan))
-        bars["rsi"] = 100 - (100 / (1 + rs))
-    bars["volatility"] = bars["close"].rolling(20).std()
-    bars.dropna(inplace=True)
-    if len(bars) < 60:
-        return None
+        df["rsi"] = 100 - (100 / (1 + rs))
+    df["volatility"] = df["close"].rolling(20).std()
+    df.dropna(inplace=True)
+    if len(df) < 60:
+        return None, None, None
 
-    X = bars[["return","rsi","volatility"]].iloc[:-1]
-    y = (bars["close"].shift(-1) > bars["close"]).astype(int).iloc[:-1]
+    X = df[["return","rsi","volatility"]].iloc[:-1]
+    y = (df["close"].shift(-1) > df["close"]).astype(int).iloc[:-1]
     if len(X) < 50:
-        return None
+        return None, None, None
 
     cut = int(len(X) * 0.7)
     clf = RandomForestClassifier(n_estimators=100, random_state=42)
@@ -409,31 +421,76 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, conf_thresho
     except Exception:
         pass
 
-    proba = clf.predict_proba(x_live)[0][1]
-    pred  = int(proba >= 0.5)
+    proba_up = float(clf.predict_proba(x_live)[0][1])
+    pred_up  = int(proba_up >= 0.5)
+    ts = df.index[-1]
+    return ts, proba_up, pred_up
 
-    ts = bars.index[-1]
+def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
+                      conf_threshold=CONF_THR, r_multiple=R_MULT,
+                      sentiment="neutral", shorts_enabled=SHORTS_ENABLED):
+    """Return a signal dict for long/short based on model + sentiment regime, else None."""
+    if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
+        return None
+    bars = _resample(df1m, tf_min)
+    if bars.empty:
+        return None
+
+    ts, proba_up, pred_up = _ml_features_and_pred(bars)
+    if ts is None or proba_up is None or pred_up is None:
+        return None
     if not _in_session(ts):
         return None
 
-    if pred == 1 and proba >= conf_threshold:
-        price = float(bars["close"].iloc[-1])
-        sl    = price * 0.99                         # 1% stop
-        tp    = price * (1 + 0.01 * r_multiple)      # r-multiple on 1% unit
-        qty   = _position_qty(price, sl)
-        if qty <= 0:
-            return None
-        return {
-            "action": "buy",
-            "orderType": "market",
-            "price": None,
-            "takeProfit": tp,
-            "stopLoss": sl,
-            "barTime": ts.tz_convert("UTC").isoformat(),
-            "entry": price,
-            "quantity": int(qty),
-            "meta": {"note": "ml_pattern"}
-        }
+    price = float(bars["close"].iloc[-1])
+    # 1% “unit” risk; SL opposite, TP along trend scaled by r_multiple
+    long_sl  = price * 0.99
+    long_tp  = price * (1 + 0.01 * r_multiple)
+    short_sl = price * 1.01
+    short_tp = price * (1 - 0.01 * r_multiple)
+
+    # Decide allowed direction under sentiment regime
+    want_long  = (proba_up >= conf_threshold)
+    want_short = ((1.0 - proba_up) >= conf_threshold) and shorts_enabled
+
+    if USE_SENTIMENT_REGIME:
+        if sentiment == "bull":
+            want_short = False
+        elif sentiment == "bear":
+            want_long = False
+        # neutral → both as computed
+
+    # Build the signal if allowed + size > 0
+    if want_long:
+        qty = _position_qty(price, long_sl)
+        if qty > 0:
+            return {
+                "action": "buy",
+                "orderType": "market",
+                "price": None,
+                "takeProfit": long_tp,
+                "stopLoss": long_sl,
+                "barTime": ts.tz_convert("UTC").isoformat(),
+                "entry": price,
+                "quantity": int(qty),
+                "meta": {"note": "ml_pattern_long", "proba_up": proba_up, "sentiment": sentiment}
+            }
+
+    if want_short:
+        qty = _position_qty(price, short_sl)
+        if qty > 0:
+            return {
+                "action": "sell_short",
+                "orderType": "market",
+                "price": None,
+                "takeProfit": short_tp,
+                "stopLoss": short_sl,
+                "barTime": ts.tz_convert("UTC").isoformat(),
+                "entry": price,
+                "quantity": int(qty),
+                "meta": {"note": "ml_pattern_short", "proba_up": proba_up, "sentiment": sentiment}
+            }
+
     return None
 
 # =============================
@@ -456,7 +513,7 @@ def _unrealized_day_pnl() -> float:
                 continue
             if t.side == "buy":
                 tot += (px - t.entry) * t.qty
-            else:
+            else:  # sell_short
                 tot += (t.entry - px) * t.qty
     return float(tot)
 
@@ -464,7 +521,12 @@ def _current_equity() -> float:
     return START_EQUITY + _realized_day_pnl() + _unrealized_day_pnl()
 
 def _opposite(action: str) -> str:
-    return "sell" if action == "buy" else "buy"
+    """Return correct closing action for a given open action."""
+    mapping = {
+        "buy": "sell",               # close long
+        "sell_short": "buy_to_cover" # close short
+    }
+    return mapping.get(action, "sell")
 
 def flatten_all_open_positions():
     posted = 0
@@ -521,7 +583,7 @@ def check_daily_guard_and_maybe_halt():
 # =============================
 # Routing & signal handling
 # =============================
-def compute_signal(strategy_name, symbol, tf_minutes, df1m=None):
+def compute_signal(strategy_name, symbol, tf_minutes, df1m=None, sentiment="neutral"):
     if df1m is None or getattr(df1m, "empty", True):
         df1m = fetch_polygon_1m(symbol, lookback_minutes=max(240, tf_minutes*240))
         if df1m is None or df1m.empty:
@@ -536,10 +598,10 @@ def compute_signal(strategy_name, symbol, tf_minutes, df1m=None):
     except Exception:
         df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
 
-    # price & volume gates
+    # price & volume gates (+ MTM cache)
     try:
         last_px = float(df1m["close"].iloc[-1])
-        LAST_PRICE[symbol] = last_px  # update MTM cache
+        LAST_PRICE[symbol] = last_px
         if last_px < MIN_PRICE:
             return None
     except Exception:
@@ -551,7 +613,11 @@ def compute_signal(strategy_name, symbol, tf_minutes, df1m=None):
         return None
 
     if strategy_name == "ml_pattern":
-        return signal_ml_pattern(symbol, df1m, tf_minutes)
+        return signal_ml_pattern(
+            symbol, df1m, tf_minutes,
+            conf_threshold=CONF_THR, r_multiple=R_MULT,
+            sentiment=sentiment, shorts_enabled=SHORTS_ENABLED
+        )
     return None
 
 def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
@@ -570,7 +636,7 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
         COUNTS["orders.ok" if ok else "orders.err"] += 1
     except Exception:
         pass
-    print(f"[ORDER] {combo_key} -> qty={sig.get('quantity')} ok={ok} info={info}", flush=True)
+    print(f"[ORDER] {combo_key} -> action={sig.get('action')} qty={sig.get('quantity')} ok={ok} info={info}", flush=True)
 
 # =============================
 # Main
@@ -580,6 +646,7 @@ def main():
     print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD=python app.py", flush=True)
     print(f"[BOOT] PAPER_MODE=paper POLL_SECONDS={POLL_SECONDS} TFs={TF_MIN_LIST}", flush=True)
     print(f"[BOOT] DAILY_GUARD_ENABLED={int(DAILY_GUARD_ENABLED)} UP={DAILY_TP_PCT:.0%} DOWN={DAILY_DD_PCT:.0%} FLATTEN={int(DAILY_FLATTEN_ON_HIT)} START_EQUITY={START_EQUITY:.2f}", flush=True)
+    print(f"[BOOT] CONF_THR={CONF_THR} R_MULT={R_MULT} SHORTS_ENABLED={int(SHORTS_ENABLED)} USE_SENTIMENT_REGIME={int(USE_SENTIMENT_REGIME)}", flush=True)
 
     if not POLYGON_API_KEY:
         print("[FATAL] POLYGON_API_KEY missing.", flush=True)
@@ -635,7 +702,7 @@ def main():
                 continue
 
             # Scan & signal phase
-            sentiment = compute_sentiment() if SENTIMENT_ONLY_GATE else "neutral"
+            sentiment = compute_sentiment() if USE_SENTIMENT_REGIME else "neutral"
             print(f"[SENTIMENT] {sentiment}", flush=True)
 
             for sym in symbols:
@@ -647,17 +714,12 @@ def main():
                 except Exception:
                     df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
 
-                # gates + MTM cache update happen inside compute_signal
                 for tf in TF_MIN_LIST:
-                    sig = compute_signal("ml_pattern", sym, tf, df1m=df1m)
+                    sig = compute_signal("ml_pattern", sym, tf, df1m=df1m, sentiment=sentiment)
                     if not sig:
                         continue
 
-                    # Sentiment gate (longs only strategy; block when bear)
-                    if SENTIMENT_ONLY_GATE and sentiment == "bear":
-                        continue
-
-                    # De-dupe
+                    # De-dupe per (strategy|symbol|tf|action|barTime)
                     k = hashlib.sha256(f"ml_pattern|{sym}|{tf}|{sig['action']}|{sig.get('barTime','')}".encode()).hexdigest()
                     if k in _sent_keys:
                         continue
