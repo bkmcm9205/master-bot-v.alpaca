@@ -180,19 +180,32 @@ def _position_qty(entry_price: float, stop_price: float,
 # =============================
 # Polygon helpers (robust)
 # =============================
+# replaces trading_dates_for_intraday()
 def trading_dates_for_intraday():
     """
-    If market is closed (outside 09:30–16:00 ET or weekend), use yesterday;
-    else use today. Returns (from_date, to_date) as YYYY-MM-DD strings.
+    Return a (from_date, to_date) that spans BACKFILL_DAYS.
+    - During RTH: from = today - (BACKFILL_DAYS-1), to = today
+    - Outside RTH/weekends: from = (yesterday - (BACKFILL_DAYS-1)), to = yesterday
     """
+    from zoneinfo import ZoneInfo
     et_now = datetime.now(ZoneInfo(MARKET_TZ))
-    is_weekend = et_now.weekday() >= 5
+    backfill_days = int(os.getenv("BACKFILL_DAYS", "5"))
+    backfill_days = max(1, backfill_days)
+
+    def daterange_str(d0, d1):
+        return d0.strftime("%Y-%m-%d"), d1.strftime("%Y-%m-%d")
+
     in_rth = ((et_now.hour > 9) or (et_now.hour == 9 and et_now.minute >= 30)) and (et_now.hour < 16)
-    if is_weekend or not in_rth:
-        d = (et_now.date() - timedelta(days=1)).strftime("%Y-%m-%d")
-        return d, d
-    d = et_now.date().strftime("%Y-%m-%d")
-    return d, d
+    is_weekend = et_now.weekday() >= 5
+
+    if in_rth and not is_weekend:
+        d_to = et_now.date()
+        d_from = d_to - timedelta(days=backfill_days - 1)
+        return daterange_str(d_from, d_to)
+    else:
+        d_to = (et_now.date() - timedelta(days=1))
+        d_from = d_to - timedelta(days=backfill_days - 1)
+        return daterange_str(d_from, d_to)
 
 def polygon_get_tickers(limit_total: int = 5000):
     """
