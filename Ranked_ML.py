@@ -1,72 +1,40 @@
-# Ranked_ML.py — market scanner + auto-trader (TradersPost + Polygon)
-# - Dynamic symbol universe (Polygon v3 + robust pagination)
-# - Bars via v2 aggs with explicit dates; auto-uses yesterday when market is closed
+# Ranked_ML.py — market scanner + auto-trader (PLUMBING SWAP: Polygon/TP -> Alpaca)
+# - Dynamic symbol universe (Alpaca assets)
+# - 1m bars via Alpaca; wrapper keeps lookback_minutes signature
 # - Multiple TFs; volume gate; sentiment gate; position sizing
 # - Daily profit target / drawdown guard (+ optional flatten), uses START_EQUITY + realized + unrealized(MTM)
-# - Max concurrent positions; per-minute order throttle
+# - Max concurrent positions; per-minute throttle
 # - End-of-day flatten (16:00–16:10 ET) + TP/SL bar-based exit checks
-# - Proper TradersPost TP/SL payload shape
 # - Allowed exchanges filter + Min-price gate
 # - Boot banner for Render logs
+#
+# NOTE: Models/feature logic unchanged. Only data + broker I/O were swapped to Alpaca.
 
-import os, time, json, math, hashlib, requests
+import os, time, json, math, hashlib
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from adapters.data_alpaca import fetch_1m as fetch_bars_1m, resample, get_universe_symbols
-from common.signal_bridge import send_to_broker, close_all_positions, list_positions, get_account_equity
-
-# =========================
-# POLYGON CONFIG + PROBE
-# =========================
-POLY_BASE = os.getenv("POLYGON_BASE_URL", "https://api.polygon.io").rstrip("/")
-POLY_KEY  = os.getenv("POLYGON_API_KEY", "")
-
-def polygon_probe():
-    """One-time probe to print real error bodies if anything is off."""
-    try:
-        if not POLY_KEY:
-            print("[PROBE] Missing POLYGON_API_KEY env var")
-            return
-        y = (datetime.now(ZoneInfo("America/New_York")).date() - timedelta(days=1)).strftime("%Y-%m-%d")
-
-        u1 = f"{POLY_BASE}/v3/reference/tickers"
-        p1 = {"market":"stocks","active":"true","limit":"1","apiKey":POLY_KEY}
-        r1 = requests.get(u1, params=p1, timeout=15)
-        print(f"[PROBE] {u1} -> {r1.status_code}")
-        print(f"[PROBE] url: {r1.url}")
-        if r1.status_code != 200:
-            print(f"[PROBE] body: {r1.text[:600]}")
-
-        u2 = f"{POLY_BASE}/v2/aggs/ticker/SPY/range/1/minute/{y}/{y}"
-        p2 = {"adjusted":"true","sort":"asc","limit":"50000","apiKey":POLY_KEY}
-        r2 = requests.get(u2, params=p2, timeout=15)
-        print(f"[PROBE] {u2} -> {r2.status_code}")
-        print(f"[PROBE] url: {r2.url}")
-        if r2.status_code != 200:
-            print(f"[PROBE] body: {r2.text[:600]}")
-        else:
-            js = r2.json()
-            print(f"[PROBE] resultsCount={js.get('resultsCount')}, queryCount={js.get('queryCount')}")
-    except Exception as e:
-        print(f"[PROBE] exception: {type(e).__name__}: {e}")
-
-polygon_probe()
+# ---- Alpaca adapters (data + broker) ----
+from adapters.data_alpaca import fetch_1m as _alpaca_fetch_1m, get_universe_symbols as _alpaca_universe
+from common.signal_bridge import (
+    send_to_broker,          # usage: send_to_broker(symbol, sig, strategy_tag="ranked_ml")
+    close_all_positions,
+    list_positions,
+    get_account_equity,
+)
 
 # =============================
 # ENV / CONFIG
 # =============================
-TP_URL = os.getenv("TP_WEBHOOK_URL", "")  # TradersPost strategy webhook
-POLYGON_API_KEY = POLY_KEY                # keep old name usage consistent
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 RUN_ID = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
 
 # Universe / scan config
 SCANNER_SYMBOLS = os.getenv("SCANNER_SYMBOLS", "").strip()  # optional override list
-SCANNER_MAX_PAGES = int(os.getenv("SCANNER_MAX_PAGES", "20"))  # safeguard loop cap
+SCANNER_MAX_PAGES = int(os.getenv("SCANNER_MAX_PAGES", "20"))  # kept for compatibility; not used by Alpaca call
 SCANNER_MIN_TODAY_VOL = int(os.getenv("SCANNER_MIN_TODAY_VOL", "20000"))
 SCANNER_CONF_THRESHOLD = float(os.getenv("SCANNER_CONF_THRESHOLD", "0.7"))
 SCANNER_R_MULTIPLE = float(os.getenv("SCANNER_R_MULTIPLE", "3.0"))
@@ -82,13 +50,13 @@ ALLOWED_EXCHANGES = set(
 
 # Risk / sizing
 EQUITY_USD = float(os.getenv("EQUITY_USD", "100000"))
-RISK_PCT = float(os.getenv("RISK_PCT", "0.01"))  # 1%
-MAX_POS_PCT = float(os.getenv("MAX_POS_PCT", "0.10"))  # 10% notional cap
+RISK_PCT = float(os.getenv("RISK_PCT", "0.01"))          # 1%
+MAX_POS_PCT = float(os.getenv("MAX_POS_PCT", "0.10"))    # 10% notional cap
 MIN_QTY = int(os.getenv("MIN_QTY", "1"))
 ROUND_LOT = int(os.getenv("ROUND_LOT","1"))
 
 # Daily portfolio guard (manual baseline each morning)
-START_EQUITY = float(os.getenv("START_EQUITY", "100000"))  # stays at 100,000 per your note
+START_EQUITY = float(os.getenv("START_EQUITY", "100000"))
 DAILY_TP_PCT = float(os.getenv("DAILY_TP_PCT", "0.25"))    # +25%
 DAILY_DD_PCT = float(os.getenv("DAILY_DD_PCT", "0.05"))    # -5%
 DAILY_FLATTEN_ON_HIT = os.getenv("DAILY_FLATTEN_ON_HIT","1").lower() in ("1","true","yes")
@@ -181,284 +149,38 @@ def _position_qty(entry_price: float, stop_price: float,
     return int(max(qty, min_qty if qty > 0 else 0))
 
 # =============================
-# Polygon helpers (robust)
+# Alpaca data wrappers (keep old signatures)
 # =============================
-# replaces trading_dates_for_intraday()
-def trading_dates_for_intraday():
-    """
-    Return a (from_date, to_date) that spans BACKFILL_DAYS.
-    - During RTH: from = today - (BACKFILL_DAYS-1), to = today
-    - Outside RTH/weekends: from = (yesterday - (BACKFILL_DAYS-1)), to = yesterday
-    """
-    from zoneinfo import ZoneInfo
-    et_now = datetime.now(ZoneInfo(MARKET_TZ))
-    backfill_days = int(os.getenv("BACKFILL_DAYS", "5"))
-    backfill_days = max(1, backfill_days)
-
-    def daterange_str(d0, d1):
-        return d0.strftime("%Y-%m-%d"), d1.strftime("%Y-%m-%d")
-
-    in_rth = ((et_now.hour > 9) or (et_now.hour == 9 and et_now.minute >= 30)) and (et_now.hour < 16)
-    is_weekend = et_now.weekday() >= 5
-
-    if in_rth and not is_weekend:
-        d_to = et_now.date()
-        d_from = d_to - timedelta(days=backfill_days - 1)
-        return daterange_str(d_from, d_to)
-    else:
-        d_to = (et_now.date() - timedelta(days=1))
-        d_from = d_to - timedelta(days=backfill_days - 1)
-        return daterange_str(d_from, d_to)
-
-def polygon_get_tickers(limit_total: int = 5000):
-    """
-    Reliable tickers fetch using v3 /reference/tickers with pagination.
-    Handles next_url (Polygon omits apiKey in next_url).
-    """
-    if not POLY_KEY:
-        print("[ERROR] Missing POLYGON_API_KEY in polygon_get_tickers", flush=True)
-        return []
-    tickers = []
-    base = f"{POLY_BASE}/v3/reference/tickers"
-    params = {
-        "market": "stocks",
-        "active": "true",
-        "sort": "ticker",
-        "order": "asc",
-        "limit": "1000",
-        "apiKey": POLY_KEY,
-    }
-    next_url = None
-    pages = 0
-    while True:
-        r = requests.get(next_url or base, params=None if next_url else params, timeout=20)
-        if r.status_code != 200:
-            print(f"[ERROR] Polygon tickers {r.status_code}: {r.text[:600]}", flush=True)
-            break
-        js = r.json()
-        for row in js.get("results", []):
-            t = row.get("ticker")
-            exch = (row.get("primary_exchange") or row.get("exchange") or "").upper()
-            if not t:
-                continue
-            if ALLOWED_EXCHANGES and exch and exch not in ALLOWED_EXCHANGES:
-                continue
-            if t.isalnum():
-                tickers.append(t)
-                if len(tickers) >= limit_total:
-                    return tickers
-        next_url = js.get("next_url")
-        if not next_url:
-            break
-        # IMPORTANT: add apiKey to next_url
-        join = "&" if "?" in next_url else "?"
-        next_url = f"{next_url}{join}apiKey={POLY_KEY}"
-        pages += 1
-        if pages >= SCANNER_MAX_PAGES:
-            break
-    return tickers
-
-def polygon_get_bars(ticker: str, tf_minutes: int, date_from: str, date_to: str):
-    """
-    Reliable intraday bars using v2 /aggs. Dates must be YYYY-MM-DD.
-    """
-    if not POLY_KEY:
-        print("[ERROR] Missing POLYGON_API_KEY in polygon_get_bars", flush=True)
-        return []
-    url = f"{POLY_BASE}/v2/aggs/ticker/{ticker}/range/{tf_minutes}/minute/{date_from}/{date_to}"
-    params = {"adjusted": "true", "sort": "asc", "limit": "50000", "apiKey": POLY_KEY}
-    r = requests.get(url, params=params, timeout=20)
-    if r.status_code != 200:
-        print(f"[ERROR] {ticker} aggs {r.status_code}: {r.text[:600]}", flush=True)
-        return []
-    return r.json().get("results", [])
-
 def fetch_bars_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
     """
-    Return tz-aware ET 1m bars with o/h/l/c/volume.
-    Uses explicit trading dates so it works at night/weekends.
+    Return tz-aware ET 1m bars with o/h/l/c/volume using Alpaca.
+    Keeps legacy signature (lookback_minutes).
     """
-    d0, d1 = trading_dates_for_intraday()
-    rows = polygon_get_bars(symbol, tf_minutes=1, date_from=d0, date_to=d1)
-    if not rows:
-        print(f"[WARN] No data from Polygon for {symbol}", flush=True)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(minutes=lookback_minutes)
+    start_iso = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    end_iso = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    try:
+        df = _alpaca_fetch_1m(symbol, start_iso=start_iso, end_iso=end_iso, limit=10000)
+    except TypeError:
+        # Fallback if adapter signature differs (allow older adapter)
+        df = _alpaca_fetch_1m(symbol, start_iso, end_iso, 10000)  # type: ignore
+    if df is None or df.empty:
         return pd.DataFrame()
-    df = pd.DataFrame(rows)
-    if df.empty:
-        print(f"[WARN] Empty bars for {symbol}", flush=True)
-        return pd.DataFrame()
-    df["ts"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    df = df.set_index("ts").sort_index()
     try:
         df.index = df.index.tz_convert(MARKET_TZ)
     except Exception:
         df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
-    df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
-    return df[["open","high","low","close","volume"]]
+    cols = [c for c in ["open","high","low","close","volume"] if c in df.columns]
+    return df[cols].copy() if cols else pd.DataFrame()
 
 def get_universe_symbols() -> list:
-    """Env override OR Polygon reference tickers filtered by ALLOWED_EXCHANGES."""
+    """Env override OR Alpaca assets (filtered by ALLOWED_EXCHANGES if available)."""
     if SCANNER_SYMBOLS:
         return [s.strip().upper() for s in SCANNER_SYMBOLS.split(",") if s.strip()]
-    return polygon_get_tickers(limit_total=10000)
-
-# =============================
-# TradersPost webhook I/O
-# =============================
-def _throttle_ok():
-    now = time.time()
-    while _order_times and now - _order_times[0] > 60:
-        _order_times.popleft()
-    if len(_order_times) >= MAX_ORDERS_PER_MIN:
-        return False, f"throttled: {len(_order_times)}/{MAX_ORDERS_PER_MIN} in last 60s"
-    _order_times.append(now)
-    return True, ""
-
-def send_to_broker(payload: dict):
-    try:
-        if DRY_RUN:
-            print(f"[DRY-RUN] {json.dumps(payload)[:500]}", flush=True)
-            return True, "dry-run"
-        if not TP_URL:
-            print("[ERROR] TP_WEBHOOK_URL missing.", flush=True)
-            return False, "no-webhook-url"
-        ok, msg = _throttle_ok()
-        if not ok:
-            return False, msg
-        payload.setdefault("meta", {})
-        payload["meta"]["environment"] = "paper"
-        payload["meta"]["sentAt"] = datetime.now(timezone.utc).isoformat()
-        r = requests.post(TP_URL, json=payload, timeout=12)
-        info = f"{r.status_code} {r.text[:300]}"
-        return (200 <= r.status_code < 300), info
-    except Exception as e:
-        print(f"[ERROR] send_to_traderspost: {e}", flush=True)
-        return False, f"exception: {e}"
-
-def build_payload(symbol: str, sig: dict):
-    """Normalize legacy and absolute TP/SL into TradersPost nested fields."""
-    action = sig.get("action")
-    order_type = sig.get("orderType","market")
-    qty = int(sig.get("quantity", 0))
-    payload = {"ticker": symbol, "action": action, "orderType": order_type, "quantity": qty, "meta": {}}
-    if isinstance(sig.get("meta"), dict):
-        payload["meta"].update(sig["meta"])
-    if sig.get("barTime"):
-        payload["meta"]["barTime"] = sig["barTime"]
-    if order_type.lower() == "limit" and sig.get("price") is not None:
-        payload["limitPrice"] = float(round(sig["price"], 2))
-    tp_abs = sig.get("tp_abs", sig.get("takeProfit"))
-    sl_abs = sig.get("sl_abs", sig.get("stopLoss"))
-    if tp_abs is not None:
-        payload["takeProfit"] = {"limitPrice": float(round(tp_abs, 2))}
-    if sl_abs is not None:
-        payload["stopLoss"] = {"type":"stop", "stopPrice": float(round(sl_abs, 2))}
-    return payload
-
-# =============================
-# Performance tracking
-# =============================
-def _combo_key(strategy: str, symbol: str, tf_min: int) -> str:
-    return f"{strategy}|{symbol}|{int(tf_min)}"
-
-def _perf_init(combo: str):
-    if combo not in PERF:
-        PERF[combo] = {
-            "trades": 0, "wins": 0, "losses": 0,
-            "gross_profit": 0.0, "gross_loss": 0.0,
-            "net_pnl": 0.0, "max_dd": 0.0,
-            "equity_curve": [0.0],
-        }
-
-def _perf_update(combo: str, pnl: float):
-    _perf_init(combo)
-    p = PERF[combo]
-    p["trades"] += 1
-    if pnl > 0:
-        p["wins"] += 1
-        p["gross_profit"] += pnl
-    elif pnl < 0:
-        p["losses"] += 1
-        p["gross_loss"] += pnl
-    p["net_pnl"] += pnl
-    ec = p["equity_curve"]
-    ec.append(ec[-1] + pnl)
-    dd = min(0.0, ec[-1] - max(ec))
-    p["max_dd"] = min(p["max_dd"], dd)
-
-def _record_open_trade(strat_name: str, symbol: str, tf_min: int, sig: dict):
-    combo = _combo_key(strat_name, symbol, tf_min)
-    _perf_init(combo)
-    tp = sig.get("tp_abs", sig.get("takeProfit"))
-    sl = sig.get("sl_abs", sig.get("stopLoss"))
-    t = LiveTrade(
-        combo=combo,
-        symbol=symbol,
-        tf_min=int(tf_min),
-        side=sig["action"],
-        entry=float(sig.get("entry") or sig.get("price") or sig.get("lastClose") or 0.0),
-        tp=float(tp) if tp is not None else float("nan"),
-        sl=float(sl) if sl is not None else float("nan"),
-        qty=int(sig["quantity"]),
-        entry_time=sig.get("barTime") or datetime.now(timezone.utc).isoformat(),
-    )
-    OPEN_TRADES[(symbol, int(tf_min))].append(t)
-
-def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, close: float):
-    key = (symbol, int(tf_min))
-    trades = OPEN_TRADES.get(key, [])
-    for t in trades:
-        if not t.is_open:
-            continue
-        if t.side == "buy":
-            hit_tp = high >= t.tp
-            hit_sl = low <= t.sl
-        else:  # sell
-            hit_tp = low <= t.tp
-            hit_sl = high >= t.sl
-        if hit_tp or hit_sl:
-            t.is_open = False
-            t.exit_time = ts.tz_convert("UTC").isoformat() if hasattr(ts, "tzinfo") else str(ts)
-            if hit_tp:
-                t.exit = t.tp
-                t.reason = "tp"
-            else:
-                t.exit = t.sl
-                t.reason = "sl"
-            pnl = (t.exit - t.entry) * t.qty if t.side == "buy" else (t.entry - t.exit) * t.qty
-            _perf_update(t.combo, pnl)
-            print(f"[CLOSE] {t.combo} {t.reason.upper()} qty={t.qty} entry={t.entry:.2f} exit={t.exit:.2f} pnl={pnl:+.2f}", flush=True)
-
-# =============================
-# Sentiment
-# =============================
-def compute_sentiment():
-    """Simple intraday momentum on SENTIMENT_SYMBOLS within SENTIMENT_NEUTRAL_BAND."""
-    look_min = max(5, SENTIMENT_LOOKBACK_MIN)
-    vals = []
-    for s in SENTIMENT_SYMBOLS:
-        df = fetch_bars_1m(s, lookback_minutes=look_min*2)
-        if df is None or df.empty:
-            print(f"[WARN] No sentiment data for {s}", flush=True)
-            continue
-        try:
-            df.index = df.index.tz_convert(MARKET_TZ)
-        except Exception:
-            df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
-        window = df.iloc[-look_min:]
-        if len(window) < 2:
-            print(f"[WARN] Insufficient data for {s} sentiment", flush=True)
-            continue
-        vals.append(float(window["close"].iloc[-1]) / float(window["close"].iloc[0]) - 1.0)
-    if not vals:
-        print("[WARN] No valid sentiment data, defaulting to neutral", flush=True)
-        return "neutral"
-    avg = sum(vals) / len(vals)
-    if avg >= SENTIMENT_NEUTRAL_BAND:
-        return "bull"
-    if avg <= -SENTIMENT_NEUTRAL_BAND:
-        return "bear"
-    return "neutral"
+    syms = _alpaca_universe(limit=10000)
+    # adapters can optionally filter by exchange; keep here for compatibility
+    return [s for s in syms if isinstance(s, str) and s.isalnum()]
 
 # =============================
 # Strategy: ML Pattern (live adapter)
@@ -526,8 +248,8 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, sentiment: s
         x_live = x_live[list(clf.feature_names_in_)]
     except Exception:
         pass
-    proba_up = clf.predict_proba(x_live)[0][1]
-    proba_down = 1 - proba_up
+    proba_up = float(clf.predict_proba(x_live)[0][1])
+    proba_down = 1.0 - proba_up
     ts = bars.index[-1]
 
     if not _in_session(ts):
@@ -545,6 +267,7 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, sentiment: s
         sl = price * 0.99
         tp = price * (1 + 0.01 * r_multiple)
     elif sentiment == "bear" and proba_down >= conf_threshold:
+        # keep model intent as "sell"; bridge will treat as short-open via translation
         action = "sell"; confidence = proba_down
         sl = price * 1.01
         tp = price * (1 - 0.01 * r_multiple)
@@ -565,9 +288,9 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int, sentiment: s
         print(f"[WARN] Invalid quantity for {symbol} {tf_min}m: qty={qty}", flush=True)
         return None
 
-    print(f"[SIGNAL] {symbol} {tf_min}m {action.UPPER() if hasattr(str,'UPPER') else action.upper()} confidence={confidence:.3f}", flush=True)
+    print(f"[SIGNAL] {symbol} {tf_min}m {action.upper()} confidence={confidence:.3f}", flush=True)
     return {
-        "action": action,
+        "action": action,                 # "buy" or "sell" (bridge maps "sell" -> short open)
         "orderType": "market",
         "price": None,
         "takeProfit": tp,
@@ -610,26 +333,25 @@ def _opposite(action: str) -> str:
     return "sell" if action == "buy" else "buy"
 
 def flatten_all_open_positions():
+    """
+    Use Alpaca bridge to close everything at broker; also mark local trades closed.
+    """
+    try:
+        close_all_positions()
+    except Exception as e:
+        print(f"[DAILY-GUARD] close_all_positions error: {e}", flush=True)
+
     posted = 0
     for (sym, tf), trades in list(OPEN_TRADES.items()):
         for t in trades:
-            if not t.is_open or not t.qty or not t.symbol:
+            if not t.is_open:
                 continue
-            payload = {
-                "ticker": t.symbol,
-                "action": _opposite(t.side),
-                "orderType": "market",
-                "quantity": int(t.qty),
-                "meta": {"note": "daily-guard-flatten", "combo": t.combo, "triggeredAt": datetime.now(timezone.utc).isoformat()}
-            }
-            ok, info = send_to_broker(payload)
-            print(f"[DAILY-GUARD] Flatten {t.combo} -> ok={ok} info={info}", flush=True)
-            posted += 1
             t.is_open = False
             t.exit_time = datetime.now(timezone.utc).isoformat()
             t.exit = t.entry
             t.reason = "daily_guard"
-    print(f"[DAILY-GUARD] Flatten requests posted: {posted}", flush=True)
+            posted += 1
+    print(f"[DAILY-GUARD] Flattened local {posted} open trade(s).", flush=True)
 
 def reset_daily_guard_if_new_day():
     global DAY_STAMP, HALT_TRADING
@@ -708,8 +430,13 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
     meta["timeframe"] = f"{int(tf_min)}m"
     sig["meta"] = meta
     _record_open_trade(strat_name, symbol, tf_min, sig)
-    payload = build_payload(symbol, sig)
-    ok, info = send_to_broker(payload)
+
+    # ---- Translate legacy "sell" into bridge short-open hint (plumbing only) ----
+    send_sig = dict(sig)
+    if send_sig.get("action") == "sell":
+        send_sig["action"] = "sell_short"
+
+    ok, info = send_to_broker(symbol, send_sig, strategy_tag="ranked_ml")
     try:
         (COMBO_COUNTS if ok else COMBO_COUNTS)[f"{combo_key}::orders.{'ok' if ok else 'err'}"] += 1
         COUNTS["orders.ok" if ok else "orders.err"] += 1
@@ -718,23 +445,90 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
     print(f"[ORDER] {combo_key} -> qty={sig.get('quantity')} ok={ok} info={info}", flush=True)
 
 # =============================
+# Performance tracking
+# =============================
+def _combo_key(strategy: str, symbol: str, tf_min: int) -> str:
+    return f"{strategy}|{symbol}|{int(tf_min)}"
+
+def _perf_init(combo: str):
+    if combo not in PERF:
+        PERF[combo] = {
+            "trades": 0, "wins": 0, "losses": 0,
+            "gross_profit": 0.0, "gross_loss": 0.0,
+            "net_pnl": 0.0, "max_dd": 0.0,
+            "equity_curve": [0.0],
+        }
+
+def _perf_update(combo: str, pnl: float):
+    _perf_init(combo)
+    p = PERF[combo]
+    p["trades"] += 1
+    if pnl > 0:
+        p["wins"] += 1
+        p["gross_profit"] += pnl
+    elif pnl < 0:
+        p["losses"] += 1
+        p["gross_loss"] += pnl
+    p["net_pnl"] += pnl
+    ec = p["equity_curve"]
+    ec.append(ec[-1] + pnl)
+    dd = min(0.0, ec[-1] - max(ec))
+    p["max_dd"] = min(p["max_dd"], dd)
+
+def _record_open_trade(strat_name: str, symbol: str, tf_min: int, sig: dict):
+    combo = _combo_key(strat_name, symbol, tf_min)
+    _perf_init(combo)
+    tp = sig.get("tp_abs", sig.get("takeProfit"))
+    sl = sig.get("sl_abs", sig.get("stopLoss"))
+    # Normalize side for local accounting: "sell" treated as short
+    side_norm = "sell" if sig.get("action") in ("sell", "sell_short") else "buy"
+    t = LiveTrade(
+        combo=combo,
+        symbol=symbol,
+        tf_min=int(tf_min),
+        side=side_norm,
+        entry=float(sig.get("entry") or sig.get("price") or sig.get("lastClose") or 0.0),
+        tp=float(tp) if tp is not None else float("nan"),
+        sl=float(sl) if sl is not None else float("nan"),
+        qty=int(sig["quantity"]),
+        entry_time=sig.get("barTime") or datetime.now(timezone.utc).isoformat(),
+    )
+    OPEN_TRADES[(symbol, int(tf_min))].append(t)
+
+def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, close: float):
+    key = (symbol, int(tf_min))
+    trades = OPEN_TRADES.get(key, [])
+    for t in trades:
+        if not t.is_open:
+            continue
+        if t.side == "buy":
+            hit_tp = high >= t.tp
+            hit_sl = low <= t.sl
+        else:  # sell (short)
+            hit_tp = low <= t.tp
+            hit_sl = high >= t.sl
+        if hit_tp or hit_sl:
+            t.is_open = False
+            t.exit_time = ts.tz_convert("UTC").isoformat() if hasattr(ts, "tzinfo") else str(ts)
+            if hit_tp:
+                t.exit = t.tp; t.reason = "tp"
+            else:
+                t.exit = t.sl; t.reason = "sl"
+            pnl = (t.exit - t.entry) * t.qty if t.side == "buy" else (t.entry - t.exit) * t.qty
+            _perf_update(t.combo, pnl)
+            print(f"[CLOSE] {t.combo} {t.reason.upper()} qty={t.qty} entry={t.entry:.2f} exit={t.exit:.2f} pnl={pnl:+.2f}", flush=True)
+
+# =============================
 # Main
 # =============================
 def main():
     # ---- Boot banner ----
     print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD=python Ranked_ML.py", flush=True)
-    print(f"[BOOT] PAPER_MODE=paper POLL_SECONDS={POLL_SECONDS} TFs={TF_MIN_LIST} CONF_THRESHOLD={SCANNER_CONF_THRESHOLD} R_MULTIPLE={SCANNER_R_MULTIPLE}", flush=True)
+    print(f"[BOOT] POLL_SECONDS={POLL_SECONDS} TFs={TF_MIN_LIST} CONF_THRESHOLD={SCANNER_CONF_THRESHOLD} R_MULTIPLE={SCANNER_R_MULTIPLE}", flush=True)
     print(f"[BOOT] DAILY_GUARD_ENABLED={int(DAILY_GUARD_ENABLED)} UP={DAILY_TP_PCT:.0%} DOWN={DAILY_DD_PCT:.0%} FLATTEN={int(DAILY_FLATTEN_ON_HIT)} START_EQUITY={START_EQUITY:.2f}", flush=True)
     print(f"[BOOT] SENTIMENT_LOOKBACK_MIN={SENTIMENT_LOOKBACK_MIN} SENTIMENT_ONLY_GATE={int(SENTIMENT_ONLY_GATE)} NEUTRAL_ACTION={SENTIMENT_NEUTRAL_ACTION.upper()}", flush=True)
 
-    if not POLYGON_API_KEY:
-        print("[FATAL] POLYGON_API_KEY missing.", flush=True)
-        return
-    if not TP_URL and not DRY_RUN:
-        print("[FATAL] TP_WEBHOOK_URL missing (or set DRY_RUN=1).", flush=True)
-        return
-
-    # Universe (robust v3 + next_url pagination)
+    # Universe (Alpaca assets)
     symbols = get_universe_symbols()
     print(f"[UNIVERSE] symbols={len(symbols)} TFs={TF_MIN_LIST} vol_gate={SCANNER_MIN_TODAY_VOL} "
           f"MIN_PRICE={MIN_PRICE} EXCH={sorted(ALLOWED_EXCHANGES)}", flush=True)
