@@ -522,15 +522,15 @@ def reset_daily_state_if_new_day():
 # ---- EOD manager (pre-close flatten + safety net) ----
 def eod_manager():
     """
-    3:58–4:00 ET: halt entries and flatten.
+    3:50–4:00 ET: halt entries and flatten.
     4:00–4:02 ET: safety net to ensure flat.
     """
     global HALT_TRADING
     ts = _now_et()
     # Pre-close window
-    if ts.hour == 15 and ts.minute >= 58:
+    if ts.hour == 15 and ts.minute >= 50:
         if not HALT_TRADING:
-            print("[EOD] Pre-close: halting new entries and flattening (3:58–4:00 ET).", flush=True)
+            print("[EOD] Pre-close: halting new entries and flattening (3:50–4:00 ET).", flush=True)
         HALT_TRADING = True
         flatten_all_open_positions_webhook()
     # Safety net right after the bell
