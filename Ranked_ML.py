@@ -570,6 +570,12 @@ def main():
     while True:
         loop_start = time.time()
         try:
+            # ⬇️ add this guard
+            now_ts = _now_et()
+            if not _in_session(now_ts):
+                # sleep longer when closed to reduce log spam
+                time.sleep(max(POLL_SECONDS, 60))
+                continue
             reset_daily_guard_if_new_day()
 
             # Close phase: evaluate exits on last bars for all open trades
