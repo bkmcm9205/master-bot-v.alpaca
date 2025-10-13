@@ -372,10 +372,9 @@ def check_daily_guard_and_maybe_halt():
     equity   = _current_equity()
     up_lim   = START_EQUITY * (1.0 + DAILY_TP_PCT)
     dn_lim   = START_EQUITY * (1.0 - DAILY_DD_PCT)
-    print(f"[DAILY-GUARD] eq={e
-quity:.2f} start={START_EQUITY:.2f} "
-          f"targets +{DAILY_TP_PCT*100:.1f}%({up_lim:.2f}) / -{DAILY_DD_PCT*100:.1f}%({dn_lim:.2f})",
-          flush=True)
+    print(f"[DAILY-GUARD] eq={equity:.2f} start={START_EQUITY:.2f} "
+      f"targets +{DAILY_TP_PCT*100:.1f}%({up_lim:.2f}) / -{DAILY_DD_PCT*100:.1f}%({dn_lim:.2f})",
+      flush=True)
     if HALT_TRADING:
         return
     if equity >= up_lim:
