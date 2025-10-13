@@ -37,7 +37,7 @@ SCANNER_SYMBOLS = os.getenv("SCANNER_SYMBOLS", "").strip()  # optional override 
 SCANNER_MAX_PAGES = int(os.getenv("SCANNER_MAX_PAGES", "20"))  # kept for compatibility; not used by Alpaca call
 SCANNER_MIN_TODAY_VOL = int(os.getenv("SCANNER_MIN_TODAY_VOL", "20000"))
 SCANNER_CONF_THRESHOLD = float(os.getenv("SCANNER_CONF_THRESHOLD", "0.7"))
-SCANNER_R_MULTIPLE = float(os.getenv("SCANNER_R_MULTIPLE", "3.0"))
+SCANNER_R_MULTIPLE = float(os.getenv("SCANNER_R_MULTIPLE", "1.5"))
 TF_MIN_LIST = [int(x) for x in os.getenv("TF_MIN_LIST", "1,2,3,5,10").split(",") if x.strip()]
 
 # Price / exchange filters
