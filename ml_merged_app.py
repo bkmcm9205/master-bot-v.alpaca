@@ -1,16 +1,7 @@
 # ml_merged_app.py — bi-directional ML scanner with sentiment regime
-# + REST equity/positions (TradersPost), kill switch, grouped-daily prefilter & batch scan,
-# + local realized/unrealized MTM guard, + broker-equity guard, + trailing high-water guard,
-# + EOD auto-flatten, throttle, max-concurrent, price/exchange/volume gates.
+# (PLUMBING-ONLY SWAP: Polygon + TradersPost -> Alpaca adapters)
 #
-# Actions (your internal model → TradersPost webhook)
-#   Long open:   "buy"         -> buy
-#   Long close:  "sell"        -> sell
-#   Short open:  "sell_short"  -> sell        (translated)
-#   Short close: "buy_to_cover"-> buy         (translated)
-#   Generic flatten:            -> exit
-#
-# Requirements: pandas, numpy, requests, scikit-learn, (optional) pandas_ta
+# Models/guards/sizing logic unchanged. Only data + broker I/O are rewired.
 
 import os, time, json, math, hashlib, requests
 from collections import defaultdict, deque
@@ -20,22 +11,22 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
-from adapters.data_alpaca import fetch_1m as fetch_bars_1m, resample, get_universe_symbols
-from common.signal_bridge import send_to_broker, close_all_positions, list_positions, get_account_equity
+# === Alpaca adapters (data + broker) ===
+from adapters.data_alpaca import (
+    fetch_1m as fetch_bars_1m,   # keep existing callsites the same
+    resample as _resample,
+    get_universe_symbols as _alpaca_universe,
+)
+from common.signal_bridge import (
+    send_to_broker,              # usage: send_to_broker(symbol, sig, strategy_tag)
+    close_all_positions,
+    list_positions,
+    get_account_equity,
+)
 
 # =============================
-# ENV / CONFIG
+# ENV / CONFIG (unchanged)
 # =============================
-# --- Core connectors
-# TP_URL          = os.getenv("TP_WEBHOOK_URL", "").strip()
-# POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
-
-# Optional TradersPost REST (equity/positions/flatten)
-# TP_BASE_URL     = os.getenv("TP_BASE_URL", "").rstrip("/")
-# TP_REST_TOKEN   = os.getenv("TP_REST_TOKEN", "")
-# TP_ACCOUNT_ID   = os.getenv("TP_ACCOUNT_ID", "")
-
-# --- Diagnostics / runtime
 POLL_SECONDS    = int(os.getenv("POLL_SECONDS", "10"))
 DRY_RUN         = os.getenv("DRY_RUN", "0").lower() in ("1","true","yes")
 PAPER_MODE      = os.getenv("PAPER_MODE", "true").lower() != "false"
@@ -46,16 +37,15 @@ RENDER_GIT_COMMIT = os.getenv("RENDER_GIT_COMMIT", "unknown")[:12]
 RENDER_GIT_BRANCH = os.getenv("RENDER_GIT_BRANCH", os.getenv("BRANCH", "unknown"))
 
 # --- Universe
-SCANNER_SYMBOLS = os.getenv("SCANNER_SYMBOLS", "").strip()         # manual override, comma-separated
+SCANNER_SYMBOLS = os.getenv("SCANNER_SYMBOLS", "").strip()
 TF_MIN_LIST     = [int(x) for x in os.getenv("TF_MIN_LIST", "1,2,3,5,10").split(",") if x.strip()]
 MARKET_TZ       = os.getenv("MARKET_TZ", "America/New_York")
 
-# Polygon reference (for prefilter)
+# (Polygon-only prefilter flags retained but no-op now)
 USE_GROUPED_DAILY_PREFILTER = os.getenv("USE_GROUPED_DAILY_PREFILTER","1").lower() in ("1","true","yes")
-MAX_UNIVERSE_PAGES          = int(os.getenv("MAX_UNIVERSE_PAGES", "2"))   # /v3/reference/tickers, 1000/page
+MAX_UNIVERSE_PAGES          = int(os.getenv("MAX_UNIVERSE_PAGES", "2"))
 SCAN_BATCH_SIZE             = int(os.getenv("SCAN_BATCH_SIZE", "300"))
-SCANNER_MIN_AVG_VOL         = int(os.getenv("SCANNER_MIN_AVG_VOL", "1000000"))  # grouped daily filter
-# Per-symbol intraday volume gate (today)
+SCANNER_MIN_AVG_VOL         = int(os.getenv("SCANNER_MIN_AVG_VOL", "1000000"))  # (Polygon grouped-daily—no-op)
 SCANNER_MIN_TODAY_VOL       = int(os.getenv("SCANNER_MIN_TODAY_VOL", "500000"))
 
 # Price + exchange gates
@@ -91,22 +81,22 @@ USE_SENTIMENT_REGIME   = os.getenv("USE_SENTIMENT_REGIME","1").lower() in ("1","
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "100"))
 MAX_ORDERS_PER_MIN       = int(os.getenv("MAX_ORDERS_PER_MIN", "60"))
 
-# --- Local daily guard (uses START_EQUITY + realized + unrealized)
+# --- Local daily guard
 DAILY_GUARD_ENABLED  = os.getenv("DAILY_GUARD_ENABLED","1").lower() in ("1","true","yes")
-START_EQUITY         = float(os.getenv("START_EQUITY","100000"))   # set this at ~9:30 each morning
-DAILY_TP_PCT         = float(os.getenv("DAILY_TP_PCT","0.03"))     # +3%
-DAILY_DD_PCT         = float(os.getenv("DAILY_DD_PCT","0.05"))     # -5%
+START_EQUITY         = float(os.getenv("START_EQUITY","100000"))
+DAILY_TP_PCT         = float(os.getenv("DAILY_TP_PCT","0.03"))
+DAILY_DD_PCT         = float(os.getenv("DAILY_DD_PCT","0.05"))
 DAILY_FLATTEN_ON_HIT = os.getenv("DAILY_FLATTEN_ON_HIT","1").lower() in ("1","true","yes")
 
-# --- Broker-equity guard (uses REST equity vs session baseline)
+# --- Broker-equity guard
 USE_BROKER_EQUITY_GUARD   = os.getenv("USE_BROKER_EQUITY_GUARD","0").lower() in ("1","true","yes")
-SESSION_START_EQUITY_ENV  = os.getenv("SESSION_START_EQUITY","").strip()  # optional fixed baseline
+SESSION_START_EQUITY_ENV  = os.getenv("SESSION_START_EQUITY","").strip()
 SESSION_START_EQUITY      = float(SESSION_START_EQUITY_ENV) if SESSION_START_EQUITY_ENV else None
 SESSION_BASELINE_AT_0930  = os.getenv("SESSION_BASELINE_AT_0930","1").lower() in ("1","true","yes")
 
-# --- Trailing high-water guard (applies to whichever equity mode you use)
+# --- Trailing high-water
 TRAIL_GUARD_ENABLED   = os.getenv("TRAIL_GUARD_ENABLED","1").lower() in ("1","true","yes")
-TRAIL_DD_PCT          = float(os.getenv("TRAIL_DD_PCT","0.05"))  # 5% from intraday peak
+TRAIL_DD_PCT          = float(os.getenv("TRAIL_DD_PCT","0.05"))
 TRAIL_FLATTEN_ON_HIT  = os.getenv("TRAIL_FLATTEN_ON_HIT","1").lower() in ("1","true","yes")
 
 # --- Kill switch
@@ -114,35 +104,35 @@ KILL_SWITCH       = os.getenv("KILL_SWITCH","OFF").lower() in ("1","true","yes",
 KILL_SWITCH_MODE  = os.getenv("KILL_SWITCH_MODE","halt").lower()   # 'halt' or 'flatten'
 
 # =============================
-# State / ledgers
+# State / ledgers (unchanged)
 # =============================
 COUNTS        = defaultdict(int)
 COMBO_COUNTS  = defaultdict(int)
-PERF          = {}                   # combo -> realized stats
-OPEN_TRADES   = defaultdict(list)    # (symbol, tf) -> [LiveTrade]
-_sent_keys    = set()                # de-dupe
-_order_times  = deque()              # for throttle
-LAST_PRICE    = {}                   # symbol -> last px (for MTM)
+PERF          = {}
+OPEN_TRADES   = defaultdict(list)
+_sent_keys    = set()
+_order_times  = deque()
+LAST_PRICE    = {}
 
 DAY_STAMP     = datetime.now().astimezone().strftime("%Y-%m-%d")
-HALT_TRADING  = False                # local guard halts entries
-HALTED        = False                # kill-switch / broker guard halts entries
+HALT_TRADING  = False
+HALTED        = False
 
 EQUITY_BASELINE_DATE = None
 EQUITY_BASELINE_SET  = False
-EQUITY_HIGH_WATER    = None          # trailing peak equity (mode-dependent)
+EQUITY_HIGH_WATER    = None
 
-_rr_idx = 0                          # round-robin pointer for batch scanning
+_rr_idx = 0
 
 # =============================
-# Models / classes
+# Models / classes (unchanged)
 # =============================
 class LiveTrade:
     def __init__(self, combo, symbol, tf_min, side, entry, tp, sl, qty, entry_time):
         self.combo = combo
         self.symbol = symbol
         self.tf_min = int(tf_min)
-        self.side = side            # "buy" or "sell" (normalized)
+        self.side = side
         self.entry = float(entry) if entry is not None else float("nan")
         self.tp = float(tp) if tp is not None else float("nan")
         self.sl = float(sl) if sl is not None else float("nan")
@@ -154,7 +144,7 @@ class LiveTrade:
         self.reason = None
 
 # =============================
-# Time/session helpers
+# Time/session helpers (unchanged)
 # =============================
 def _now_et():
     return datetime.now(timezone.utc).astimezone(ZoneInfo(MARKET_TZ))
@@ -177,7 +167,7 @@ def _after_0930_now():
     return (ts.hour > 9) or (ts.hour == 9 and ts.minute >= 30)
 
 # =============================
-# Math / sizing
+# Math / sizing (unchanged)
 # =============================
 def _position_qty(entry_price: float, stop_price: float,
                   equity=EQUITY_USD, risk_pct=RISK_PCT, max_pos_pct=MAX_POS_PCT,
@@ -193,247 +183,20 @@ def _position_qty(entry_price: float, stop_price: float,
     return int(max(qty, min_qty if qty > 0 else 0))
 
 # =============================
-# TradersPost REST helpers
+# Alpaca data/universe (replaces Polygon)
 # =============================
-def _tp_headers():
-    return {"Authorization": f"Bearer {TP_REST_TOKEN}", "Content-Type": "application/json"}
-
-def _tp_rest_ok():
-    return bool(TP_BASE_URL and TP_REST_TOKEN and TP_ACCOUNT_ID)
-
-def get_equity_from_tp(default_equity: float) -> float:
-    if not _tp_rest_ok():
-        return default_equity
-    try:
-        url = f"{TP_BASE_URL}/api/v2/accounts/{TP_ACCOUNT_ID}"
-        r = requests.get(url, headers=_tp_headers(), timeout=12)
-        if r.status_code >= 300:
-            if SCANNER_DEBUG:
-                print(f"[TP EQUITY] HTTP {r.status_code}: {r.text[:200]}", flush=True)
-            return default_equity
-        js = r.json()
-        eq = js.get("equity") or js.get("cash") or js.get("netLiquidation") or default_equity
-        return float(eq)
-    except Exception as e:
-        if SCANNER_DEBUG:
-            import traceback
-            print("[TP EQUITY EXC]", e, traceback.format_exc(), flush=True)
-        return default_equity
-
-def list_open_positions_tp():
-    if not _tp_rest_ok():
-        return []
-    try:
-        url = f"{TP_BASE_URL}/api/v2/accounts/{TP_ACCOUNT_ID}/positions"
-        r = requests.get(url, headers=_tp_headers(), timeout=15)
-        if r.status_code >= 300:
-            if SCANNER_DEBUG:
-                print(f"[TP POS] HTTP {r.status_code}: {r.text[:200]}", flush=True)
-            return []
-        js = r.json()
-        return js.get("data", js if isinstance(js, list) else [])
-    except Exception as e:
-        if SCANNER_DEBUG:
-            import traceback
-            print("[TP POS EXC]", e, traceback.format_exc(), flush=True)
-        return []
-
-def close_position_tp(symbol: str, qty: float | int | None = None):
-    if _tp_rest_ok():
-        try:
-            url = f"{TP_BASE_URL}/api/v2/accounts/{TP_ACCOUNT_ID}/orders"
-            payload = {"symbol": symbol, "side": "sell", "type": "market"}
-            if qty and qty > 0:
-                payload["quantity"] = qty
-            else:
-                payload["closePosition"] = True  # if supported
-            r = requests.post(url, headers=_tp_headers(), json=payload, timeout=15)
-            return 200 <= r.status_code < 300
-        except Exception as e:
-            if SCANNER_DEBUG:
-                import traceback
-                print(f"[TP CLOSE EXC {symbol}]", e, traceback.format_exc(), flush=True)
-    # Webhook fallback (best-effort)
-    if TP_URL and not DRY_RUN:
-        payload = {"ticker": symbol, "action": "exit", "orderType": "market",
-                   "meta": {"environment": "paper" if PAPER_MODE else "live", "runId": RUN_ID, "intent": "flatten"}}
-        try:
-            r = requests.post(TP_URL, json=payload, timeout=12)
-            return 200 <= r.status_code < 300
-        except Exception:
-            return False
-    return False
-
-def flatten_all_positions_tp():
-    pos = list_open_positions_tp()
-    if not pos:
-        print("[FLATTEN] No broker positions found or REST not enabled.", flush=True)
-        return
-    print(f"[FLATTEN] Attempting REST close for {len(pos)} positions…", flush=True)
-    closed = 0
-    for p in pos:
-        sym = p.get("symbol") or p.get("ticker") or ""
-        qty = p.get("quantity") or p.get("qty") or None
-        if not sym:
-            continue
-        ok = close_position_tp(sym, qty)
-        closed += 1 if ok else 0
-        time.sleep(0.2)
-    print(f"[FLATTEN] REST close requested for {closed}/{len(pos)} positions.", flush=True)
-
-# =============================
-# Polygon data fetchers
-# =============================
-def fetch_bars_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=lookback_minutes)
-    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
-    js = _get(url, {"adjusted":"true","sort":"asc","limit":"50000"})
-    if not js or not js.get("results"):
-        return pd.DataFrame()
-    df = pd.DataFrame(js["results"])
-    df["ts"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    df = df.set_index("ts").sort_index()
-    try:
-        df.index = df.index.tz_convert(MARKET_TZ)
-    except Exception:
-        df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
-    df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
-    return df[["open","high","low","close","volume"]]
-
-def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
-    if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
-        return pd.DataFrame()
-    rule = f"{int(tf_min)}min"
-    agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
-    try:
-        bars = df1m.resample(rule, origin="start_day", label="right").agg(agg).dropna()
-    except Exception:
-        bars = pd.DataFrame()
-    return bars
-
-def fetch_polygon_universe(max_pages: int = 2) -> list:
-    out = []
-    url = "https://api.polygon.io/v3/reference/tickers"
-    page_token = None
-    pages = 0
-    while pages < max_pages:
-        params = {"market":"stocks","active":"true","limit":1000}
-        if page_token:
-            params["page_token"] = page_token
-        js = _get(url, params)
-        if not js or not js.get("results"):
-            break
-        for row in js["results"]:
-            sym = row.get("ticker")
-            exch = (row.get("primary_exchange") or row.get("exchange") or "").upper()
-            if sym and sym.isalnum() and (not ALLOWED_EXCHANGES or exch in ALLOWED_EXCHANGES):
-                out.append(sym)
-        nxt = js.get("next_url", None)
-        if nxt and "page_token=" in nxt:
-            page_token = nxt.split("page_token=")[-1]
-        else:
-            page_token = None
-        pages += 1
-        if not page_token:
-            break
-    if SCANNER_DEBUG:
-        print(f"[UNIVERSE] reference tickers fetched={len(out)} pages={pages}", flush=True)
-    return out
-
-def filter_by_grouped_daily_volume(tickers: list, min_vol: int) -> list:
-    if not tickers:
-        return []
-    today_et = datetime.now(timezone.utc).astimezone(ZoneInfo(MARKET_TZ)).date().strftime("%Y-%m-%d")
-    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{today_et}"
-    js = _get(url, {"adjusted":"true"})
-    if not js or not js.get("results"):
-        return tickers
-    vol_map = {row["T"]: row.get("v", 0) for row in js["results"] if "T" in row}
-    filtered = [t for t in tickers if vol_map.get(t, 0) >= min_vol]
-    if SCANNER_DEBUG:
-        print(f"[VOL FILTER] {len(tickers)} -> {len(filtered)} by grouped-daily v≥{min_vol}", flush=True)
-    return filtered
-
 def get_universe_symbols() -> list:
+    """SCANNER_SYMBOLS override, else Alpaca /v2/assets filtered by ALLOWED_EXCHANGES/MIN_PRICE via adapter."""
     if SCANNER_SYMBOLS:
         return [s.strip().upper() for s in SCANNER_SYMBOLS.split(",") if s.strip()]
-    base = fetch_polygon_universe(MAX_UNIVERSE_PAGES)
-    if USE_GROUPED_DAILY_PREFILTER and base:
-        base = filter_by_grouped_daily_volume(base, SCANNER_MIN_AVG_VOL)
-    return base
+    syms = _alpaca_universe(limit=10000)
+    # NOTE: Polygon grouped-daily prefilter has no 1:1 Alpaca equivalent; skipping by design.
+    if USE_GROUPED_DAILY_PREFILTER and SCANNER_DEBUG:
+        print("[VOL FILTER] Skipped Polygon grouped-daily prefilter (no direct Alpaca equivalent).", flush=True)
+    return syms
 
 # =============================
-# Webhook I/O to TradersPost
-# =============================
-def _throttle_ok():
-    now = time.time()
-    while _order_times and now - _order_times[0] > 60:
-        _order_times.popleft()
-    if len(_order_times) >= MAX_ORDERS_PER_MIN:
-        return False, f"throttled: {len(_order_times)}/{MAX_ORDERS_PER_MIN} in last 60s"
-    _order_times.append(now)
-    return True, ""
-
-def _tp_translate_action(action: str) -> str:
-    """
-    Normalize internal actions to TradersPost-accepted actions.
-    - buy, sell are passthrough
-    - sell_short -> sell
-    - buy_to_cover -> buy
-    - exit/flatten/close -> exit
-    """
-    a = (action or "").lower()
-    if a in ("sell_short", "short", "sell_to_open"):
-        return "sell"
-    if a in ("buy_to_cover", "cover", "buy_to_close"):
-        return "buy"
-    if a in ("close", "flatten", "exit"):
-        return "exit"
-    return a
-
-def build_payload(symbol: str, sig: dict):
-    raw_action = sig.get("action")
-    action     = _tp_translate_action(raw_action)
-    order_type = sig.get("orderType","market")
-    qty        = int(sig.get("quantity", 0))
-    payload = {"ticker": symbol, "action": action, "orderType": order_type, "quantity": qty, "meta": {}}
-    if isinstance(sig.get("meta"), dict):
-        payload["meta"].update(sig["meta"])
-    if sig.get("barTime"):
-        payload["meta"]["barTime"] = sig["barTime"]
-    if order_type.lower() == "limit" and sig.get("price") is not None:
-        payload["limitPrice"] = float(round(sig["price"], 2))
-    tp_abs = sig.get("tp_abs", sig.get("takeProfit"))
-    sl_abs = sig.get("sl_abs", sig.get("stopLoss"))
-    if tp_abs is not None:
-        payload["takeProfit"] = {"limitPrice": float(round(tp_abs, 2))}
-    if sl_abs is not None:
-        payload["stopLoss"] = {"type":"stop", "stopPrice": float(round(sl_abs, 2))}
-    return payload
-
-def send_to_broker(payload: dict):
-    try:
-        if DRY_RUN:
-            print(f"[DRY-RUN] {json.dumps(payload)[:500]}", flush=True)
-            return True, "dry-run"
-        if not TP_URL:
-            print("[ERROR] TP_WEBHOOK_URL missing.", flush=True)
-            return False, "no-webhook-url"
-        ok, msg = _throttle_ok()
-        if not ok:
-            return False, msg
-        payload.setdefault("meta", {})
-        payload["meta"]["environment"] = "paper" if PAPER_MODE else "live"
-        payload["meta"]["sentAt"] = datetime.now(timezone.utc).isoformat()
-        r = requests.post(TP_URL, json=payload, timeout=12)
-        info = f"{r.status_code} {r.text[:300]}"
-        return (200 <= r.status_code < 300), info
-    except Exception as e:
-        return False, f"exception: {e}"
-
-# =============================
-# Performance tracking (local)
+# Performance tracking (unchanged)
 # =============================
 def _combo_key(strategy: str, symbol: str, tf_min: int) -> str:
     return f"{strategy}|{symbol}|{int(tf_min)}"
@@ -461,7 +224,6 @@ def _record_open_trade(strat_name: str, symbol: str, tf_min: int, sig: dict):
     _perf_init(combo)
     tp = sig.get("tp_abs", sig.get("takeProfit"))
     sl = sig.get("sl_abs", sig.get("stopLoss"))
-    # Normalize side to "buy" or "sell" (shorts treated as "sell")
     side_norm = "sell" if sig["action"] in ("sell", "sell_short") else "buy"
     t = LiveTrade(
         combo=combo, symbol=symbol, tf_min=int(tf_min), side=side_norm,
@@ -493,7 +255,7 @@ def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, c
             print(f"[CLOSE] {t.combo} {t.reason.upper()} qty={t.qty} entry={t.entry:.2f} exit={t.exit:.2f} pnl={pnl:+.2f}", flush=True)
 
 # =============================
-# Sentiment
+# Sentiment (unchanged)
 # =============================
 def compute_sentiment():
     look_min = max(5, SENTIMENT_LOOKBACK_MIN)
@@ -520,7 +282,7 @@ def compute_sentiment():
     return "neutral"
 
 # =============================
-# ML adapter with sentiment regime
+# ML adapter with sentiment regime (unchanged)
 # =============================
 def _ml_features_and_pred(bars: pd.DataFrame):
     try:
@@ -590,29 +352,27 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
             want_short = False
         elif sentiment == "bear":
             want_long = False
-        # neutral -> allow both
 
     if want_long:
         qty = _position_qty(price, long_sl)
         if qty > 0:
             return {"action":"buy","orderType":"market","price":None,
-                    "takeProfit": long_tp,"stopLoss": long_sl,
+                    "tp_abs": long_tp,"sl_abs": long_sl,
                     "barTime": ts.tz_convert("UTC").isoformat(),"entry": price,
                     "quantity": int(qty),
                     "meta":{"note":"ml_pattern_long","proba_up": proba_up,"sentiment": sentiment}}
     if want_short:
         qty = _position_qty(price, short_sl)
         if qty > 0:
-            # keep your internal intent as "sell_short" (translator will map to "sell")
             return {"action":"sell_short","orderType":"market","price":None,
-                    "takeProfit": short_tp,"stopLoss": short_sl,
+                    "tp_abs": short_tp,"sl_abs": short_sl,
                     "barTime": ts.tz_convert("UTC").isoformat(),"entry": price,
                     "quantity": int(qty),
                     "meta":{"note":"ml_pattern_short","proba_up": proba_up,"sentiment": sentiment}}
     return None
 
 # =============================
-# Equity / guards
+# Equity / guards (swap REST equity source)
 # =============================
 def _realized_day_pnl() -> float:
     return sum(float(p.get("net_pnl", 0.0)) for p in PERF.values())
@@ -644,28 +404,24 @@ def _opposite(action: str) -> str:
     return "exit"
 
 def flatten_all_open_positions_webhook():
-    posted = 0
+    """
+    Replace legacy webhook flatten with direct broker flatten.
+    """
+    ok = close_all_positions()
+    print(f"[FLATTEN] close_all_positions -> ok={bool(ok)}", flush=True)
+    # Mark locals closed
     for (sym, tf), trades in list(OPEN_TRADES.items()):
         for t in trades:
-            if not t.is_open or not t.qty or not t.symbol:
-                continue
-            payload = {
-                "ticker": t.symbol,
-                "action": "exit",  # generic close on TP
-                "orderType": "market",
-                "meta": {"note": "auto-flatten", "combo": t.combo, "triggeredAt": datetime.now(timezone.utc).isoformat()}
-            }
-            ok, info = send_to_broker(payload)
-            print(f"[FLATTEN-LOCAL] {t.combo} -> ok={ok} info={info}", flush=True)
-            posted += 1
-            t.is_open = False; t.exit_time = datetime.now(timezone.utc).isoformat(); t.exit = t.entry; t.reason = "flatten"
-    print(f"[FLATTEN-LOCAL] Requests posted: {posted}", flush=True)
+            if t.is_open:
+                t.is_open = False
+                t.exit_time = datetime.now(timezone.utc).isoformat()
+                t.exit = t.entry
+                t.reason = "flatten"
 
 def ensure_session_baseline():
     """
     Establish broker-equity session baseline once per day if using broker guard.
-    If SESSION_START_EQUITY env provided, prefer that; else pull from TP.
-    If SESSION_BASELINE_AT_0930=1, waits until >= 09:30 ET.
+    Uses Alpaca equity via adapter when enabled.
     """
     global SESSION_START_EQUITY, EQUITY_BASELINE_DATE, EQUITY_BASELINE_SET, EQUITY_HIGH_WATER
     if not USE_BROKER_EQUITY_GUARD:
@@ -680,19 +436,16 @@ def ensure_session_baseline():
     if SESSION_BASELINE_AT_0930 and not _after_0930_now():
         return
     if SESSION_START_EQUITY is None:
-        SESSION_START_EQUITY = get_equity_from_tp(EQUITY_USD)
+        SESSION_START_EQUITY = get_account_equity(EQUITY_USD)
     EQUITY_HIGH_WATER = SESSION_START_EQUITY
     EQUITY_BASELINE_SET = True
     print(f"[SESSION] Baseline set: session_start_equity={SESSION_START_EQUITY:.2f}", flush=True)
 
 def _active_equity_and_limits():
-    """
-    Returns (equity_now, up_limit, down_limit, mode_str) for guard evaluation.
-    """
     if USE_BROKER_EQUITY_GUARD:
         ensure_session_baseline()
         base = SESSION_START_EQUITY if SESSION_START_EQUITY is not None else EQUITY_USD
-        eq_now = get_equity_from_tp(base)
+        eq_now = get_account_equity(base)
         up_lim = base * (1.0 + DAILY_TP_PCT)
         dn_lim = base * (1.0 - DAILY_DD_PCT)
         return eq_now, up_lim, dn_lim, "broker"
@@ -709,20 +462,13 @@ def check_kill_switch() -> bool:
         print(f"[GUARD] Kill switch ON (mode={KILL_SWITCH_MODE}). Trading halted.", flush=True)
         if KILL_SWITCH_MODE == "flatten":
             flatten_all_open_positions_webhook()
-            if _tp_rest_ok():
-                flatten_all_positions_tp()
         return True
     return HALTED
 
 def check_daily_guards():
-    """
-    Evaluates profit target / drawdown and trailing DD on the selected equity mode.
-    Sets HALT_TRADING/HALTED and optionally flattens.
-    """
     global HALT_TRADING, HALTED, EQUITY_HIGH_WATER
     eq_now, up_lim, dn_lim, mode = _active_equity_and_limits()
 
-    # Update high-water
     if EQUITY_HIGH_WATER is None:
         EQUITY_HIGH_WATER = eq_now
     else:
@@ -738,15 +484,11 @@ def check_daily_guards():
             print(f"[GUARD:{mode}] ✅ Profit target hit. Halting entries.", flush=True)
             if DAILY_FLATTEN_ON_HIT:
                 flatten_all_open_positions_webhook()
-                if _tp_rest_ok():
-                    flatten_all_positions_tp()
         elif eq_now <= dn_lim and not HALTED:
             HALT_TRADING = True; HALTED = True
             print(f"[GUARD:{mode}] ⛔ Drawdown limit hit. Halting entries.", flush=True)
             if DAILY_FLATTEN_ON_HIT:
                 flatten_all_open_positions_webhook()
-                if _tp_rest_ok():
-                    flatten_all_positions_tp()
 
     if TRAIL_GUARD_ENABLED and EQUITY_HIGH_WATER and not HALTED:
         trail_floor = EQUITY_HIGH_WATER * (1.0 - TRAIL_DD_PCT)
@@ -755,8 +497,6 @@ def check_daily_guards():
             print(f"[GUARD:{mode}] 🛑 Trailing DD hit ({TRAIL_DD_PCT:.0%} from peak).", flush=True)
             if TRAIL_FLATTEN_ON_HIT:
                 flatten_all_open_positions_webhook()
-                if _tp_rest_ok():
-                    flatten_all_positions_tp()
 
 def reset_daily_state_if_new_day():
     global DAY_STAMP, HALT_TRADING, HALTED, EQUITY_HIGH_WATER
@@ -769,46 +509,22 @@ def reset_daily_state_if_new_day():
         print(f"[NEW DAY] State reset. START_EQUITY={START_EQUITY:.2f} DAY={DAY_STAMP}", flush=True)
 
 # =============================
-# Routing & signal handling
+# Routing & signal handling (send via Alpaca bridge)
 # =============================
-def compute_signal(strategy_name, symbol, tf_minutes, df1m=None, sentiment="neutral"):
-    if df1m is None or getattr(df1m, "empty", True):
-        df1m = fetch_bars_1m(symbol, lookback_minutes=max(240, tf_minutes*240))
-        if df1m is None or df1m.empty:
-            return None
-    if not isinstance(df1m.index, pd.DatetimeIndex):
-        try:
-            df1m.index = pd.to_datetime(df1m.index, utc=True)
-        except Exception:
-            return None
-    try:
-        df1m.index = df1m.index.tz_convert(MARKET_TZ)
-    except Exception:
-        df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
-
-    # price & volume gates (+ MTM cache)
-    try:
-        last_px = float(df1m["close"].iloc[-1])
-        LAST_PRICE[symbol] = last_px
-        if last_px < MIN_PRICE:
-            return None
-    except Exception:
-        return None
-
-    today_mask = df1m.index.date == df1m.index[-1].date()
-    todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
-    if todays_vol < SCANNER_MIN_TODAY_VOL:
-        return None
-
-    if strategy_name == "ml_pattern":
-        return signal_ml_pattern(
-            symbol, df1m, tf_minutes,
-            conf_threshold=CONF_THR, r_multiple=R_MULT,
-            sentiment=sentiment, shorts_enabled=SHORTS_ENABLED
-        )
-    return None
+def _throttle_ok():
+    now = time.time()
+    while _order_times and now - _order_times[0] > 60:
+        _order_times.popleft()
+    if len(_order_times) >= MAX_ORDERS_PER_MIN:
+        return False, f"throttled: {len(_order_times)}/{MAX_ORDERS_PER_MIN} in last 60s"
+    _order_times.append(now)
+    return True, ""
 
 def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
+    ok_throttle, why = _throttle_ok()
+    if not ok_throttle:
+        print(f"[THROTTLE] {why}", flush=True); return
+
     combo_key = _combo_key(strat_name, symbol, tf_min)
     COUNTS["signals"] += 1
     COMBO_COUNTS[f"{combo_key}::signals"] += 1
@@ -816,18 +532,20 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
     meta["combo"] = combo_key
     meta["timeframe"] = f"{int(tf_min)}m"
     sig["meta"] = meta
+
     _record_open_trade(strat_name, symbol, tf_min, sig)
-    payload = build_payload(symbol, sig)
-    ok, info = send_to_broker(payload)
+
+    # Send via Alpaca adapter
+    ok, info = send_to_broker(symbol, sig, strategy_tag=strat_name)
     try:
-        (COMBO_COUNTS if ok else COMBO_COUNTS)[f"{combo_key}::orders.{'ok' if ok else 'err'}"] += 1
+        COMBO_COUNTS[f"{combo_key}::orders.{'ok' if ok else 'err'}"] += 1
         COUNTS["orders.ok" if ok else "orders.err"] += 1
     except Exception:
         pass
     print(f"[ORDER] {combo_key} -> action={sig.get('action')} qty={sig.get('quantity')} ok={ok} info={info}", flush=True)
 
 # =============================
-# Universe scan loop (batching)
+# Universe scan loop (batching) (unchanged)
 # =============================
 def _batched_symbols(universe: list):
     global _rr_idx
@@ -841,7 +559,7 @@ def _batched_symbols(universe: list):
     return batch
 
 # =============================
-# Main
+# Main (unchanged except Polygon/TP refs removed)
 # =============================
 def main():
     print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD=python app_scanner_merged.py", flush=True)
@@ -849,11 +567,6 @@ def main():
     print(f"[BOOT] CONF_THR={CONF_THR} R_MULT={R_MULT} SHORTS_ENABLED={int(SHORTS_ENABLED)} USE_SENTIMENT_REGIME={int(USE_SENTIMENT_REGIME)}", flush=True)
     print(f"[BOOT] DAILY_GUARD_ENABLED={int(DAILY_GUARD_ENABLED)} UP={DAILY_TP_PCT:.0%} DOWN={DAILY_DD_PCT:.0%} FLATTEN={int(DAILY_FLATTEN_ON_HIT)}", flush=True)
     print(f"[BOOT] BROKER_GUARD={int(USE_BROKER_EQUITY_GUARD)} BASELINE_AT_0930={int(SESSION_BASELINE_AT_0930)} TRAIL_DD={TRAIL_DD_PCT:.0%}", flush=True)
-
-    # if not POLYGON_API_KEY:
-    #    print("[FATAL] POLYGON_API_KEY missing.", flush=True); return
-    #if not TP_URL and not DRY_RUN:
-    #    print("[FATAL] TP_WEBHOOK_URL missing (or set DRY_RUN=1).", flush=True); return
 
     # Universe
     symbols = get_universe_symbols()
@@ -869,7 +582,7 @@ def main():
         try:
             reset_daily_state_if_new_day()
 
-            # --- Close phase: update prices, check TP/SL on open trades
+            # --- Close phase
             touched = set((k[0], k[1]) for k in OPEN_TRADES.keys())
             for (sym, tf) in touched:
                 try:
@@ -889,7 +602,7 @@ def main():
                 except Exception as e:
                     print(f"[CLOSE-PHASE ERROR] {sym} {tf}m: {e}", flush=True)
 
-            # --- Guards (kill switch, daily, trailing)
+            # --- Guards
             if check_kill_switch():
                 pass
             else:
@@ -918,13 +631,11 @@ def main():
                     if not sig:
                         continue
 
-                    # De-dupe per (strategy|symbol|tf|action|barTime)
                     dk = hashlib.sha256(f"ml_pattern|{sym}|{tf}|{sig['action']}|{sig.get('barTime','')}".encode()).hexdigest()
                     if dk in _sent_keys:
                         continue
                     _sent_keys.add(dk)
 
-                    # Concurrent cap (just-in-time)
                     open_positions = sum(1 for lst in OPEN_TRADES.values() for t in lst if t.is_open)
                     if open_positions >= MAX_CONCURRENT_POSITIONS:
                         print(f"[LIMIT] Max concurrent reached: {open_positions}/{MAX_CONCURRENT_POSITIONS}", flush=True)
@@ -937,8 +648,6 @@ def main():
             if now_et.hour == 16 and now_et.minute < 10:
                 print("[EOD] Auto-flatten window.", flush=True)
                 flatten_all_open_positions_webhook()
-                if _tp_rest_ok():
-                    flatten_all_positions_tp()
 
         except Exception as e:
             import traceback
@@ -946,6 +655,45 @@ def main():
 
         elapsed = time.time() - loop_start
         time.sleep(max(1, POLL_SECONDS - int(elapsed)))
+
+# =============================
+# Signal computation (unchanged)
+# =============================
+def compute_signal(strategy_name, symbol, tf_minutes, df1m=None, sentiment="neutral"):
+    if df1m is None or getattr(df1m, "empty", True):
+        df1m = fetch_bars_1m(symbol, lookback_minutes=max(240, tf_minutes*240))
+        if df1m is None or df1m.empty:
+            return None
+    if not isinstance(df1m.index, pd.DatetimeIndex):
+        try:
+            df1m.index = pd.to_datetime(df1m.index, utc=True)
+        except Exception:
+            return None
+    try:
+        df1m.index = df1m.index.tz_convert(MARKET_TZ)
+    except Exception:
+        df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
+
+    try:
+        last_px = float(df1m["close"].iloc[-1])
+        LAST_PRICE[symbol] = last_px
+        if last_px < MIN_PRICE:
+            return None
+    except Exception:
+        return None
+
+    today_mask = df1m.index.date == df1m.index[-1].date()
+    todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
+    if todays_vol < SCANNER_MIN_TODAY_VOL:
+        return None
+
+    if strategy_name == "ml_pattern":
+        return signal_ml_pattern(
+            symbol, df1m, tf_minutes,
+            conf_threshold=CONF_THR, r_multiple=R_MULT,
+            sentiment=sentiment, shorts_enabled=SHORTS_ENABLED
+        )
+    return None
 
 if __name__ == "__main__":
     main()
