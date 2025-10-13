@@ -1,5 +1,7 @@
-# app_scanner.py — dynamic market scanner -> TradersPost (paper/live)
+# scanner_alpaca.py — dynamic market scanner (PLUMBING SWAP: Polygon/TP -> Alpaca)
 # Requires: pandas, numpy, requests, pandas_ta, scikit-learn
+#
+# ✅ Models/ML logic unchanged. Only data + broker I/O rewired to Alpaca.
 
 import os, time, json, math, requests
 import pandas as pd, numpy as np
@@ -8,16 +10,21 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
-from adapters.data_alpaca import fetch_1m as fetch_bars_1m, resample, get_universe_symbols
-from common.signal_bridge import send_to_broker, close_all_positions, list_positions, get_account_equity
+# ---- Alpaca adapters (data + broker) ----
+from adapters.data_alpaca import (
+    fetch_1m as _alpaca_fetch_1m,
+    get_universe_symbols as _alpaca_universe,
+)
+from common.signal_bridge import (
+    send_to_broker,           # usage: send_to_broker(symbol, sig, strategy_tag="ml_pattern")
+    close_all_positions,
+    list_positions,
+    get_account_equity,
+)
 
 # ==============================
-# ENV / CONFIG
+# ENV / CONFIG (unchanged where possible)
 # ==============================
-TP_URL = os.getenv("TP_WEBHOOK_URL", "")
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
-
-# Poll cadence & diagnostics
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 DRY_RUN = os.getenv("DRY_RUN", "0").lower() in ("1","true","yes")
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() != "false"
@@ -26,20 +33,20 @@ SCANNER_DEBUG = os.getenv("SCANNER_DEBUG", "0").lower() in ("1","true","yes")
 # Timeframes list (comma-separated)
 TF_MIN_LIST = [int(x) for x in os.getenv("TF_MIN_LIST", "5").split(",")]
 
-# Universe paging/size
-MAX_UNIVERSE_PAGES = int(os.getenv("MAX_UNIVERSE_PAGES", "3"))   # pages of /v3/reference/tickers (1000 per page)
-SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "150"))        # how many tickers per loop iteration
+# Universe paging/size (Polygon-era knobs; keep but no-op for Alpaca paging)
+MAX_UNIVERSE_PAGES = int(os.getenv("MAX_UNIVERSE_PAGES", "3"))
+SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "150"))
 
-# Liquidity filter (daily volume)
-SCANNER_MIN_AVG_VOL = int(os.getenv("SCANNER_MIN_AVG_VOL", "1000000"))  # default 1,000,000 shares
+# Liquidity filter (kept for compatibility; grouped-daily prefilter is skipped under Alpaca)
+SCANNER_MIN_AVG_VOL = int(os.getenv("SCANNER_MIN_AVG_VOL", "1000000"))
 
 RUN_ID = datetime.now().astimezone().strftime("%Y-%m-%d")
-COUNTS = defaultdict(int)        # global counters
-COMBO_COUNTS = defaultdict(int)  # per symbol|tf
-_sent = set()                    # dedupe key set
-_round_robin = 0                 # rotate universe
+COUNTS = defaultdict(int)
+COMBO_COUNTS = defaultdict(int)
+_sent = set()
+_round_robin = 0
 
-# ---- Global position sizing (aligned with your Colab wrapper semantics) ----
+# ---- Global position sizing ----
 EQUITY_USD  = float(os.getenv("EQUITY_USD",  "100000"))
 RISK_PCT    = float(os.getenv("RISK_PCT",    "0.01"))
 MAX_POS_PCT = float(os.getenv("MAX_POS_PCT", "0.10"))
@@ -50,16 +57,15 @@ SCANNER_MARKET_HOURS_ONLY = os.getenv("SCANNER_MARKET_HOURS_ONLY","1").lower() i
 ALLOW_PREMARKET  = os.getenv("ALLOW_PREMARKET","0").lower() in ("1","true","yes")
 ALLOW_AFTERHOURS = os.getenv("ALLOW_AFTERHOURS","0").lower() in ("1","true","yes")
 
+# ==============================
+# Session helpers (unchanged)
+# ==============================
 def _market_session_now():
     now_et = datetime.now(ZoneInfo("America/New_York"))
     t = now_et.time()
-    # Sessions (ET)
-    rth_start = (9,30)
-    rth_end   = (16,0)
-    pre_start = (4,0)
-    pre_end   = (9,30)
-    ah_start  = (16,0)
-    ah_end    = (20,0)
+    rth_start = (9,30); rth_end = (16,0)
+    pre_start = (4,0);  pre_end = (9,30)
+    ah_start  = (16,0); ah_end  = (20,0)
 
     def within(start, end):
         (sh, sm), (eh, em) = start, end
@@ -68,7 +74,6 @@ def _market_session_now():
     in_rth = within(rth_start, rth_end)
     in_pre = ALLOW_PREMARKET  and within(pre_start, pre_end)
     in_ah  = ALLOW_AFTERHOURS and within(ah_start, ah_end)
-
     return in_rth or in_pre or in_ah
 
 def _position_qty(entry_price: float, stop_price: float,
@@ -85,33 +90,28 @@ def _position_qty(entry_price: float, stop_price: float,
     return int(max(qty, min_qty if qty > 0 else 0))
 
 # ==============================
-# Data fetchers (Polygon)
+# Data fetchers (Alpaca replacement for Polygon)
 # ==============================
-def _get(url, params=None, timeout=15):
-    params = params or {}
-    if POLYGON_API_KEY:
-        params["apiKey"] = POLYGON_API_KEY
-    r = requests.get(url, params=params, timeout=timeout)
-    if r.status_code != 200:
-        if SCANNER_DEBUG:
-            print(f"[HTTP {r.status_code}] {url} -> {r.text[:200]}", flush=True)
-        return None
-    return r.json()
-
 def fetch_bars_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
-    """Fetch recent 1m bars as tz-aware ET ohlcv DataFrame."""
+    """
+    Backward-compatible wrapper around Alpaca minute bars.
+    Returns tz-aware ET ohlcv DataFrame (open/high/low/close/volume).
+    """
     end = datetime.now(timezone.utc)
     start = end - timedelta(minutes=lookback_minutes)
-    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{start.strftime('%Y-%m-%d')}/{end.strftime('%Y-%m-%d')}"
-    js = _get(url, {"adjusted":"true","sort":"asc","limit":"50000"})
-    if not js or not js.get("results"):
+    start_iso = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    end_iso = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    df = _alpaca_fetch_1m(symbol, start_iso=start_iso, end_iso=end_iso, limit=10000)
+    if df is None or df.empty:
         return pd.DataFrame()
-    df = pd.DataFrame(js["results"])
-    df["ts"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    df = df.set_index("ts").sort_index()
-    df.index = df.index.tz_convert("America/New_York")
-    df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
-    return df[["open","high","low","close","volume"]]
+    # ensure ET index and expected columns
+    try:
+        df.index = df.index.tz_convert("America/New_York")
+    except Exception:
+        df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
+    # adapters.data_alpaca should already yield ohlcv; keep a safe select:
+    cols = [c for c in ["open","high","low","close","volume"] if c in df.columns]
+    return df[cols].copy() if cols else pd.DataFrame()
 
 def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
     if df1m is None or df1m.empty:
@@ -125,55 +125,23 @@ def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
         bars.index = bars.index.tz_localize("UTC").tz_convert("America/New_York")
     return bars
 
-def fetch_polygon_universe(max_pages: int = 3) -> list[str]:
-    """Pull active US stock tickers via /v3/reference/tickers (paginated)."""
-    out = []
-    url = "https://api.polygon.io/v3/reference/tickers"
-    page_token = None
-    pages = 0
-    while pages < max_pages:
-        params = {
-            "market": "stocks",
-            "active": "true",
-            "limit": 1000
-        }
-        if page_token:
-            params["page_token"] = page_token
-        js = _get(url, params)
-        if not js or not js.get("results"):
-            break
-        for row in js["results"]:
-            sym = row.get("ticker")
-            if sym and sym.isalpha():  # simple guard, ignore funny symbols
-                out.append(sym)
-        page_token = js.get("next_url", None)
-        if page_token and "page_token=" in page_token:
-            page_token = page_token.split("page_token=")[-1]
-        pages += 1
-        if not page_token:
-            break
+def build_universe() -> list[str]:
+    """
+    Env override OR Alpaca assets universe. Polygon grouped-daily volume prefilter
+    has no 1:1 in Alpaca; we skip it (log once if debug).
+    """
+    manual = os.getenv("SCANNER_SYMBOLS", "").strip()
+    if manual:
+        return [s.strip().upper() for s in manual.split(",") if s.strip()]
+    syms = _alpaca_universe(limit=10000)
     if SCANNER_DEBUG:
-        print(f"[UNIVERSE] fetched {len(out)} tickers across {pages} page(s).", flush=True)
-    return out
-
-def filter_by_daily_volume(tickers: list[str], min_vol: int) -> list[str]:
-    """Use grouped daily to get today's volumes quickly, then filter."""
-    if not tickers:
-        return []
-    # today's date ET
-    today_et = datetime.now(timezone.utc).astimezone().date().strftime("%Y-%m-%d")
-    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{today_et}"
-    js = _get(url, {"adjusted":"true"})
-    if not js or not js.get("results"):
-        return tickers  # fallback: no filter
-    vol_map = {row["T"]: row.get("v", 0) for row in js["results"] if "T" in row}
-    filtered = [t for t in tickers if vol_map.get(t, 0) >= min_vol]
-    if SCANNER_DEBUG:
-        print(f"[VOL FILTER] {len(tickers)} -> {len(filtered)} tickers with v≥{min_vol}", flush=True)
-    return filtered
+        print(f"[UNIVERSE] fetched {len(syms)} tickers via Alpaca assets.", flush=True)
+        if SCANNER_MIN_AVG_VOL:
+            print("[UNIVERSE] NOTE: Polygon grouped-daily prefilter skipped under Alpaca.", flush=True)
+    return syms
 
 # ==============================
-# ML strategy adapter (live signal)
+# ML strategy adapter (unchanged)
 # ==============================
 def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
                       conf_threshold: float = 0.8,
@@ -185,9 +153,8 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
       - train simple RF on features
       - if last bar predicts 1 with prob>threshold AND volume > min_volume_mult * rolling avg
       - go long with 1% SL and TP = r_multiple * 1% above entry
-    Returns a dict signal compatible with TradersPost payload builder.
+    Returns a dict signal; order routing handled by Alpaca bridge.
     """
-    # Lazy imports (so worker still boots if packages missing)
     try:
         import pandas_ta as ta  # noqa: F401
         from sklearn.ensemble import RandomForestClassifier
@@ -200,15 +167,12 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
     if bars is None or bars.empty or len(bars) < 120:
         return None
 
-    # features
     bars = bars.copy()
     bars["return"] = bars["close"].pct_change()
-    # RSI via pandas-ta
     try:
         import pandas_ta as ta
         bars["rsi"] = ta.rsi(bars["close"], length=14)
     except Exception:
-        # fallback simple RSI-ish
         delta = bars["close"].diff()
         up = delta.clip(lower=0).rolling(14).mean()
         down = -delta.clip(upper=0).rolling(14).mean()
@@ -222,7 +186,6 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
     X = bars[["return", "rsi", "volatility"]]
     y = (bars["close"].shift(-1) > bars["close"]).astype(int)
 
-    # train/test split
     train_size = int(len(X) * 0.7)
     if train_size < 50:
         return None
@@ -231,7 +194,6 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
     if X_test.empty:
         return None
 
-    # train RF
     try:
         model = RandomForestClassifier(n_estimators=n_estimators, random_state=42)
         model.fit(X_train, y_train)
@@ -240,7 +202,6 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
             print(f"[ML TRAIN ERR] {symbol} tf={tf_min}: {e}", flush=True)
         return None
 
-    # infer last row
     prob = model.predict_proba(X_test)[:, 1]
     preds = (prob > 0.5).astype(int)
 
@@ -248,15 +209,13 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
     bars_live["prediction"] = preds
     bars_live["confidence"] = prob
 
-    # volume filter proxy (rolling mean over available test bars)
     avg_volume = bars_live["volume"].rolling(50).mean().fillna(bars_live["volume"].mean())
-
     last = bars_live.iloc[-1]
     ts = bars_live.index[-1]
+
     if (last["prediction"] == 1) and (last["confidence"] >= conf_threshold):
         if min_volume_mult > 0.0:
             try:
-                # guard if rolling mean NaN very early
                 i = len(bars_live) - 1
                 if not (last["volume"] > min_volume_mult * avg_volume.iloc[i]):
                     return None
@@ -264,10 +223,9 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
                 pass
 
         entry = float(last["close"])
-        sl = entry * 0.99                            # 1% stop
-        tp = entry * (1.0 + 0.01 * r_multiple)       # r_multiple * 1% take profit
+        sl = entry * 0.99
+        tp = entry * (1.0 + 0.01 * r_multiple)
         qty = _position_qty(entry, sl)
-
         if qty <= 0:
             return None
 
@@ -285,76 +243,16 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
     return None
 
 # ==============================
-# TradersPost helpers
+# Dedupe helper (unchanged)
 # ==============================
 def _dedupe_key(symbol: str, tf: int, action: str, bar_time: str) -> str:
     raw = f"{symbol}|{tf}|{action}|{bar_time}"
     import hashlib
     return hashlib.sha256(raw.encode()).hexdigest()
 
-def build_payload(symbol: str, sig: dict) -> dict:
-    """
-    TradersPost requires absolute TP/SL as nested objects.
-    """
-    payload = {
-        "ticker": symbol,
-        "action": sig["action"],
-        "orderType": sig.get("orderType", "market"),
-        "quantity": int(sig["quantity"]),
-        "meta": sig.get("meta", {})
-    }
-
-    # absolute prices
-    tp_abs = sig.get("tp_abs")
-    sl_abs = sig.get("sl_abs")
-    if tp_abs is not None:
-        payload["takeProfit"] = {"limitPrice": float(round(tp_abs, 2))}
-    if sl_abs is not None:
-        payload["stopLoss"] = {"type": "stop", "stopPrice": float(round(sl_abs, 2))}
-
-    # helpful audit fields
-    payload["meta"]["environment"] = "paper" if PAPER_MODE else "live"
-    if sig.get("barTime"):
-        payload["meta"]["barTime"] = sig["barTime"]
-    payload["meta"]["runId"] = RUN_ID
-    return payload
-
-def send_to_broker(payload: dict):
-    if DRY_RUN:
-        print(f"[DRY-RUN] {json.dumps(payload)[:500]}", flush=True)
-        return True, "dry-run"
-    if not TP_URL:
-        print("[ERROR] TP_WEBHOOK_URL is missing/empty.", flush=True)
-        return False, "no-webhook"
-    try:
-        r = requests.post(TP_URL, json=payload, timeout=12)
-        ok = 200 <= r.status_code < 300
-        info = f"{r.status_code} {r.text[:300]}"
-        if not ok:
-            print(f"[POST ERROR] {info}", flush=True)
-        return ok, info
-    except Exception as e:
-        import traceback
-        print("[POST EXCEPTION]", e, traceback.format_exc(), flush=True)
-        return False, f"exception: {e}"
-
 # ==============================
-# Scanner loop
+# Scanner loop (unchanged logic; Alpaca plumbing)
 # ==============================
-def build_universe():
-    # 1) fetch active stocks (paged)
-    universe = fetch_polygon_universe(MAX_UNIVERSE_PAGES)
-    if not universe:
-        print("[UNIVERSE] Empty; check POLYGON_API_KEY / permissions.", flush=True)
-        return []
-
-    # 2) volume filter using grouped daily
-    liquid = filter_by_daily_volume(universe, SCANNER_MIN_AVG_VOL)
-    if not liquid:
-        print("[UNIVERSE] Volume filter removed everything; lowering threshold?", flush=True)
-        return universe  # fallback to full set if filter too strict
-    return liquid
-
 def scan_once(universe: list[str]):
     global _round_robin
 
@@ -366,7 +264,6 @@ def scan_once(universe: list[str]):
     if not universe:
         return
 
-    # rotate through universe in batches to control request rate
     N = len(universe)
     start = _round_robin % max(1, N)
     end = min(N, start + SCAN_BATCH_SIZE)
@@ -377,12 +274,10 @@ def scan_once(universe: list[str]):
         print(f"[SCAN] symbols {start}:{end} / {N}  (batch={len(batch)})", flush=True)
 
     for sym in batch:
-        # pull once and reuse for all TFs to save API calls
         try:
-            df1m = fetch_bars_1m(sym, lookback_minutes=2400)  # ~ 40 hours
+            df1m = fetch_bars_1m(sym, lookback_minutes=2400)  # ~40h
             if df1m is None or df1m.empty:
                 continue
-            # ensure tz ET
             try:
                 df1m.index = df1m.index.tz_convert("America/New_York")
             except Exception:
@@ -399,7 +294,7 @@ def scan_once(universe: list[str]):
                     conf_threshold=0.8,
                     n_estimators=100,
                     r_multiple=3.0,
-                    min_volume_mult=0.0  # you said you only care that it's tradable; set >0 to enforce volume spike
+                    min_volume_mult=0.0
                 )
                 if not sig:
                     continue
@@ -410,10 +305,11 @@ def scan_once(universe: list[str]):
                 _sent.add(k)
 
                 if SCANNER_MARKET_HOURS_ONLY and not _market_session_now():
-                    continue  # if the session flipped while scanning, skip sends
+                    continue  # session flipped while scanning
 
-                payload = build_payload(sym, sig)
-                ok, info = send_to_broker(payload)
+                # ---- Alpaca bridge send (plumbing swap) ----
+                ok, info = send_to_broker(sym, sig, strategy_tag="ml_pattern")
+
                 COUNTS["signals"] += 1
                 stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{stamp}] ml_pattern {sym} {tf}m -> {sig['action']} qty={sig['quantity']} | {info}", flush=True)
@@ -430,12 +326,6 @@ def scan_once(universe: list[str]):
 
 def main():
     print("Scanner starting…", flush=True)
-    if not POLYGON_API_KEY:
-        print("[FATAL] POLYGON_API_KEY missing.", flush=True)
-        return
-    if not TP_URL and not DRY_RUN:
-        print("[FATAL] TP_WEBHOOK_URL missing (or set DRY_RUN=1).", flush=True)
-        return
 
     universe = build_universe()
     print(f"[READY] Universe size: {len(universe)}  TFs: {TF_MIN_LIST}  Batch: {SCAN_BATCH_SIZE}", flush=True)
