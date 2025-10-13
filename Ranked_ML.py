@@ -183,6 +183,39 @@ def get_universe_symbols() -> list:
     return [s for s in syms if isinstance(s, str) and s.isalnum()]
 
 # =============================
+# Sentiment
+# =============================
+def compute_sentiment():
+    """Simple intraday momentum on SENTIMENT_SYMBOLS within SENTIMENT_NEUTRAL_BAND."""
+    look_min = max(5, SENTIMENT_LOOKBACK_MIN)
+    vals = []
+    for s in SENTIMENT_SYMBOLS:
+        try:
+            df = fetch_bars_1m(s, lookback_minutes=look_min * 2)
+        except TypeError:
+            # in case the adapter signature differs; but our wrapper above keeps it
+            df = fetch_bars_1m(s)
+        if df is None or df.empty:
+            continue
+        try:
+            df.index = df.index.tz_convert(MARKET_TZ)
+        except Exception:
+            df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
+        window = df.iloc[-look_min:]
+        if len(window) < 2:
+            continue
+        vals.append(float(window["close"].iloc[-1]) / float(window["close"].iloc[0]) - 1.0)
+
+    if not vals:
+        return "neutral"
+    avg = sum(vals) / len(vals)
+    if avg >= SENTIMENT_NEUTRAL_BAND:
+        return "bull"
+    if avg <= -SENTIMENT_NEUTRAL_BAND:
+        return "bear"
+    return "neutral"
+
+# =============================
 # Strategy: ML Pattern (live adapter)
 # =============================
 def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
