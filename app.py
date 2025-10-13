@@ -57,11 +57,16 @@ SCANNER_MARKET_HOURS_ONLY = os.getenv("SCANNER_MARKET_HOURS_ONLY","1").lower() i
 ALLOW_PREMARKET  = os.getenv("ALLOW_PREMARKET","0").lower() in ("1","true","yes")
 ALLOW_AFTERHOURS = os.getenv("ALLOW_AFTERHOURS","0").lower() in ("1","true","yes")
 
+# Trading state flag (used by EOD logic to stop new entries)
+HALT_TRADING = False
+
+MARKET_TZ = "America/New_York"
+
 # ==============================
 # Session helpers (unchanged)
 # ==============================
 def _market_session_now():
-    now_et = datetime.now(ZoneInfo("America/New_York"))
+    now_et = datetime.now(ZoneInfo(MARKET_TZ))
     t = now_et.time()
     rth_start = (9,30); rth_end = (16,0)
     pre_start = (4,0);  pre_end = (9,30)
@@ -106,10 +111,9 @@ def fetch_bars_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
         return pd.DataFrame()
     # ensure ET index and expected columns
     try:
-        df.index = df.index.tz_convert("America/New_York")
+        df.index = df.index.tz_convert(MARKET_TZ)
     except Exception:
-        df.index = df.index.tz_localize("UTC").tz_convert("America/New_York")
-    # adapters.data_alpaca should already yield ohlcv; keep a safe select:
+        df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
     cols = [c for c in ["open","high","low","close","volume"] if c in df.columns]
     return df[cols].copy() if cols else pd.DataFrame()
 
@@ -120,9 +124,9 @@ def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
     agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
     bars = df1m.resample(rule, origin="start_day", label="right").agg(agg).dropna()
     try:
-        bars.index = bars.index.tz_convert("America/New_York")
+        bars.index = bars.index.tz_convert(MARKET_TZ)
     except Exception:
-        bars.index = bars.index.tz_localize("UTC").tz_convert("America/New_York")
+        bars.index = bars.index.tz_localize("UTC").tz_convert(MARKET_TZ)
     return bars
 
 def build_universe() -> list[str]:
@@ -254,7 +258,13 @@ def _dedupe_key(symbol: str, tf: int, action: str, bar_time: str) -> str:
 # Scanner loop (unchanged logic; Alpaca plumbing)
 # ==============================
 def scan_once(universe: list[str]):
-    global _round_robin
+    global _round_robin, HALT_TRADING
+
+    # Respect EOD halt
+    if HALT_TRADING:
+        if SCANNER_DEBUG:
+            print("[SCAN] HALT_TRADING active — skipping new entries.", flush=True)
+        return
 
     if SCANNER_MARKET_HOURS_ONLY and not _market_session_now():
         if SCANNER_DEBUG:
@@ -279,9 +289,9 @@ def scan_once(universe: list[str]):
             if df1m is None or df1m.empty:
                 continue
             try:
-                df1m.index = df1m.index.tz_convert("America/New_York")
+                df1m.index = df1m.index.tz_convert(MARKET_TZ)
             except Exception:
-                df1m.index = df1m.index.tz_localize("UTC").tz_convert("America/New_York")
+                df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
         except Exception as e:
             if SCANNER_DEBUG:
                 print(f"[FETCH ERR] {sym}: {e}", flush=True)
@@ -289,6 +299,10 @@ def scan_once(universe: list[str]):
 
         for tf in TF_MIN_LIST:
             try:
+                # Stop mid-loop if EOD halt flips on
+                if HALT_TRADING:
+                    break
+
                 sig = signal_ml_pattern(
                     sym, df1m, tf_min=tf,
                     conf_threshold=0.8,
@@ -333,7 +347,30 @@ def main():
     while True:
         loop_start = time.time()
         try:
+            # ---- main scan tick ----
             scan_once(universe)
+
+            # ---- EOD management (PRE-CLOSE + SAFETY NET) ----
+            now_et = datetime.now(ZoneInfo(MARKET_TZ))
+
+            # Pre-close auto-flatten window (3:50–4:00 ET)
+            if now_et.hour == 15 and now_et.minute >= 50:
+                print("[EOD] Pre-close flatten window (3:50–4:00 ET).", flush=True)
+                ok, info = close_all_positions()
+                print(f"[EOD] Alpaca flatten -> ok={ok} info={info}", flush=True)
+                # Halt new entries for the remainder of the day
+                global HALT_TRADING
+                HALT_TRADING = True
+
+            # Safety net just after the bell (4:00–4:02 ET)
+            elif now_et.hour == 16 and now_et.minute < 3:
+                pos = list_positions()
+                if pos:
+                    print(f"[EOD] Safety net: positions still open ({len(pos)}). Flattening…", flush=True)
+                    ok, info = close_all_positions()
+                    print(f"[EOD] Safety flatten -> ok={ok} info={info}", flush=True)
+                    # keep HALT_TRADING = True
+
         except Exception as e:
             import traceback
             print("[LOOP ERROR]", e, traceback.format_exc(), flush=True)
