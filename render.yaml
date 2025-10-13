@@ -1,0 +1,129 @@
+# render.yaml — master-bot-v.alpaca (Paper)
+# Push this file to the repo root on GitHub.
+
+envVarGroups:
+  # ===== Shared config & guards (applies to all workers) =====
+  - name: bot-common
+    envVars:
+      # Alpaca paper endpoints + defaults
+      - key: ALPACA_TRADE_BASE_URL
+        value: https://paper-api.alpaca.markets
+      - key: ALPACA_DATA_BASE_URL
+        value: https://data.alpaca.markets
+      - key: ALPACA_PAPER
+        value: "1"
+      - key: ALPACA_TIME_IN_FORCE
+        value: day
+      - key: MARKET_TZ
+        value: America/New_York
+      - key: ALLOWED_EXCHANGES
+        value: NASD,NASDAQ,NYSE,XNAS,XNYS
+      - key: MIN_PRICE
+        value: "3.0"
+
+      # >>> Your existing guard/sizing defaults (tweak if you want global defaults)
+      - key: START_EQUITY
+        value: "100000"
+      - key: DAILY_TP_PCT
+        value: "10"
+      - key: DAILY_DD_PCT
+        value: "5"
+      - key: MAX_CONCURRENT_POSITIONS
+        value: "200"
+      - key: CONF_THR
+        value: "0.7"
+      - key: R_MULT
+        value: "3.0"
+      - key: SCANNER_MIN_TODAY_VOL
+        value: "20000"
+      - key: TF_MIN_LIST
+        value: "1,2,3,5,10"
+
+  # ===== Alpaca accounts (fill these secrets in Render after creating the blueprint) =====
+  - name: alpaca-acct-A   # Shared by Merged + Sentiment
+    envVars:
+      - key: ALPACA_KEY_ID
+        value: ""     # <-- Fill in Render Dashboard
+      - key: ALPACA_SECRET_KEY
+        value: ""     # <-- Fill in Render Dashboard
+  - name: alpaca-acct-B   # Ranked
+    envVars:
+      - key: ALPACA_KEY_ID
+        value: ""
+      - key: ALPACA_SECRET_KEY
+        value: ""
+  - name: alpaca-acct-C   # TradingBot
+    envVars:
+      - key: ALPACA_KEY_ID
+        value: ""
+      - key: ALPACA_SECRET_KEY
+        value: ""
+
+services:
+  # ========== 1) ML_Merged ==========
+  - type: worker
+    name: ml-merged
+    env: docker
+    repo: https://github.com/your-org-or-user/master-bot-v.alpaca
+    branch: main
+    plan: Starter
+    autoDeploy: true
+    dockerfilePath: Dockerfile
+    dockerCommand: python ml_merged_app.py
+    envVarGroups:
+      - bot-common
+      - alpaca-acct-A   # <-- uses account A
+    envVars:
+      - key: STRATEGY_TAG
+        value: ml_merged
+
+  # ========== 2) ML_Sentiment (renamed file) ==========
+  - type: worker
+    name: ml-sentiment
+    env: docker
+    repo: https://github.com/your-org-or-user/master-bot-v.alpaca
+    branch: main
+    plan: Starter
+    autoDeploy: true
+    dockerfilePath: Dockerfile
+    dockerCommand: python ml_sentiment.py   # <-- your renamed file
+    envVarGroups:
+      - bot-common
+      - alpaca-acct-A   # <-- shares account A
+    envVars:
+      - key: STRATEGY_TAG
+        value: ml_sentiment
+
+  # ========== 3) Ranked ==========
+  - type: worker
+    name: ranked
+    env: docker
+    repo: https://github.com/your-org-or-user/master-bot-v.alpaca
+    branch: main
+    plan: Starter
+    autoDeploy: true
+    dockerfilePath: Dockerfile
+    dockerCommand: python Ranked_ML.py
+    envVarGroups:
+      - bot-common
+      - alpaca-acct-B   # <-- uses account B
+    envVars:
+      - key: STRATEGY_TAG
+        value: ranked
+
+  # ========== 4) TradingBot ==========
+  - type: worker
+    name: trading-bot
+    env: docker
+    repo: https://github.com/your-org-or-user/master-bot-v.alpaca
+    branch: main
+    plan: Starter
+    autoDeploy: true
+    dockerfilePath: Dockerfile
+    dockerCommand: python app.py
+    envVarGroups:
+      - bot-common
+      - alpaca-acct-C   # <-- uses account C
+    envVars:
+      - key: STRATEGY_TAG
+        value: trading_bot
