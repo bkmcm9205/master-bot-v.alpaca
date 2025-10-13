@@ -53,8 +53,8 @@ MIN_QTY             = int(os.getenv("MIN_QTY", "1"))
 ROUND_LOT           = int(os.getenv("ROUND_LOT","1"))
 
 # Model thresholds
-CONF_THR            = float(os.getenv("CONF_THR", "0.80"))
-R_MULT              = float(os.getenv("R_MULT", "3.0"))
+CONF_THR            = float(os.getenv("CONF_THR", "0.70"))
+R_MULT              = float(os.getenv("R_MULT", "1.5"))
 
 # Shorts toggle
 SHORTS_ENABLED      = os.getenv("SHORTS_ENABLED","0").lower() in ("1","true","yes")
@@ -69,8 +69,8 @@ HALT_TRADING              = False
 DAY_STAMP                 = datetime.now().astimezone().strftime("%Y-%m-%d")
 
 # Engine guards
-MAX_CONCURRENT_POSITIONS  = int(os.getenv("MAX_CONCURRENT_POSITIONS", "100"))
-MAX_ORDERS_PER_MIN        = int(os.getenv("MAX_ORDERS_PER_MIN", "60"))
+MAX_CONCURRENT_POSITIONS  = int(os.getenv("MAX_CONCURRENT_POSITIONS", "500"))
+MAX_ORDERS_PER_MIN        = int(os.getenv("MAX_ORDERS_PER_MIN", "500"))
 MARKET_TZ                 = os.getenv("MARKET_TZ", "America/New_York")
 ALLOW_PREMARKET           = os.getenv("ALLOW_PREMARKET", "0").lower() in ("1","true","yes")
 ALLOW_AFTERHOURS          = os.getenv("ALLOW_AFTERHOURS", "0").lower() in ("1","true","yes")
