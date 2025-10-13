@@ -150,7 +150,7 @@ def build_universe() -> list[str]:
 def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
                       conf_threshold: float = 0.7,
                       n_estimators: int = 100,
-                      r_multiple: float = 3.0,
+                      r_multiple: float = 1.5,
                       min_volume_mult: float = 0.0):
     """
     Live-time adapter mimicking your backtest logic:
@@ -307,7 +307,7 @@ def scan_once(universe: list[str]):
                     sym, df1m, tf_min=tf,
                     conf_threshold=0.7,
                     n_estimators=100,
-                    r_multiple=3.0,
+                    r_multiple=1.5,
                     min_volume_mult=0.0
                 )
                 if not sig:
