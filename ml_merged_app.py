@@ -151,7 +151,7 @@ class LiveTrade:
         self.entry_time = entry_time
         self.is_open = True
         self.exit = None
-               self.exit_time = None
+        self.exit_time = None
         self.reason = None
 
 # =============================
