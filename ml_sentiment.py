@@ -373,8 +373,8 @@ def check_daily_guard_and_maybe_halt():
     up_lim   = START_EQUITY * (1.0 + DAILY_TP_PCT)
     dn_lim   = START_EQUITY * (1.0 - DAILY_DD_PCT)
     print(f"[DAILY-GUARD] eq={equity:.2f} start={START_EQUITY:.2f} "
-      f"targets +{DAILY_TP_PCT*100:.1f}%({up_lim:.2f}) / -{DAILY_DD_PCT*100:.1f}%({dn_lim:.2f})",
-      flush=True)
+          f"targets +{DAILY_TP_PCT*100:.1f}%({up_lim:.2f}) / -{DAILY_DD_PCT*100:.1f}%({dn_lim:.2f})",
+          flush=True)
     if HALT_TRADING:
         return
     if equity >= up_lim:
@@ -387,6 +387,27 @@ def check_daily_guard_and_maybe_halt():
         print("[DAILY-GUARD] ⛔ Daily DD hit. Halting entries.", flush=True)
         if DAILY_FLATTEN_ON_HIT:
             flatten_all_open_positions()
+
+# ---- EOD manager (pre-close flatten + safety net) ----
+def eod_manager():
+    """
+    3:50–4:00 ET: halt entries and flatten.
+    4:00–4:02 ET: safety net to ensure flat.
+    """
+    global HALT_TRADING
+    ts = _now_et()
+    # Pre-close window
+    if ts.hour == 15 and ts.minute >= 50:
+        if not HALT_TRADING:
+            print("[EOD] Pre-close: halting new entries and flattening (3:50–4:00 ET).", flush=True)
+        HALT_TRADING = True
+        flatten_all_open_positions()
+    # Safety net right after the bell
+    elif ts.hour == 16 and ts.minute < 3:
+        if not HALT_TRADING:
+            print("[EOD] Post-bell safety: halting entries and ensuring flat (4:00–4:02 ET).", flush=True)
+        HALT_TRADING = True
+        flatten_all_open_positions()
 
 # =============================
 # Routing & signal handling (uses Alpaca bridge)
@@ -536,6 +557,9 @@ def main():
             if DAILY_GUARD_ENABLED:
                 check_daily_guard_and_maybe_halt()
 
+            # EOD manager runs BEFORE computing allow_entries
+            eod_manager()
+
             allow_entries = not (DAILY_GUARD_ENABLED and HALT_TRADING)
             if not allow_entries:
                 time.sleep(POLL_SECONDS)
@@ -580,11 +604,7 @@ def main():
 
                     handle_signal("ml_pattern", sym, tf, sig)
 
-            # EOD auto-flatten window (16:00–16:10 ET)
-            now_et = _now_et()
-            if now_et.hour == 16 and now_et.minute < 10:
-                print("[EOD] Auto-flatten window.", flush=True)
-                flatten_all_open_positions()
+            # (Old 16:00–16:10 EOD block removed; handled by eod_manager())
 
         except Exception as e:
             import traceback
