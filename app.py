@@ -8,6 +8,9 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
+from adapters.data_alpaca import fetch_1m as fetch_bars_1m, resample, get_universe_symbols
+from common.signal_bridge import send_to_broker, close_all_positions, list_positions, get_account_equity
+
 # ==============================
 # ENV / CONFIG
 # ==============================
@@ -95,7 +98,7 @@ def _get(url, params=None, timeout=15):
         return None
     return r.json()
 
-def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
+def fetch_bars_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
     """Fetch recent 1m bars as tz-aware ET ohlcv DataFrame."""
     end = datetime.now(timezone.utc)
     start = end - timedelta(minutes=lookback_minutes)
@@ -316,7 +319,7 @@ def build_payload(symbol: str, sig: dict) -> dict:
     payload["meta"]["runId"] = RUN_ID
     return payload
 
-def send_to_traderspost(payload: dict):
+def send_to_broker(payload: dict):
     if DRY_RUN:
         print(f"[DRY-RUN] {json.dumps(payload)[:500]}", flush=True)
         return True, "dry-run"
@@ -376,7 +379,7 @@ def scan_once(universe: list[str]):
     for sym in batch:
         # pull once and reuse for all TFs to save API calls
         try:
-            df1m = fetch_polygon_1m(sym, lookback_minutes=2400)  # ~ 40 hours
+            df1m = fetch_bars_1m(sym, lookback_minutes=2400)  # ~ 40 hours
             if df1m is None or df1m.empty:
                 continue
             # ensure tz ET
@@ -410,7 +413,7 @@ def scan_once(universe: list[str]):
                     continue  # if the session flipped while scanning, skip sends
 
                 payload = build_payload(sym, sig)
-                ok, info = send_to_traderspost(payload)
+                ok, info = send_to_broker(payload)
                 COUNTS["signals"] += 1
                 stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(f"[{stamp}] ml_pattern {sym} {tf}m -> {sig['action']} qty={sig['quantity']} | {info}", flush=True)
