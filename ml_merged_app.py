@@ -13,7 +13,7 @@ import pandas as pd
 
 # === Alpaca adapters (data + broker) ===
 from adapters.data_alpaca import (
-    fetch_1m as fetch_bars_1m,   # keep existing callsites the same
+    fetch_1m as _alpaca_fetch_1m,
     resample as _resample,
     get_universe_symbols as _alpaca_universe,
 )
@@ -23,6 +23,17 @@ from common.signal_bridge import (
     list_positions,
     get_account_equity,
 )
+
+def fetch_bars_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
+    """
+    Backward-compatible wrapper so existing calls like
+    fetch_bars_1m('AAPL', lookback_minutes=...) keep working.
+    """
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(minutes=lookback_minutes)
+    start_iso = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    end_iso = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return _alpaca_fetch_1m(symbol, start_iso=start_iso, end_iso=end_iso, limit=10000)
 
 # =============================
 # ENV / CONFIG (unchanged)
