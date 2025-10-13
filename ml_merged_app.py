@@ -79,8 +79,8 @@ MIN_QTY     = int(os.getenv("MIN_QTY", "1"))
 ROUND_LOT   = int(os.getenv("ROUND_LOT","1"))
 
 # --- Model / sentiment
-CONF_THR       = float(os.getenv("CONF_THR", "0.80"))
-R_MULT         = float(os.getenv("R_MULT", "3.0"))
+CONF_THR       = float(os.getenv("CONF_THR", "0.70"))
+R_MULT         = float(os.getenv("R_MULT", "1.5"))
 SHORTS_ENABLED = os.getenv("SHORTS_ENABLED","0").lower() in ("1","true","yes")
 
 SENTIMENT_LOOKBACK_MIN = int(os.getenv("SENTIMENT_LOOKBACK_MIN", "60"))
