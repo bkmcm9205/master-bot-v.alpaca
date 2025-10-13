@@ -1,8 +1,8 @@
-# scanner_alpaca.py — dynamic market scanner (PLUMBING SWAP: Polygon/TP -> Alpaca)
+# app.py — dynamic market scanner (PLUMBING SWAP: Polygon/TP -> Alpaca)
 # Requires: pandas, numpy, requests, pandas_ta, scikit-learn
 #
 # ✅ Models/ML logic unchanged. Only data + broker I/O rewired to Alpaca.
-# ✅ Added rich boot/universe banners for clearer Render logs.
+# ✅ Adds full boot banner + env echo; thresholds read from env (CONF_THR, R_MULT).
 
 import os, time, json, math, requests
 import pandas as pd, numpy as np
@@ -24,24 +24,26 @@ from common.signal_bridge import (
 )
 
 # ==============================
-# ENV / CONFIG (unchanged where possible)
+# ENV / CONFIG
 # ==============================
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 DRY_RUN = os.getenv("DRY_RUN", "0").lower() in ("1","true","yes")
 PAPER_MODE = os.getenv("PAPER_MODE", "true").lower() != "false"
 SCANNER_DEBUG = os.getenv("SCANNER_DEBUG", "0").lower() in ("1","true","yes")
 
-# Timeframes list (comma-separated)
-TF_MIN_LIST = [int(x) for x in os.getenv("TF_MIN_LIST", "5").split(",")]
+# thresholds (env-driven)
+CONF_THR = float(os.getenv("CONF_THR", "0.7"))
+R_MULT   = float(os.getenv("R_MULT", "1.5"))
 
-# Universe paging/size (Polygon-era knobs; keep but no-op for Alpaca paging)
+# Timeframes list (comma-separated)
+TF_MIN_LIST = [int(x) for x in os.getenv("TF_MIN_LIST", "5").split(",") if x.strip()]
+
+# Universe knobs maintained for compatibility (Alpaca paging ignores MAX_UNIVERSE_PAGES)
 MAX_UNIVERSE_PAGES = int(os.getenv("MAX_UNIVERSE_PAGES", "3"))
 SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "150"))
-
-# Liquidity filter (kept for compatibility; grouped-daily prefilter is skipped under Alpaca)
 SCANNER_MIN_AVG_VOL = int(os.getenv("SCANNER_MIN_AVG_VOL", "1000000"))
 
-RUN_ID = datetime.now().astimezone().strftime("%Y-%m-%d")
+RUN_ID = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
 COUNTS = defaultdict(int)
 COMBO_COUNTS = defaultdict(int)
 _sent = set()
@@ -60,29 +62,14 @@ ALLOW_AFTERHOURS = os.getenv("ALLOW_AFTERHOURS","0").lower() in ("1","true","yes
 
 # Trading state flag (used by EOD logic to stop new entries)
 HALT_TRADING = False
-
 MARKET_TZ = "America/New_York"
 
-# ---- Boot banner helpers (logging only; no model changes) ----
+# Render boot info (purely for logs)
 RENDER_GIT_COMMIT = os.getenv("RENDER_GIT_COMMIT", "unknown")[:12]
 RENDER_GIT_BRANCH = os.getenv("RENDER_GIT_BRANCH", os.getenv("BRANCH", "unknown"))
 
-def boot_banner(start_cmd: str):
-    print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD={start_cmd}", flush=True)
-    tfs = TF_MIN_LIST
-    mode = "paper" if PAPER_MODE else "live"
-    print(f"[BOOT] PAPER_MODE={mode} POLL_SECONDS={POLL_SECONDS} TFs={tfs}", flush=True)
-    # Log the strategy knobs actually used below (just for visibility)
-    print(f"[BOOT] CONF_THR=0.7 R_MULT=1.5 SHORTS_ENABLED=0 USE_SENTIMENT_REGIME=0", flush=True)
-
-def universe_banner(symbols: list):
-    exchs = sorted(list(os.getenv("ALLOWED_EXCHANGES","NASD,NASDAQ,NYSE,XNAS,XNYS").split(",")))
-    min_px = float(os.getenv("MIN_PRICE","0") or 0.0)
-    vol_gate = int(os.getenv("SCANNER_MIN_TODAY_VOL", "0"))
-    print(f"[UNIVERSE] symbols={len(symbols)}  TFs={TF_MIN_LIST}  vol_gate={vol_gate}  MIN_PRICE={min_px} EXCH={exchs}", flush=True)
-
 # ==============================
-# Session helpers (unchanged)
+# Session helpers
 # ==============================
 def _market_session_now():
     now_et = datetime.now(ZoneInfo(MARKET_TZ))
@@ -114,13 +101,10 @@ def _position_qty(entry_price: float, stop_price: float,
     return int(max(qty, min_qty if qty > 0 else 0))
 
 # ==============================
-# Data fetchers (Alpaca replacement for Polygon)
+# Data fetchers (Alpaca replacement)
 # ==============================
 def fetch_bars_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
-    """
-    Backward-compatible wrapper around Alpaca minute bars.
-    Returns tz-aware ET ohlcv DataFrame (open/high/low/close/volume).
-    """
+    """Backward-compatible wrapper around Alpaca minute bars → tz-aware ET ohlcv."""
     end = datetime.now(timezone.utc)
     start = end - timedelta(minutes=lookback_minutes)
     start_iso = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -128,7 +112,6 @@ def fetch_bars_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
     df = _alpaca_fetch_1m(symbol, start_iso=start_iso, end_iso=end_iso, limit=10000)
     if df is None or df.empty:
         return pd.DataFrame()
-    # ensure ET index and expected columns
     try:
         df.index = df.index.tz_convert(MARKET_TZ)
     except Exception:
@@ -149,10 +132,7 @@ def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
     return bars
 
 def build_universe() -> list[str]:
-    """
-    Env override OR Alpaca assets universe. Polygon grouped-daily volume prefilter
-    has no 1:1 in Alpaca; we skip it (log once if debug).
-    """
+    """Env override OR Alpaca assets universe (Polygon grouped-daily prefilter not used)."""
     manual = os.getenv("SCANNER_SYMBOLS", "").strip()
     if manual:
         return [s.strip().upper() for s in manual.split(",") if s.strip()]
@@ -167,17 +147,11 @@ def build_universe() -> list[str]:
 # ML strategy adapter (unchanged)
 # ==============================
 def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
-                      conf_threshold: float = 0.7,
+                      conf_threshold: float = CONF_THR,
                       n_estimators: int = 100,
-                      r_multiple: float = 1.5,
+                      r_multiple: float = R_MULT,
                       min_volume_mult: float = 0.0):
-    """
-    Live-time adapter mimicking your backtest logic:
-      - train simple RF on features
-      - if last bar predicts 1 with prob>threshold AND volume > min_volume_mult * rolling avg
-      - go long with 1% SL and TP = r_multiple * 1% above entry
-    Returns a dict signal; order routing handled by Alpaca bridge.
-    """
+    """Train quick RF; if prob>threshold → long with 1% SL and TP = r_multiple * 1%."""
     try:
         import pandas_ta as ta  # noqa: F401
         from sklearn.ensemble import RandomForestClassifier
@@ -266,7 +240,7 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
     return None
 
 # ==============================
-# Dedupe helper (unchanged)
+# Dedupe
 # ==============================
 def _dedupe_key(symbol: str, tf: int, action: str, bar_time: str) -> str:
     raw = f"{symbol}|{tf}|{action}|{bar_time}"
@@ -274,12 +248,11 @@ def _dedupe_key(symbol: str, tf: int, action: str, bar_time: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
 
 # ==============================
-# Scanner loop (unchanged logic; Alpaca plumbing)
+# Scanner loop
 # ==============================
 def scan_once(universe: list[str]):
     global _round_robin, HALT_TRADING
 
-    # Respect EOD halt
     if HALT_TRADING:
         if SCANNER_DEBUG:
             print("[SCAN] HALT_TRADING active — skipping new entries.", flush=True)
@@ -318,15 +291,14 @@ def scan_once(universe: list[str]):
 
         for tf in TF_MIN_LIST:
             try:
-                # Stop mid-loop if EOD halt flips on
                 if HALT_TRADING:
                     break
 
                 sig = signal_ml_pattern(
                     sym, df1m, tf_min=tf,
-                    conf_threshold=0.7,
+                    conf_threshold=CONF_THR,
                     n_estimators=100,
-                    r_multiple=1.5,
+                    r_multiple=R_MULT,
                     min_volume_mult=0.0
                 )
                 if not sig:
@@ -340,7 +312,6 @@ def scan_once(universe: list[str]):
                 if SCANNER_MARKET_HOURS_ONLY and not _market_session_now():
                     continue  # session flipped while scanning
 
-                # ---- Alpaca bridge send (plumbing swap) ----
                 ok, info = send_to_broker(sym, sig, strategy_tag="ml_pattern")
 
                 COUNTS["signals"] += 1
@@ -359,17 +330,19 @@ def scan_once(universe: list[str]):
 
 def main():
     # ---- Boot banner ----
-    boot_banner("python scanner_alpaca.py")
-
-    print("Scanner starting…", flush=True)
+    print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD=python app.py", flush=True)
+    print(f"[BOOT] PAPER_MODE={'paper' if PAPER_MODE else 'live'} POLL_SECONDS={POLL_SECONDS} TFs={TF_MIN_LIST}", flush=True)
+    print(f"[BOOT] CONF_THR={CONF_THR} R_MULT={R_MULT}", flush=True)
+    manual = os.getenv("SCANNER_SYMBOLS", "").strip()
+    if manual:
+        print(f"[BOOT] SCANNER_SYMBOLS override detected ({len([s for s in manual.split(',') if s.strip()])} symbols).", flush=True)
 
     universe = build_universe()
-    universe_banner(universe)
+    print(f"[UNIVERSE] size={len(universe)}  TFs={TF_MIN_LIST}  Batch={SCAN_BATCH_SIZE}", flush=True)
 
     while True:
         loop_start = time.time()
         try:
-            # ---- main scan tick ----
             scan_once(universe)
 
             # ---- EOD management (PRE-CLOSE + SAFETY NET) ----
@@ -380,7 +353,6 @@ def main():
                 print("[EOD] Pre-close flatten window (3:50–4:00 ET).", flush=True)
                 ok, info = close_all_positions()
                 print(f"[EOD] Alpaca flatten -> ok={ok} info={info}", flush=True)
-                # Halt new entries for the remainder of the day
                 global HALT_TRADING
                 HALT_TRADING = True
 
@@ -391,7 +363,6 @@ def main():
                     print(f"[EOD] Safety net: positions still open ({len(pos)}). Flattening…", flush=True)
                     ok, info = close_all_positions()
                     print(f"[EOD] Safety flatten -> ok={ok} info={info}", flush=True)
-                    # keep HALT_TRADING = True
 
         except Exception as e:
             import traceback
@@ -401,4 +372,6 @@ def main():
         time.sleep(max(1, POLL_SECONDS - int(elapsed)))
 
 if __name__ == "__main__":
+    # Ensure unbuffered logs on some platforms too
+    os.environ["PYTHONUNBUFFERED"] = "1"
     main()
