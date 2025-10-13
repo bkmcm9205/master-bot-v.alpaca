@@ -104,7 +104,7 @@ services:
   - type: worker
     name: trading-bot
     env: docker
-    repo: https://github.com/your-org-or-user/master-bot-v.alpaca
+    repo: https://github.com/bkmcm9205/master-bot-v.alpaca
     branch: main
     autoDeploy: true
     plan: Starter
