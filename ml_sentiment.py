@@ -560,7 +560,7 @@ def main():
             # EOD manager runs BEFORE computing allow_entries
             eod_manager()
 
-            allow_entries = not (_ENABLED and HALT_TRADING)
+            allow_entries = not (DAILY_GUARD_ENABLED and HALT_TRADING)
             if not allow_entries:
                 time.sleep(POLL_SECONDS)
                 continue
