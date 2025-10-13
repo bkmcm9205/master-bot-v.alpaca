@@ -27,13 +27,13 @@ from common.signal_bridge import send_to_broker, close_all_positions, list_posit
 # ENV / CONFIG
 # =============================
 # --- Core connectors
-TP_URL          = os.getenv("TP_WEBHOOK_URL", "").strip()
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
+# TP_URL          = os.getenv("TP_WEBHOOK_URL", "").strip()
+# POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
 
 # Optional TradersPost REST (equity/positions/flatten)
-TP_BASE_URL     = os.getenv("TP_BASE_URL", "").rstrip("/")
-TP_REST_TOKEN   = os.getenv("TP_REST_TOKEN", "")
-TP_ACCOUNT_ID   = os.getenv("TP_ACCOUNT_ID", "")
+# TP_BASE_URL     = os.getenv("TP_BASE_URL", "").rstrip("/")
+# TP_REST_TOKEN   = os.getenv("TP_REST_TOKEN", "")
+# TP_ACCOUNT_ID   = os.getenv("TP_ACCOUNT_ID", "")
 
 # --- Diagnostics / runtime
 POLL_SECONDS    = int(os.getenv("POLL_SECONDS", "10"))
@@ -280,20 +280,6 @@ def flatten_all_positions_tp():
         closed += 1 if ok else 0
         time.sleep(0.2)
     print(f"[FLATTEN] REST close requested for {closed}/{len(pos)} positions.", flush=True)
-
-# =============================
-# HTTP helper for Polygon
-# =============================
-def _get(url, params=None, timeout=15):
-    params = params or {}
-    if POLYGON_API_KEY:
-        params["apiKey"] = POLYGON_API_KEY
-    r = requests.get(url, params=params, timeout=timeout)
-    if r.status_code != 200:
-        if SCANNER_DEBUG:
-            print(f"[HTTP {r.status_code}] {url} -> {r.text[:200]}", flush=True)
-        return None
-    return r.json()
 
 # =============================
 # Polygon data fetchers
@@ -864,10 +850,10 @@ def main():
     print(f"[BOOT] DAILY_GUARD_ENABLED={int(DAILY_GUARD_ENABLED)} UP={DAILY_TP_PCT:.0%} DOWN={DAILY_DD_PCT:.0%} FLATTEN={int(DAILY_FLATTEN_ON_HIT)}", flush=True)
     print(f"[BOOT] BROKER_GUARD={int(USE_BROKER_EQUITY_GUARD)} BASELINE_AT_0930={int(SESSION_BASELINE_AT_0930)} TRAIL_DD={TRAIL_DD_PCT:.0%}", flush=True)
 
-    if not POLYGON_API_KEY:
-        print("[FATAL] POLYGON_API_KEY missing.", flush=True); return
-    if not TP_URL and not DRY_RUN:
-        print("[FATAL] TP_WEBHOOK_URL missing (or set DRY_RUN=1).", flush=True); return
+    # if not POLYGON_API_KEY:
+    #    print("[FATAL] POLYGON_API_KEY missing.", flush=True); return
+    #if not TP_URL and not DRY_RUN:
+    #    print("[FATAL] TP_WEBHOOK_URL missing (or set DRY_RUN=1).", flush=True); return
 
     # Universe
     symbols = get_universe_symbols()
