@@ -151,7 +151,7 @@ class LiveTrade:
         self.entry_time = entry_time
         self.is_open = True
         self.exit = None
-        self.exit_time = None
+               self.exit_time = None
         self.reason = None
 
 # =============================
@@ -519,6 +519,27 @@ def reset_daily_state_if_new_day():
         EQUITY_HIGH_WATER = None
         print(f"[NEW DAY] State reset. START_EQUITY={START_EQUITY:.2f} DAY={DAY_STAMP}", flush=True)
 
+# ---- EOD manager (pre-close flatten + safety net) ----
+def eod_manager():
+    """
+    3:58–4:00 ET: halt entries and flatten.
+    4:00–4:02 ET: safety net to ensure flat.
+    """
+    global HALT_TRADING
+    ts = _now_et()
+    # Pre-close window
+    if ts.hour == 15 and ts.minute >= 58:
+        if not HALT_TRADING:
+            print("[EOD] Pre-close: halting new entries and flattening (3:58–4:00 ET).", flush=True)
+        HALT_TRADING = True
+        flatten_all_open_positions_webhook()
+    # Safety net right after the bell
+    elif ts.hour == 16 and ts.minute < 3:
+        if not HALT_TRADING:
+            print("[EOD] Post-bell safety: halting entries and ensuring flat (4:00–4:02 ET).", flush=True)
+        HALT_TRADING = True
+        flatten_all_open_positions_webhook()
+
 # =============================
 # Routing & signal handling (send via Alpaca bridge)
 # =============================
@@ -570,7 +591,7 @@ def _batched_symbols(universe: list):
     return batch
 
 # =============================
-# Main (unchanged except Polygon/TP refs removed)
+# Main (unchanged except Polygon/TP refs removed + EOD manager)
 # =============================
 def main():
     print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD=python app_scanner_merged.py", flush=True)
@@ -619,6 +640,9 @@ def main():
             else:
                 check_daily_guards()
 
+            # --- EOD manager (pre-close + safety net) BEFORE deciding to enter
+            eod_manager()
+
             allow_entries = not (HALT_TRADING or HALTED)
             if not allow_entries:
                 time.sleep(POLL_SECONDS); continue
@@ -654,11 +678,7 @@ def main():
 
                     handle_signal("ml_pattern", sym, tf, sig)
 
-            # --- EOD auto-flatten window (16:00–16:10 ET)
-            now_et = _now_et()
-            if now_et.hour == 16 and now_et.minute < 10:
-                print("[EOD] Auto-flatten window.", flush=True)
-                flatten_all_open_positions_webhook()
+            # (Old 16:00–16:10 EOD block removed; handled by eod_manager())
 
         except Exception as e:
             import traceback
