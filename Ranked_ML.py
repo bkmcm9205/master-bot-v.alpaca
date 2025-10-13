@@ -15,6 +15,8 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
+from adapters.data_alpaca import fetch_1m as fetch_bars_1m, resample, get_universe_symbols
+from common.signal_bridge import send_to_broker, close_all_positions, list_positions, get_account_equity
 
 # =========================
 # POLYGON CONFIG + PROBE
@@ -270,7 +272,7 @@ def polygon_get_bars(ticker: str, tf_minutes: int, date_from: str, date_to: str)
         return []
     return r.json().get("results", [])
 
-def fetch_polygon_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
+def fetch_bars_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
     """
     Return tz-aware ET 1m bars with o/h/l/c/volume.
     Uses explicit trading dates so it works at night/weekends.
@@ -311,7 +313,7 @@ def _throttle_ok():
     _order_times.append(now)
     return True, ""
 
-def send_to_traderspost(payload: dict):
+def send_to_broker(payload: dict):
     try:
         if DRY_RUN:
             print(f"[DRY-RUN] {json.dumps(payload)[:500]}", flush=True)
@@ -434,7 +436,7 @@ def compute_sentiment():
     look_min = max(5, SENTIMENT_LOOKBACK_MIN)
     vals = []
     for s in SENTIMENT_SYMBOLS:
-        df = fetch_polygon_1m(s, lookback_minutes=look_min*2)
+        df = fetch_bars_1m(s, lookback_minutes=look_min*2)
         if df is None or df.empty:
             print(f"[WARN] No sentiment data for {s}", flush=True)
             continue
@@ -619,7 +621,7 @@ def flatten_all_open_positions():
                 "quantity": int(t.qty),
                 "meta": {"note": "daily-guard-flatten", "combo": t.combo, "triggeredAt": datetime.now(timezone.utc).isoformat()}
             }
-            ok, info = send_to_traderspost(payload)
+            ok, info = send_to_broker(payload)
             print(f"[DAILY-GUARD] Flatten {t.combo} -> ok={ok} info={info}", flush=True)
             posted += 1
             t.is_open = False
@@ -662,7 +664,7 @@ def check_daily_guard_and_maybe_halt():
 # =============================
 def compute_signal(strategy_name, symbol, tf_minutes, sentiment, df1m=None):
     if df1m is None or getattr(df1m, "empty", True):
-        df1m = fetch_polygon_1m(symbol, lookback_minutes=max(240, tf_minutes*240))
+        df1m = fetch_bars_1m(symbol, lookback_minutes=max(240, tf_minutes*240))
         if df1m is None or df1m.empty:
             return None
     if not isinstance(df1m.index, pd.DatetimeIndex):
@@ -706,7 +708,7 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
     sig["meta"] = meta
     _record_open_trade(strat_name, symbol, tf_min, sig)
     payload = build_payload(symbol, sig)
-    ok, info = send_to_traderspost(payload)
+    ok, info = send_to_broker(payload)
     try:
         (COMBO_COUNTS if ok else COMBO_COUNTS)[f"{combo_key}::orders.{'ok' if ok else 'err'}"] += 1
         COUNTS["orders.ok" if ok else "orders.err"] += 1
@@ -745,7 +747,7 @@ def main():
             touched = set((k[0], k[1]) for k in OPEN_TRADES.keys())
             for (sym, tf) in touched:
                 try:
-                    df = fetch_polygon_1m(sym, lookback_minutes=max(60, tf * 12))
+                    df = fetch_bars_1m(sym, lookback_minutes=max(60, tf * 12))
                     if df is None or df.empty:
                         continue
                     try:
@@ -788,7 +790,7 @@ def main():
 
             signals_list = []
             for sym in symbols:
-                df1m = fetch_polygon_1m(sym, lookback_minutes=max(240, max(TF_MIN_LIST) * 240))
+                df1m = fetch_bars_1m(sym, lookback_minutes=max(240, max(TF_MIN_LIST) * 240))
                 if df1m is None or df1m.empty:
                     continue
                 try:
