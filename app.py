@@ -2,6 +2,7 @@
 # Requires: pandas, numpy, requests, pandas_ta, scikit-learn
 #
 # ✅ Models/ML logic unchanged. Only data + broker I/O rewired to Alpaca.
+# ✅ Added rich boot/universe banners for clearer Render logs.
 
 import os, time, json, math, requests
 import pandas as pd, numpy as np
@@ -61,6 +62,24 @@ ALLOW_AFTERHOURS = os.getenv("ALLOW_AFTERHOURS","0").lower() in ("1","true","yes
 HALT_TRADING = False
 
 MARKET_TZ = "America/New_York"
+
+# ---- Boot banner helpers (logging only; no model changes) ----
+RENDER_GIT_COMMIT = os.getenv("RENDER_GIT_COMMIT", "unknown")[:12]
+RENDER_GIT_BRANCH = os.getenv("RENDER_GIT_BRANCH", os.getenv("BRANCH", "unknown"))
+
+def boot_banner(start_cmd: str):
+    print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD={start_cmd}", flush=True)
+    tfs = TF_MIN_LIST
+    mode = "paper" if PAPER_MODE else "live"
+    print(f"[BOOT] PAPER_MODE={mode} POLL_SECONDS={POLL_SECONDS} TFs={tfs}", flush=True)
+    # Log the strategy knobs actually used below (just for visibility)
+    print(f"[BOOT] CONF_THR=0.7 R_MULT=1.5 SHORTS_ENABLED=0 USE_SENTIMENT_REGIME=0", flush=True)
+
+def universe_banner(symbols: list):
+    exchs = sorted(list(os.getenv("ALLOWED_EXCHANGES","NASD,NASDAQ,NYSE,XNAS,XNYS").split(",")))
+    min_px = float(os.getenv("MIN_PRICE","0") or 0.0)
+    vol_gate = int(os.getenv("SCANNER_MIN_TODAY_VOL", "0"))
+    print(f"[UNIVERSE] symbols={len(symbols)}  TFs={TF_MIN_LIST}  vol_gate={vol_gate}  MIN_PRICE={min_px} EXCH={exchs}", flush=True)
 
 # ==============================
 # Session helpers (unchanged)
@@ -339,10 +358,13 @@ def scan_once(universe: list[str]):
                 continue
 
 def main():
+    # ---- Boot banner ----
+    boot_banner("python scanner_alpaca.py")
+
     print("Scanner starting…", flush=True)
 
     universe = build_universe()
-    print(f"[READY] Universe size: {len(universe)}  TFs: {TF_MIN_LIST}  Batch: {SCAN_BATCH_SIZE}", flush=True)
+    universe_banner(universe)
 
     while True:
         loop_start = time.time()
