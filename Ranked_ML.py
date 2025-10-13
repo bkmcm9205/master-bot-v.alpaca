@@ -555,6 +555,7 @@ def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, c
 # Main
 # =============================
 def main():
+    global HALT_TRADING
     # ---- Boot banner ----
     print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD=python Ranked_ML.py", flush=True)
     print(f"[BOOT] POLL_SECONDS={POLL_SECONDS} TFs={TF_MIN_LIST} CONF_THRESHOLD={SCANNER_CONF_THRESHOLD} R_MULTIPLE={SCANNER_R_MULTIPLE}", flush=True)
