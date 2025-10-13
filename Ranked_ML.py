@@ -645,11 +645,21 @@ def main():
                     break
                 handle_signal("ml_pattern", sym, tf, sig)
 
-            # EOD auto-flatten window (16:00–16:10 ET)
+            # --- Pre-close auto-flatten (3:58–4:00 ET)
             now_et = _now_et()
-            if now_et.hour == 16 and now_et.minute < 10:
-                print("[EOD] Auto-flatten window.", flush=True)
-                flatten_all_open_positions()
+            if now_et.hour == 15 and now_et.minute >= 50:
+                print("[EOD] Pre-close flatten window (3:50–4:00 ET).", flush=True)
+                ok, info = close_all_positions()
+                print(f"[EOD] Alpaca flatten -> ok={ok} info={info}", flush=True)
+                HALT_TRADING = True
+
+            # Optional safety net after close (4:00–4:02 ET)
+            elif now_et.hour == 16 and now_et.minute < 3:
+                pos = list_positions()
+                if pos:
+                    print(f"[EOD] Safety net: positions still open ({len(pos)}). Flattening…", flush=True)
+                    ok, info = close_all_positions()
+                    print(f"[EOD] Safety flatten -> ok={ok} info={info}", flush=True)
 
         except Exception as e:
             import traceback
