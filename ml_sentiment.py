@@ -373,7 +373,7 @@ def check_daily_guard_and_maybe_halt():
     up_lim   = START_EQUITY * (1.0 + DAILY_TP_PCT)
     dn_lim   = START_EQUITY * (1.0 - DAILY_DD_PCT)
     print(f"[DAILY-GUARD] eq={equity:.2f} start={START_EQUITY:.2f} "
-          f"targets +{DAILY_TP_PCT*100:.1f}%({up_lim:.2f}) / -{DAILY_DD_PCT*100:.1f}%({dn_lim:.2f})",
+          f"targets +{DAILY_TP_PCT*1:.1f}%({up_lim:.2f}) / -{DAILY_DD_PCT*1:.1f}%({dn_lim:.2f})",
           flush=True)
     if HALT_TRADING:
         return
@@ -560,7 +560,7 @@ def main():
             # EOD manager runs BEFORE computing allow_entries
             eod_manager()
 
-            allow_entries = not (DAILY_GUARD_ENABLED and HALT_TRADING)
+            allow_entries = not (_ENABLED and HALT_TRADING)
             if not allow_entries:
                 time.sleep(POLL_SECONDS)
                 continue
