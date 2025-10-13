@@ -148,7 +148,7 @@ def build_universe() -> list[str]:
 # ML strategy adapter (unchanged)
 # ==============================
 def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
-                      conf_threshold: float = 0.8,
+                      conf_threshold: float = 0.7,
                       n_estimators: int = 100,
                       r_multiple: float = 3.0,
                       min_volume_mult: float = 0.0):
@@ -305,7 +305,7 @@ def scan_once(universe: list[str]):
 
                 sig = signal_ml_pattern(
                     sym, df1m, tf_min=tf,
-                    conf_threshold=0.8,
+                    conf_threshold=0.7,
                     n_estimators=100,
                     r_multiple=3.0,
                     min_volume_mult=0.0
