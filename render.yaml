@@ -1,11 +1,9 @@
 # render.yaml — master-bot-v.alpaca (Paper)
-# Push this file to the repo root on GitHub.
 
 envVarGroups:
   # ===== Shared config & guards (applies to all workers) =====
   - name: bot-common
     envVars:
-      # Alpaca paper endpoints + defaults
       - key: ALPACA_TRADE_BASE_URL
         value: https://paper-api.alpaca.markets
       - key: ALPACA_DATA_BASE_URL
@@ -21,7 +19,7 @@ envVarGroups:
       - key: MIN_PRICE
         value: "3.0"
 
-      # >>> Your existing guard/sizing defaults (tweak if you want global defaults)
+      # Global defaults for guards/sizing (tweak as you like)
       - key: START_EQUITY
         value: "100000"
       - key: DAILY_TP_PCT
@@ -39,13 +37,13 @@ envVarGroups:
       - key: TF_MIN_LIST
         value: "1,2,3,5,10"
 
-  # ===== Alpaca accounts (fill these secrets in Render after creating the blueprint) =====
+  # ===== Alpaca accounts (you will set the secrets in the dashboard) =====
   - name: alpaca-acct-A   # Shared by Merged + Sentiment
     envVars:
       - key: ALPACA_KEY_ID
-        value: ""     # <-- Fill in Render Dashboard
+        value: ""         # <-- Fill in Render after creating the Blueprint
       - key: ALPACA_SECRET_KEY
-        value: ""     # <-- Fill in Render Dashboard
+        value: ""         # <-- Fill in Render after creating the Blueprint
   - name: alpaca-acct-B   # Ranked
     envVars:
       - key: ALPACA_KEY_ID
@@ -66,14 +64,13 @@ services:
     env: docker
     repo: https://github.com/your-org-or-user/master-bot-v.alpaca
     branch: main
-    plan: Starter
     autoDeploy: true
+    plan: Starter
     dockerfilePath: Dockerfile
     dockerCommand: python ml_merged_app.py
-    envVarGroups:
-      - bot-common
-      - alpaca-acct-A   # <-- uses account A
     envVars:
+      - fromGroup: bot-common
+      - fromGroup: alpaca-acct-A
       - key: STRATEGY_TAG
         value: ml_merged
 
@@ -83,14 +80,13 @@ services:
     env: docker
     repo: https://github.com/your-org-or-user/master-bot-v.alpaca
     branch: main
-    plan: Starter
     autoDeploy: true
+    plan: Starter
     dockerfilePath: Dockerfile
-    dockerCommand: python ml_sentiment.py   # <-- your renamed file
-    envVarGroups:
-      - bot-common
-      - alpaca-acct-A   # <-- shares account A
+    dockerCommand: python ml_sentiment.py
     envVars:
+      - fromGroup: bot-common
+      - fromGroup: alpaca-acct-A     # shares account A with Merged
       - key: STRATEGY_TAG
         value: ml_sentiment
 
@@ -100,14 +96,13 @@ services:
     env: docker
     repo: https://github.com/your-org-or-user/master-bot-v.alpaca
     branch: main
-    plan: Starter
     autoDeploy: true
+    plan: Starter
     dockerfilePath: Dockerfile
     dockerCommand: python Ranked_ML.py
-    envVarGroups:
-      - bot-common
-      - alpaca-acct-B   # <-- uses account B
     envVars:
+      - fromGroup: bot-common
+      - fromGroup: alpaca-acct-B     # uses account B
       - key: STRATEGY_TAG
         value: ranked
 
@@ -117,13 +112,12 @@ services:
     env: docker
     repo: https://github.com/your-org-or-user/master-bot-v.alpaca
     branch: main
-    plan: Starter
     autoDeploy: true
+    plan: Starter
     dockerfilePath: Dockerfile
     dockerCommand: python app.py
-    envVarGroups:
-      - bot-common
-      - alpaca-acct-C   # <-- uses account C
     envVars:
+      - fromGroup: bot-common
+      - fromGroup: alpaca-acct-C     # uses account C
       - key: STRATEGY_TAG
         value: trading_bot
