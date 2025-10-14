@@ -18,6 +18,7 @@ from common.signal_bridge import (
     close_all_positions,
     list_positions,
     get_account_equity,
+    cancel_all_orders,
 )
 
 # ==============================
@@ -551,20 +552,57 @@ def main():
 
                     handle_signal("ml_pattern", sym, tf, sig)
 
-            # ---- EOD management during open session tick
+            # ---- EOD management during open session tick (PRE-CLOSE + SAFETY) ----
+            # Make sure at the TOP of main() you have:  global HALT_TRADING
             now_et = _now_et()
-            if now_et.hour == 15 and now_et.minute >= 50:
-                print("[EOD] Pre-close flatten window (3:50–4:00 ET).", flush=True)
-                ok, info = close_all_positions()
-                print(f"[EOD] Alpaca flatten -> ok={ok} info={info}", flush=True)
-                HALT_TRADING = True
-            elif now_et.hour == 16 and now_et.minute < 3:
-                pos = list_positions()
-                if pos:
-                    print(f"[EOD] Safety net: positions still open ({len(pos)}). Flattening…", flush=True)
-                    ok, info = close_all_positions()
-                    print(f"[EOD] Safety flatten -> ok={ok} info={info}", flush=True)
+
+            def _cancel_all_open_orders_safely():
+                try:
+                    ok, info = cancel_all_orders()
+                    print(f"[EOD] Cancel all open orders -> ok={ok} info={info}", flush=True)
+                except Exception as e:
+                    import traceback
+                    print("[EOD] Cancel orders exception:", e, traceback.format_exc(), flush=True)
+
+            def _flatten_until_flat(max_iters=5, sleep_s=2):
+                for i in range(max_iters):
+                    try:
+                        pos = list_positions() or []
+                        if not pos:
+                            print("[EOD] Positions already flat.", flush=True)
+                            return True
+                        print(f"[EOD] Flatten pass {i+1}: positions={len(pos)}", flush=True)
+                        ok, info = close_all_positions()
+                        print(f"[EOD] Flatten call -> ok={ok} info={info}", flush=True)
+                    except Exception as e:
+                        import traceback
+                        print("[EOD] Flatten exception:", e, traceback.format_exc(), flush=True)
+                    time.sleep(sleep_s)
+                # final check
+                try:
+                    pos = list_positions() or []
+                    print(f"[EOD] Final position check -> {len(pos)} open", flush=True)
+                    return len(pos) == 0
+                except Exception:
+                    return False
+
+            # 1) Stop new entries before the close
+            if now_et.hour == 15 and now_et.minute >= 45:
+                if not HALT_TRADING:
                     HALT_TRADING = True
+                    print("[EOD] HALT_TRADING enabled at 3:45 ET (no new entries).", flush=True)
+
+            # 2) Pre-close consolidation & flatten window (3:50–4:00 ET)
+            if now_et.hour == 15 and now_et.minute >= 50:
+                print("[EOD] Pre-close window (3:50–4:00 ET): cancel orders + flatten until flat.", flush=True)
+                _cancel_all_open_orders_safely()
+                _flatten_until_flat()
+
+            # 3) Safety net right after bell (4:00–4:03 ET)
+            if now_et.hour == 16 and now_et.minute < 3:
+                print("[EOD] Post-bell safety net (4:00–4:03 ET).", flush=True)
+                _cancel_all_open_orders_safely()
+                _flatten_until_flat()
 
         except Exception as e:
             import traceback
