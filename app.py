@@ -346,9 +346,15 @@ def ensure_session_baseline():
     global SESSION_BASELINE_SET, SESSION_START_EQUITY, EQUITY_HIGH_WATER
     if SESSION_BASELINE_SET:
         return
-    eq = get_account_equity()
     try:
-        eq = float(eq) if eq is not None else START_EQUITY
+        eq = get_account_equity(default_equity=START_EQUITY)
+    except TypeError:
+        # fallback in case signature differs
+        eq = START_EQUITY
+    except Exception:
+        eq = START_EQUITY
+    try:
+        eq = float(eq)
     except Exception:
         eq = START_EQUITY
     SESSION_START_EQUITY = eq
@@ -362,10 +368,16 @@ def check_daily_guards():
         return
     ensure_session_baseline()
     try:
-        eq_now = float(get_account_equity() or SESSION_START_EQUITY)
+        eq_now = get_account_equity(default_equity=SESSION_START_EQUITY or START_EQUITY)
+    except TypeError:
+        eq_now = SESSION_START_EQUITY or START_EQUITY
     except Exception:
-        eq_now = SESSION_START_EQUITY
-
+        eq_now = SESSION_START_EQUITY or START_EQUITY
+    try:
+        eq_now = float(eq_now)
+    except Exception:
+        eq_now = SESSION_START_EQUITY or START_EQUITY
+        
     if EQUITY_HIGH_WATER is None:
         EQUITY_HIGH_WATER = eq_now
     else:
