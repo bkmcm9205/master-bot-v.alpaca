@@ -404,6 +404,20 @@ def check_daily_guards():
             ok, info = close_all_positions()
             print(f"[DAILY-GUARD] Flatten -> ok={ok} info={info}", flush=True)
 
+def _active_equity_and_limits():
+    if USE_BROKER_EQUITY_GUARD:
+        ensure_session_baseline()
+        base = SESSION_START_EQUITY if SESSION_START_EQUITY is not None else EQUITY_USD
+        eq_now = get_account_equity(base)
+        up_lim = base * (1.0 + DAILY_TP_PCT)
+        dn_lim = base * (1.0 - DAILY_DD_PCT)
+        return eq_now, up_lim, dn_lim, "broker"
+    else:
+        eq_now = _current_equity_local()
+        up_lim = START_EQUITY * (1.0 + DAILY_TP_PCT)
+        dn_lim = START_EQUITY * (1.0 - DAILY_DD_PCT)
+        return eq_now, up_lim, dn_lim, "local"
+
 def reset_daily_state_if_new_day():
     global DAY_STAMP, HALT_TRADING, SESSION_BASELINE_SET, EQUITY_HIGH_WATER
     today = datetime.now().astimezone().strftime("%Y-%m-%d")
@@ -462,6 +476,7 @@ def main():
     up = START_EQUITY*(1+DAILY_TP_PCT); dn = START_EQUITY*(1-DAILY_DD_PCT)
     print(f"[BOOT] DAILY_GUARD_ENABLED={int(DAILY_GUARD_ENABLED)} UP={DAILY_TP_PCT:.0%} DOWN={DAILY_DD_PCT:.0%} "
           f"FLATTEN={int(DAILY_FLATTEN_ON_HIT)} START_EQUITY={START_EQUITY:.2f}", flush=True)
+    print(f"[BOOT] BROKER_GUARD={int(USE_BROKER_EQUITY_GUARD)} BASELINE_AT_0930={int(SESSION_BASELINE_AT_0930)} TRAIL_DD={TRAIL_DD_PCT:.0%}", flush=True)
 
     # Universe
     symbols = build_universe()
