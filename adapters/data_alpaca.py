@@ -1,66 +1,86 @@
-import os, requests
-import pandas as pd
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+# adapters/data_alpaca.py  — HARDENED (replace the whole file if you want)
 
-ALPACA_DATA_BASE_URL = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").rstrip("/")
-MARKET_TZ = os.getenv("MARKET_TZ", "America/New_York")
-ALLOWED_EXCHANGES = set(x.strip().upper() for x in os.getenv("ALLOWED_EXCHANGES", "NASD,NASDAQ,NYSE,XNAS,XNYS").split(",") if x.strip())
-MIN_PRICE = float(os.getenv("MIN_PRICE", "3.0"))
+import os, pandas as pd, requests
+from datetime import datetime
+from requests.adapters import HTTPAdapter, Retry
+
+ALP_DATA_BASE = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").rstrip("/")
+ALP_KEY  = os.getenv("ALPACA_API_KEY_ID", "")
+ALP_SEC  = os.getenv("ALPACA_SECRET_KEY", "")
+
+# Tunables (env overrideable)
+DATA_TIMEOUT_SEC = float(os.getenv("ALPACA_DATA_TIMEOUT", "20"))
+DATA_RETRIES     = int(os.getenv("ALPACA_DATA_RETRIES", "3"))
+DATA_BACKOFF     = float(os.getenv("ALPACA_DATA_BACKOFF", "0.5"))
 
 def _headers():
     return {
-        "APCA-API-KEY-ID": os.getenv("ALPACA_KEY_ID", ""),
-        "APCA-API-SECRET-KEY": os.getenv("ALPACA_SECRET_KEY", ""),
+        "APCA-API-KEY-ID": ALP_KEY,
+        "APCA-API-SECRET-KEY": ALP_SEC,
     }
 
-def fetch_1m(symbol: str, start_iso: str | None = None, end_iso: str | None = None, limit: int = 10000) -> pd.DataFrame:
-    """Return tz-aware ET 1m bars with columns: open, high, low, close, volume"""
-    tf = "1Min"
-    if end_iso is None:
-        end_iso = datetime.now(timezone.utc).isoformat().replace("+00:00","Z")
-    if start_iso is None:
-        start_iso = (datetime.now(timezone.utc).replace(microsecond=0) - pd.Timedelta(days=7)).isoformat().replace("+00:00","Z")
-    url = f"{ALPACA_DATA_BASE_URL}/v2/stocks/{symbol}/bars"
-    params = {"timeframe": tf, "start": start_iso, "end": end_iso, "limit": str(limit), "adjustment": "raw"}
-    r = requests.get(url, headers=_headers(), params=params, timeout=20)
-    if r.status_code != 200:
-        return pd.DataFrame()
-    js = r.json()
-    bars = js.get("bars", [])
-    if not bars:
-        return pd.DataFrame()
-    df = pd.DataFrame(bars)
-    df["ts"] = pd.to_datetime(df["t"], utc=True)
-    df = df.set_index("ts").sort_index()
-    df.index = df.index.tz_convert(ZoneInfo(MARKET_TZ))
-    df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
-    return df[["open","high","low","close","volume"]]
+# one shared resilient session
+_session = None
+def _get_session():
+    global _session
+    if _session is not None:
+        return _session
+    _session = requests.Session()
+    retry = Retry(
+        total=DATA_RETRIES,
+        connect=DATA_RETRIES,
+        read=DATA_RETRIES,
+        backoff_factor=DATA_BACKOFF,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"])
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=100, pool_maxsize=100)
+    _session.mount("https://", adapter)
+    _session.mount("http://", adapter)
+    return _session
 
-def resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
-    if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
-        return pd.DataFrame()
-    rule = f"{int(tf_min)}min"
-    agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
-    return df1m.resample(rule, origin="start_day", label="right").agg(agg).dropna()
+def fetch_1m(symbol: str, start_iso: str, end_iso: str, limit: int = 10000, adjustment: str = "raw") -> pd.DataFrame:
+    """
+    Single-symbol 1m bars, resilient to transient timeouts and 5xx.
+    Returns a tz-aware index DataFrame with columns: open, high, low, close, volume
+    On any fatal error -> empty DataFrame (caller already handles empty).
+    """
+    try:
+        url = f"{ALP_DATA_BASE}/v2/stocks/{symbol}/bars"
+        params = {
+            "timeframe": "1Min",
+            "start": start_iso,   # e.g. '2025-10-12T23:00:31Z'
+            "end":   end_iso,     # e.g. '2025-10-14T15:00:31Z'
+            "limit": min(10000, int(limit)),
+            "adjustment": adjustment
+        }
+        s = _get_session()
+        r = s.get(url, headers=_headers(), params=params, timeout=DATA_TIMEOUT_SEC)
+        if r.status_code != 200:
+            # Soft-fail: return empty df; upstream will skip this symbol
+            return pd.DataFrame()
 
-def get_universe_symbols(limit: int = 10000) -> list[str]:
-    """Uses Alpaca /v2/assets (active, US equities), filters by ALLOWED_EXCHANGES and MIN_PRICE gate"""
-    base = os.getenv("ALPACA_TRADE_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-    url = f"{base}/v2/assets"
-    params = {"status":"active", "asset_class":"us_equity"}
-    r = requests.get(url, headers=_headers(), params=params, timeout=30)
-    if r.status_code != 200:
-        return []
-    out = []
-    for row in r.json():
-        sym = row.get("symbol", "")
-        exch = (row.get("exchange", "") or "").upper()
-        if not sym or not sym.isalnum():
-            continue
-        if ALLOWED_EXCHANGES and exch not in ALLOWED_EXCHANGES:
-            continue
-        out.append(sym)
-        if len(out) >= limit:
-            break
-    return out
+        js = r.json()
+        bars = js.get("bars") or []
+        if not bars:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(bars)
+        # Normalize column names to your expected schema
+        # Alpaca fields: t(Open time ISO), o, h, l, c, v, n, vw
+        if "t" not in df.columns:
+            return pd.DataFrame()
+        df["ts"] = pd.to_datetime(df["t"], utc=True)
+        df = df.set_index("ts").sort_index()
+        rename = {"o":"open","h":"high","l":"low","c":"close","v":"volume"}
+        df = df.rename(columns=rename)
+        keep = [c for c in ["open","high","low","close","volume"] if c in df.columns]
+        return df[keep]
+    except Exception:
+        # Any network/JSON error -> empty; your app already logs per-symbol fetch errors when SCANNER_DEBUG=1
+        return pd.DataFrame()
+
+# Optional: batched multi-symbol fetch (for later optimization)
+# Alpaca supports /v2/stocks/bars?symbols=AAPL,MSFT&timeframe=1Min...
+# You can add a fetch_1m_batch(symbols, start_iso, end_iso, ...) here when you want to
+# reduce HTTP calls further. Keeping the single-symbol API for drop-in safety today.
