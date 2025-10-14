@@ -14,7 +14,7 @@ from adapters.data_alpaca import (
     get_universe_symbols as _alpaca_universe,
 )
 from common.signal_bridge import (
-    send_to_broker,           # send_to_broker(symbol, sig, strategy_tag="ml_pattern")
+    send_to_broker,
     close_all_positions,
     list_positions,
     get_account_equity,
@@ -356,7 +356,6 @@ def ensure_session_baseline():
     try:
         eq = get_account_equity(default_equity=START_EQUITY)
     except TypeError:
-        # fallback in case signature differs
         eq = START_EQUITY
     except Exception:
         eq = START_EQUITY
@@ -384,7 +383,7 @@ def check_daily_guards():
         eq_now = float(eq_now)
     except Exception:
         eq_now = SESSION_START_EQUITY or START_EQUITY
-        
+
     if EQUITY_HIGH_WATER is None:
         EQUITY_HIGH_WATER = eq_now
     else:
@@ -409,20 +408,6 @@ def check_daily_guards():
         if DAILY_FLATTEN_ON_HIT:
             ok, info = close_all_positions()
             print(f"[DAILY-GUARD] Flatten -> ok={ok} info={info}", flush=True)
-
-def _active_equity_and_limits():
-    if USE_BROKER_EQUITY_GUARD:
-        ensure_session_baseline()
-        base = SESSION_START_EQUITY if SESSION_START_EQUITY is not None else EQUITY_USD
-        eq_now = get_account_equity(base)
-        up_lim = base * (1.0 + DAILY_TP_PCT)
-        dn_lim = base * (1.0 - DAILY_DD_PCT)
-        return eq_now, up_lim, dn_lim, "broker"
-    else:
-        eq_now = _current_equity_local()
-        up_lim = START_EQUITY * (1.0 + DAILY_TP_PCT)
-        dn_lim = START_EQUITY * (1.0 - DAILY_DD_PCT)
-        return eq_now, up_lim, dn_lim, "local"
 
 def reset_daily_state_if_new_day():
     global DAY_STAMP, HALT_TRADING, SESSION_BASELINE_SET, EQUITY_HIGH_WATER
@@ -449,7 +434,7 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
 
     ok, info = send_to_broker(symbol, sig, strategy_tag="ml_pattern")
     try:
-        (COMBO_COUNTS if ok else COMBO_COUNTS)[f"{combo_key}::orders.{'ok' if ok else 'err'}"] += 1
+        COMBO_COUNTS[f"{combo_key}::orders.{'ok' if ok else 'err'}"] += 1
         COUNTS["orders.ok" if ok else "orders.err"] += 1
     except Exception:
         pass
@@ -483,7 +468,7 @@ def main():
     print(f"[BOOT] DAILY_GUARD_ENABLED={int(DAILY_GUARD_ENABLED)} UP={DAILY_TP_PCT:.0%} DOWN={DAILY_DD_PCT:.0%} "
           f"FLATTEN={int(DAILY_FLATTEN_ON_HIT)} START_EQUITY={START_EQUITY:.2f}", flush=True)
     print(f"[BOOT] BROKER_GUARD={int(USE_BROKER_EQUITY_GUARD)} BASELINE_AT_0930={int(SESSION_BASELINE_AT_0930)} TRAIL_DD={TRAIL_DD_PCT:.0%}", flush=True)
-     
+
     from common.signal_bridge import probe_alpaca_auth
     probe_alpaca_auth()
 
@@ -515,36 +500,68 @@ def main():
                 except Exception as e:
                     print(f"[CLOSE-PHASE ERROR] {sym} {tf}m: {e}", flush=True)
 
-            # ---- Guards (daily only)
+            # ---- Daily guard (broker equity)
             check_daily_guards()
+
+            # ---- Hardened EOD manager (runs BEFORE deciding allow_entries)
+            now_et = _now_et()
+
+            def _cancel_all_open_orders_safely():
+                try:
+                    ok, info = cancel_all_orders()
+                    print(f"[EOD] Cancel all open orders -> ok={ok} info={info}", flush=True)
+                except Exception as e:
+                    import traceback
+                    print("[EOD] Cancel orders exception:", e, traceback.format_exc(), flush=True)
+
+            def _flatten_until_flat(max_iters=5, sleep_s=2):
+                for i in range(max_iters):
+                    try:
+                        pos = list_positions() or []
+                        if not pos:
+                            print(f"[EOD] Flat after pass {i}", flush=True)
+                            return True
+                        print(f"[EOD] Flatten pass {i+1}: positions={len(pos)}", flush=True)
+                        ok, info = close_all_positions()
+                        print(f"[EOD] Flatten call -> ok={ok} info={info}", flush=True)
+                    except Exception as e:
+                        import traceback
+                        print("[EOD] Flatten exception:", e, traceback.format_exc(), flush=True)
+                    time.sleep(sleep_s)
+                pos = list_positions() or []
+                print(f"[EOD] Final position check -> {len(pos)} open", flush=True)
+                return len(pos) == 0
+
+            # 1) Stop new entries before the close
+            if now_et.hour == 15 and now_et.minute >= 45:
+                if not HALT_TRADING:
+                    HALT_TRADING = True
+                    print("[EOD] HALT_TRADING enabled at 3:45 ET (no new entries).", flush=True)
+
+            # 2) Pre-close consolidation & flatten window (3:50–4:00 ET)
+            if now_et.hour == 15 and now_et.minute >= 50:
+                print("[EOD] Pre-close window (3:50–4:00 ET): cancel orders + flatten until flat.", flush=True)
+                _cancel_all_open_orders_safely()
+                _flatten_until_flat()
+
+            # 3) Safety net right after bell (4:00–4:03 ET)
+            if now_et.hour == 16 and now_et.minute < 3:
+                print("[EOD] Post-bell safety net (4:00–4:03 ET).", flush=True)
+                _cancel_all_open_orders_safely()
+                _flatten_until_flat()
+
+            # ---- Decide if we may place new entries *after* EOD logic ran
             allow_entries = not HALT_TRADING
             if not allow_entries:
-                time.sleep(POLL_SECONDS); continue
+                time.sleep(POLL_SECONDS)
+                continue
 
             # ---- Scan & signal phase
             if SCANNER_MARKET_HOURS_ONLY and not _market_session_now():
                 if SCANNER_DEBUG:
                     print("[SCAN] Skipping — market session closed.", flush=True)
-                # EOD handling even if closed:
-                now_et = _now_et()
-                if now_et.hour == 15 and now_et.minute >= 50:
-                    print("[EOD] Pre-close flatten window (3:50–4:00 ET).", flush=True)
-                    ok, info = close_all_positions()
-                    print(f"[EOD] Alpaca flatten -> ok={ok} info={info}", flush=True)
-                    HALT_TRADING = True
-                elif now_et.hour == 16 and now_et.minute < 3:
-                    pos = list_positions()
-                    if pos:
-                        print(f"[EOD] Safety net: positions still open ({len(pos)}). Flattening…", flush=True)
-                        ok, info = close_all_positions()
-                        print(f"[EOD] Safety flatten -> ok={ok} info={info}", flush=True)
-                        HALT_TRADING = True
                 time.sleep(POLL_SECONDS)
                 continue
-
-            # Max concurrent positions (kept parity; optional)
-            open_positions = sum(1 for lst in OPEN_TRADES.values() for t in lst if t.is_open)
-            # (you can turn this into an env like MAX_CONCURRENT_POSITIONS as in other files)
 
             # Round-robin batching to control API rate
             batch = _batched_symbols(symbols)
@@ -564,8 +581,6 @@ def main():
                     df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
 
                 for tf in TF_MIN_LIST:
-                    sig = signal_ml_pattern("ml_pattern", df1m, tf_min=tf)  # wrong call signature guard
-                    # Correct call:
                     sig = signal_ml_pattern(sym, df1m, tf)
                     if not sig:
                         continue
@@ -575,58 +590,6 @@ def main():
                     _sent_keys.add(k)
 
                     handle_signal("ml_pattern", sym, tf, sig)
-
-            # ---- EOD management during open session tick (PRE-CLOSE + SAFETY) ----
-            # Make sure at the TOP of main() you have:  global HALT_TRADING
-            now_et = _now_et()
-
-            def _cancel_all_open_orders_safely():
-                try:
-                    ok, info = cancel_all_orders()
-                    print(f"[EOD] Cancel all open orders -> ok={ok} info={info}", flush=True)
-                except Exception as e:
-                    import traceback
-                    print("[EOD] Cancel orders exception:", e, traceback.format_exc(), flush=True)
-
-            def _flatten_until_flat(max_iters=5, sleep_s=2):
-                for i in range(max_iters):
-                    try:
-                        pos = list_positions() or []
-                        if not pos:
-                            print("[EOD] Positions already flat.", flush=True)
-                            return True
-                        print(f"[EOD] Flatten pass {i+1}: positions={len(pos)}", flush=True)
-                        ok, info = close_all_positions()
-                        print(f"[EOD] Flatten call -> ok={ok} info={info}", flush=True)
-                    except Exception as e:
-                        import traceback
-                        print("[EOD] Flatten exception:", e, traceback.format_exc(), flush=True)
-                    time.sleep(sleep_s)
-                # final check
-                try:
-                    pos = list_positions() or []
-                    print(f"[EOD] Final position check -> {len(pos)} open", flush=True)
-                    return len(pos) == 0
-                except Exception:
-                    return False
-
-            # 1) Stop new entries before the close
-            if now_et.hour == 15 and now_et.minute >= 45:
-                if not HALT_TRADING:
-                    HALT_TRADING = True
-                    print("[EOD] HALT_TRADING enabled at 3:45 ET (no new entries).", flush=True)
-
-            # 2) Pre-close consolidation & flatten window (3:50–4:00 ET)
-            if now_et.hour == 15 and now_et.minute >= 50:
-                print("[EOD] Pre-close window (3:50–4:00 ET): cancel orders + flatten until flat.", flush=True)
-                _cancel_all_open_orders_safely()
-                _flatten_until_flat()
-
-            # 3) Safety net right after bell (4:00–4:03 ET)
-            if now_et.hour == 16 and now_et.minute < 3:
-                print("[EOD] Post-bell safety net (4:00–4:03 ET).", flush=True)
-                _cancel_all_open_orders_safely()
-                _flatten_until_flat()
 
         except Exception as e:
             import traceback
