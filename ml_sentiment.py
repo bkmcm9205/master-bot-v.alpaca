@@ -73,6 +73,12 @@ DAILY_GUARD_ENABLED       = os.getenv("DAILY_GUARD_ENABLED","1").lower() in ("1"
 HALT_TRADING              = False
 DAY_STAMP                 = datetime.now().astimezone().strftime("%Y-%m-%d")
 
+# --- Broker-equity guard (optional; pulls actual Alpaca account equity)
+USE_BROKER_EQUITY_GUARD   = os.getenv("USE_BROKER_EQUITY_GUARD","0").lower() in ("1","true","yes")
+SESSION_BASELINE_AT_0930  = os.getenv("SESSION_BASELINE_AT_0930","1").lower() in ("1","true","yes")
+TRAIL_GUARD_ENABLED       = os.getenv("TRAIL_GUARD_ENABLED","1").lower() in ("1","true","yes")
+TRAIL_DD_PCT              = float(os.getenv("TRAIL_DD_PCT","0.05"))
+
 # Engine guards
 MAX_CONCURRENT_POSITIONS  = int(os.getenv("MAX_CONCURRENT_POSITIONS", "500"))
 MAX_ORDERS_PER_MIN        = int(os.getenv("MAX_ORDERS_PER_MIN", "500"))
