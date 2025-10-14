@@ -1,11 +1,13 @@
-# common/signal_bridge.py
-import os, json, requests
+# common/signal_bridge.py  — Alpaca plumbing (robust TP/SL normalization)
+
+import os
+import json
+import requests
 from datetime import datetime, timezone
 
-# ---- ENV / BASE ----
-ALP_BASE = (os.getenv("ALPACA_TRADE_BASE_URL", "https://paper-api.alpaca.markets") or "").rstrip("/")
-ALP_KEY  = (os.getenv("ALPACA_API_KEY_ID", "") or "").strip()
-ALP_SEC  = (os.getenv("ALPACA_SECRET_KEY", "") or "").strip()
+ALP_TRADE_BASE = os.getenv("ALPACA_TRADE_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+ALP_KEY        = os.getenv("ALPACA_API_KEY_ID", "")
+ALP_SEC        = os.getenv("ALPACA_SECRET_KEY", "")
 
 def _alp_headers():
     return {
@@ -14,193 +16,203 @@ def _alp_headers():
         "Content-Type": "application/json",
     }
 
-def _safe_head(s: str, n=4):
-    s = s or ""
-    return (s[:n] + "…" + s[-3:]) if len(s) > (n + 3) else s
-
-# --------------------------------------------------------------------
-# AUTH PROBE (handy in boot logs)
-# --------------------------------------------------------------------
-def probe_alpaca_auth():
+# ---------------------------
+# Helpers
+# ---------------------------
+def _to_float(x):
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
     try:
-        url = f"{ALP_BASE}/v2/account"
-        r = requests.get(url, headers=_alp_headers(), timeout=12)
-        key_hint = _safe_head(ALP_KEY, 3)
-        print(f"[PROBE] GET /v2/account -> {r.status_code} key={key_hint} base={ALP_BASE}", flush=True)
-        if r.status_code == 200:
-            js = r.json()
-            acct = js.get("account_number", "?")
-            status = js.get("status", "?")
-            ccy = js.get("currency", "?")
-            print(f"[PROBE] account_number={acct} status={status} currency={ccy}", flush=True)
-        else:
-            print(f"[PROBE] body: {(r.text or '')[:400]}", flush=True)
-    except Exception as e:
-        print(f"[PROBE] exception: {type(e).__name__}: {e}", flush=True)
+        return float(str(x))
+    except Exception:
+        return None
 
-# --------------------------------------------------------------------
-# CORE SEND (accepts payload dict *or* (symbol, sig, strategy_tag))
-# --------------------------------------------------------------------
-def send_to_broker(symbol_or_payload, maybe_sig=None, strategy_tag=None):
+def _extract_tp(payload: dict):
     """
-    Compatible with both call signatures:
-      - send_to_broker(symbol, sig, strategy_tag=?)
+    Accepts any of:
+      - payload["takeProfit"] = 123.45
+      - payload["takeProfit"] = {"limitPrice": 123.45}
+      - payload["tp_abs"] = 123.45
+    Returns a float or None.
+    """
+    if "takeProfit" in payload:
+        tp = payload["takeProfit"]
+        if isinstance(tp, dict):
+            return _to_float(tp.get("limitPrice") or tp.get("price"))
+        return _to_float(tp)
+    if "tp_abs" in payload:
+        return _to_float(payload["tp_abs"])
+    return None
+
+def _extract_sl(payload: dict):
+    """
+    Accepts any of:
+      - payload["stopLoss"] = 120.10
+      - payload["stopLoss"] = {"stopPrice": 120.10}
+      - payload["sl_abs"] = 120.10
+    Returns a float or None.
+    """
+    if "stopLoss" in payload:
+        sl = payload["stopLoss"]
+        if isinstance(sl, dict):
+            return _to_float(sl.get("stopPrice") or sl.get("price"))
+        return _to_float(sl)
+    if "sl_abs" in payload:
+        return _to_float(payload["sl_abs"])
+    return None
+
+def _extract_limit(payload: dict):
+    """
+    Limit entry price if orderType == 'limit'.
+    Accepts payload["limitPrice"] or payload["price"] (number/string).
+    """
+    lp = payload.get("limitPrice", payload.get("price"))
+    return _to_float(lp)
+
+def _side_from_action(action: str):
+    a = (action or "").lower()
+    if a in ("buy", "buy_to_cover"):
+        return "buy"
+    # normalize both "sell" and "sell_short" to "sell" for entry (Alpaca uses qty + side)
+    return "sell"
+
+def _payload_from_args(symbol_or_payload, sig=None, strategy_tag=None):
+    """
+    Supports both call styles:
+      - send_to_broker(symbol, sig, strategy_tag=None)
       - send_to_broker(payload_dict)
-
-    Expected fields (we normalize internally):
-      ticker, action, orderType, quantity, price (optional),
-      takeProfit / tp_abs, stopLoss / sl_abs, entry (optional), meta
+    Returns unified payload dict with keys: ticker, action, orderType, quantity, entry, takeProfit/stopLoss (numeric or dict ok).
     """
-    # Normalize payload
-    if isinstance(symbol_or_payload, dict):
-        payload_in = dict(symbol_or_payload)
-    else:
-        symbol = symbol_or_payload
-        sig = maybe_sig or {}
-        payload_in = {
-            "ticker": symbol,
-            "action": sig.get("action"),
-            "orderType": sig.get("orderType", "market"),
-            "quantity": int(sig.get("quantity", 0)),
-            "price": sig.get("limitPrice", sig.get("price")),
-            "takeProfit": sig.get("tp_abs", sig.get("takeProfit")),
-            "stopLoss": sig.get("sl_abs", sig.get("stopLoss")),
-            "entry": sig.get("entry"),
-            "meta": sig.get("meta", {}),
-        }
-        if strategy_tag:
-            payload_in.setdefault("meta", {})
-            payload_in["meta"]["strategy"] = strategy_tag
+    if isinstance(symbol_or_payload, dict) and sig is None:
+        # Already a full payload
+        payload = dict(symbol_or_payload)  # shallow copy
+        if "ticker" not in payload and "symbol" in payload:
+            payload["ticker"] = payload["symbol"]
+        return payload
 
+    # Build payload from (symbol, sig)
+    symbol = symbol_or_payload
+    sig = sig or {}
+    payload = {
+        "ticker": symbol,
+        "action": sig.get("action"),
+        "orderType": sig.get("orderType", "market"),
+        "quantity": int(sig.get("quantity", 0)),
+        "entry": _to_float(sig.get("entry") or sig.get("price") or sig.get("lastClose")),
+        # Preserve both absolute and nested variants if provided
+        "takeProfit": sig.get("takeProfit") if "takeProfit" in sig else sig.get("tp_abs"),
+        "stopLoss":   sig.get("stopLoss")   if "stopLoss"   in sig else sig.get("sl_abs"),
+        "limitPrice": sig.get("limitPrice") or sig.get("price"),
+        "meta": {},
+    }
+    if isinstance(sig.get("meta"), dict):
+        payload["meta"].update(sig["meta"])
+    if strategy_tag:
+        payload["meta"]["strategy"] = strategy_tag
+    if sig.get("barTime"):
+        payload["meta"]["barTime"] = sig["barTime"]
+    return payload
+
+# ---------------------------
+# Public functions (used by apps)
+# ---------------------------
+def send_to_broker(symbol_or_payload, sig=None, strategy_tag=None):
+    """
+    Places an order via Alpaca REST.
+    - Accepts both calling styles (see _payload_from_args).
+    - Normalizes TP/SL whether numeric or dict.
+    - Enforces Alpaca 1¢ min distance from base price.
+    """
     try:
-        symbol = payload_in["ticker"]
-        act    = (payload_in.get("action") or "").lower()
-        side   = "buy" if act in ("buy", "buy_to_cover") else "sell"
-        otype  = (payload_in.get("orderType") or "market").lower()
-        qty    = int(payload_in.get("quantity", 0))
-        entry  = payload_in.get("entry")
-        tp     = payload_in.get("takeProfit")
-        sl     = payload_in.get("stopLoss")
+        payload = _payload_from_args(symbol_or_payload, sig, strategy_tag)
+
+        symbol = payload["ticker"]
+        action = payload.get("action")
+        side   = _side_from_action(action)
+        otype  = (payload.get("orderType") or "market").lower()
+        qty    = int(payload.get("quantity", 0))
 
         order = {
             "symbol": symbol,
             "side": side,
             "type": "market" if otype == "market" else "limit",
             "time_in_force": "day",
-            "extended_hours": False,
             "qty": qty,
         }
 
-        # limit entry price if provided
-        if order["type"] == "limit" and payload_in.get("price") is not None:
-            order["limit_price"] = float(round(float(payload_in["price"]), 2))
+        if order["type"] == "limit":
+            lp = _extract_limit(payload)
+            if lp is not None:
+                order["limit_price"] = float(round(lp, 2))
 
-        # Enforce >= $0.01 spacing when we know entry
-        if entry is not None:
-            try:
-                base = float(entry)
-                if tp is not None:
-                    tp = float(tp)
-                    # move TP away by 0.01 in the favorable direction if needed
-                    if side == "buy"  and (tp - base) < 0.01:
-                        tp = round(base + 0.01, 2)
-                    if side == "sell" and (base - tp) < 0.01:
-                        tp = round(base - 0.01, 2)
-                if sl is not None:
-                    sl = float(sl)
-                    if side == "buy"  and (base - sl) < 0.01:
-                        sl = round(base - 0.01, 2)
-                    if side == "sell" and (sl - base) < 0.01:
-                        sl = round(base + 0.01, 2)
-            except Exception:
-                pass
+        # Normalize TP/SL regardless of shape
+        tp = _extract_tp(payload)
+        sl = _extract_sl(payload)
 
-        # Bracket (both) vs OTO (single exit)
-        if tp is not None and sl is not None:
+        # Enforce 1¢ distance if we know base price (entry or limit)
+        base_price = _to_float(payload.get("entry") or payload.get("price") or order.get("limit_price"))
+        if base_price is not None:
+            if tp is not None and (tp - base_price) < 0.01:
+                tp = round(base_price + 0.01, 2)
+            if sl is not None:
+                if side == "buy" and (base_price - sl) < 0.01:
+                    sl = round(base_price - 0.01, 2)
+                if side == "sell" and (sl - base_price) < 0.01:
+                    sl = round(base_price + 0.01, 2)
+
+        if tp is not None or sl is not None:
             order["order_class"] = "bracket"
-            order["take_profit"] = {"limit_price": float(round(tp, 2))}
-            order["stop_loss"]   = {"stop_price":  float(round(sl, 2))}
-        elif tp is not None or sl is not None:
-            order["order_class"] = "oto"
             if tp is not None:
                 order["take_profit"] = {"limit_price": float(round(tp, 2))}
             if sl is not None:
-                order["stop_loss"]   = {"stop_price":  float(round(sl, 2))}
+                order["stop_loss"] = {"stop_price": float(round(sl, 2))}
 
-        # POST
-        url = f"{ALP_BASE}/v2/orders"
-        r = requests.post(url, headers=_alp_headers(), json=order, timeout=15)
-
-        if 200 <= r.status_code < 300:
-            return True, f"{r.status_code} {r.text[:300]}"
-
-        # 401 diagnostics
-        if r.status_code == 401:
-            key_hint = _safe_head(ALP_KEY, 4)
-            diag = {
-                "where": "POST /v2/orders",
-                "status": r.status_code,
-                "base": ALP_BASE,
-                "key_prefix": key_hint,
-                "symbol": symbol,
-                "side": side,
-                "type": order.get("type"),
-                "order_class": order.get("order_class", "simple"),
-                "has_tp": "take_profit" in order,
-                "has_sl": "stop_loss" in order,
-                "body": (r.text or "")[:400],
-            }
-            print(f"[AUTH-401] {json.dumps(diag, separators=(',',':'))}", flush=True)
-        else:
-            print(f"[ORDER-ERR] {r.status_code} {(r.text or '')[:400]}", flush=True)
-
-        return False, f"{r.status_code} {r.text[:300]}"
+        r = requests.post(f"{ALP_TRADE_BASE}/v2/orders", headers=_alp_headers(), json=order, timeout=15)
+        return (200 <= r.status_code < 300), f"{r.status_code} {r.text[:300]}"
 
     except Exception as e:
         return False, f"exception: {e}"
 
-# --------------------------------------------------------------------
-# POSITIONS / FLATTEN / CANCELS
-# --------------------------------------------------------------------
 def list_positions():
-    try:
-        r = requests.get(f"{ALP_BASE}/v2/positions", headers=_alp_headers(), timeout=15)
-        return r.json() if r.status_code == 200 else []
-    except Exception:
-        return []
+    r = requests.get(f"{ALP_TRADE_BASE}/v2/positions", headers=_alp_headers(), timeout=15)
+    return r.json() if r.status_code == 200 else []
 
 def close_all_positions():
-    """
-    Flatten all positions. Returns (ok: bool, info: str).
-    (If callers assign only to `ok`, it's still truthy in prints.)
-    """
-    try:
-        r = requests.delete(f"{ALP_BASE}/v2/positions", headers=_alp_headers(), timeout=30)
-        ok = 200 <= r.status_code < 300
-        return ok, f"{r.status_code} {(r.text or '')[:300]}"
-    except Exception as e:
-        return False, f"exception: {e}"
+    r = requests.delete(f"{ALP_TRADE_BASE}/v2/positions", headers=_alp_headers(), timeout=25)
+    ok = 200 <= r.status_code < 300
+    info = f"{r.status_code} {r.text[:300]}"
+    return ok, info
 
 def cancel_all_orders():
-    """
-    Cancel all open orders. Returns (ok: bool, info: str).
-    """
-    try:
-        r = requests.delete(f"{ALP_BASE}/v2/orders", headers=_alp_headers(), timeout=20)
-        ok = 200 <= r.status_code < 300
-        return ok, f"{r.status_code} {(r.text or '')[:300]}"
-    except Exception as e:
-        return False, f"exception: {e}"
+    r = requests.delete(f"{ALP_TRADE_BASE}/v2/orders", headers=_alp_headers(), timeout=15)
+    ok = 200 <= r.status_code < 300
+    info = f"{r.status_code} {r.text[:300]}"
+    return ok, info
 
-# --------------------------------------------------------------------
-# ACCOUNT EQUITY (used by broker guard)
-# --------------------------------------------------------------------
 def get_account_equity(default_equity: float):
+    r = requests.get(f"{ALP_TRADE_BASE}/v2/account", headers=_alp_headers(), timeout=12)
+    if r.status_code != 200:
+        return default_equity
     try:
-        r = requests.get(f"{ALP_BASE}/v2/account", headers=_alp_headers(), timeout=12)
-        if r.status_code != 200:
-            return default_equity
-        js = r.json()
-        return float(js.get("equity", default_equity))
+        return float(r.json().get("equity", default_equity))
     except Exception:
         return default_equity
+
+def probe_alpaca_auth():
+    """Optional boot probe for keys + trade host."""
+    try:
+        key_hint = f"{ALP_KEY[:3]}…{ALP_KEY[-3:]}" if ALP_KEY else "<empty>"
+        r = requests.get(f"{ALP_TRADE_BASE}/v2/account", headers=_alp_headers(), timeout=10)
+        print(f"[PROBE] GET /v2/account -> {r.status_code} key={key_hint} base={ALP_TRADE_BASE}", flush=True)
+        if r.status_code == 200:
+            js = r.json()
+            acct = js.get("account_number")
+            status = js.get("status")
+            ccy = js.get("currency")
+            print(f"[PROBE] account_number={acct} status={status} currency={ccy}", flush=True)
+        else:
+            print(f"[PROBE] body: {r.text[:500]}", flush=True)
+    except Exception as e:
+        print(f"[PROBE] exception: {type(e).__name__}: {e}", flush=True)
