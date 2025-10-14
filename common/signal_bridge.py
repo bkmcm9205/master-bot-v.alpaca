@@ -179,3 +179,19 @@ def get_account_equity(default_equity: float | None = None) -> float:
         return float(js.get("equity", default_equity if default_equity is not None else 0.0))
     except Exception:
         return float(default_equity) if default_equity is not None else 0.0
+
+def probe_alpaca_auth():
+    try:
+        import json, os, requests
+        base = os.getenv("ALPACA_TRADE_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+        r = requests.get(f"{base}/v2/account", headers=_alp_headers(), timeout=10)
+        key_id = (os.getenv("ALPACA_API_KEY_ID","") or "")
+        key_hint = f"{key_id[:3]}…{key_id[-3:]}" if len(key_id) >= 7 else "(short)"
+        print(f"[PROBE] GET /v2/account -> {r.status_code} key={key_hint} base={base}", flush=True)
+        if r.status_code == 200:
+            acct = r.json()
+            print(f"[PROBE] account_number={acct.get('account_number')} status={acct.get('status')} currency={acct.get('currency')}", flush=True)
+        else:
+            print(f"[PROBE] body: {r.text[:400]}", flush=True)
+    except Exception as e:
+        print(f"[PROBE] exception: {type(e).__name__}: {e}", flush=True)
