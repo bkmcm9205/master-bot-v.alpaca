@@ -1,42 +1,55 @@
 # ml_merged_app.py — bi-directional ML scanner with sentiment regime
-# (PLUMBING-ONLY SWAP: Polygon + TradersPost -> Alpaca adapters)
-#
-# Models/guards/sizing logic unchanged. Only data + broker I/O are rewired.
+# (PLUMBING SWAP: Polygon/TP -> Alpaca adapters)
+# - ML & sentiment logic unchanged
+# - Data via adapters.data_alpaca
+# - Orders via common.signal_bridge (Alpaca)
+# - Hardened EOD: halt 3:45 ET, cancel orders, flatten in passes, post-bell safety net
 
-import os, time, json, math, hashlib, requests
+import os, time, json, math, hashlib
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+import requests
 
-# === Alpaca adapters (data + broker) ===
+# === Alpaca adapters (data + broker/plumbing) ===
 from adapters.data_alpaca import (
-    fetch_1m as _alpaca_fetch_1m,
-    resample as _resample,
-    get_universe_symbols as _alpaca_universe,
-)
-from common.signal_bridge import (
-    send_to_broker,              # usage: send_to_broker(symbol, sig, strategy_tag)
-    close_all_positions,
-    list_positions,
-    get_account_equity,
+    fetch_1m as _alpaca_fetch_1m,     # fetch_1m(symbol, start_iso, end_iso, limit)
+    resample as _resample,            # resample(df1m, tf_min)
+    get_universe_symbols as _alpaca_universe,  # universe w/ exchange filters inside adapter
 )
 
+from common.signal_bridge import (
+    send_to_broker,              # send_to_broker(payload: dict) -> (ok: bool, info: str)
+    close_all_positions,         # -> (ok: bool, info: str)
+    list_positions,              # -> list
+    get_account_equity,          # (default_equity: float) -> float
+    cancel_all_orders,           # -> (ok: bool, info: str)
+)
+
+# ------------------------------------------------------------------------------------
+# Backward-compatible fetch wrapper (so existing code calling fetch_bars_1m keeps working)
+# ------------------------------------------------------------------------------------
 def fetch_bars_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
-    """
-    Backward-compatible wrapper so existing calls like
-    fetch_bars_1m('AAPL', lookback_minutes=...) keep working.
-    """
     end = datetime.now(timezone.utc)
     start = end - timedelta(minutes=lookback_minutes)
     start_iso = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    end_iso = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    return _alpaca_fetch_1m(symbol, start_iso=start_iso, end_iso=end_iso, limit=10000)
+    end_iso   = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    df = _alpaca_fetch_1m(symbol, start_iso=start_iso, end_iso=end_iso, limit=10000)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    try:
+        df.index = df.index.tz_convert(MARKET_TZ)
+    except Exception:
+        df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
+    # Ensure expected columns
+    cols = [c for c in ["open","high","low","close","volume"] if c in df.columns]
+    return df[cols].copy() if cols else pd.DataFrame()
 
 # =============================
-# ENV / CONFIG (unchanged)
+# ENV / CONFIG
 # =============================
 POLL_SECONDS    = int(os.getenv("POLL_SECONDS", "10"))
 DRY_RUN         = os.getenv("DRY_RUN", "0").lower() in ("1","true","yes")
@@ -52,14 +65,13 @@ SCANNER_SYMBOLS = os.getenv("SCANNER_SYMBOLS", "").strip()
 TF_MIN_LIST     = [int(x) for x in os.getenv("TF_MIN_LIST", "1,2,3,5,10").split(",") if x.strip()]
 MARKET_TZ       = os.getenv("MARKET_TZ", "America/New_York")
 
-# (Polygon-only prefilter flags retained but no-op now)
-USE_GROUPED_DAILY_PREFILTER = os.getenv("USE_GROUPED_DAILY_PREFILTER","1").lower() in ("1","true","yes")
-MAX_UNIVERSE_PAGES          = int(os.getenv("MAX_UNIVERSE_PAGES", "2"))
+# Pagination/batching
 SCAN_BATCH_SIZE             = int(os.getenv("SCAN_BATCH_SIZE", "300"))
-SCANNER_MIN_AVG_VOL         = int(os.getenv("SCANNER_MIN_AVG_VOL", "1000000"))  # (Polygon grouped-daily—no-op)
+
+# Volume gates (today’s 1m sum; grouped-daily prefilter is a Polygon-only concept, skipped)
 SCANNER_MIN_TODAY_VOL       = int(os.getenv("SCANNER_MIN_TODAY_VOL", "500000"))
 
-# Price + exchange gates
+# Price + exchange gates (enforced in-scan)
 MIN_PRICE = float(os.getenv("MIN_PRICE", "3.0"))
 ALLOWED_EXCHANGES = set(
     x.strip().upper()
@@ -92,14 +104,13 @@ USE_SENTIMENT_REGIME   = os.getenv("USE_SENTIMENT_REGIME","1").lower() in ("1","
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "100"))
 MAX_ORDERS_PER_MIN       = int(os.getenv("MAX_ORDERS_PER_MIN", "60"))
 
-# --- Local daily guard
+# --- Daily guard (local) and broker guard
 DAILY_GUARD_ENABLED  = os.getenv("DAILY_GUARD_ENABLED","1").lower() in ("1","true","yes")
 START_EQUITY         = float(os.getenv("START_EQUITY","100000"))
-DAILY_TP_PCT         = float(os.getenv("DAILY_TP_PCT","0.03"))
-DAILY_DD_PCT         = float(os.getenv("DAILY_DD_PCT","0.05"))
+DAILY_TP_PCT         = float(os.getenv("DAILY_TP_PCT","0.10"))  # 10%
+DAILY_DD_PCT         = float(os.getenv("DAILY_DD_PCT","0.05"))  # 5%
 DAILY_FLATTEN_ON_HIT = os.getenv("DAILY_FLATTEN_ON_HIT","1").lower() in ("1","true","yes")
 
-# --- Broker-equity guard
 USE_BROKER_EQUITY_GUARD   = os.getenv("USE_BROKER_EQUITY_GUARD","0").lower() in ("1","true","yes")
 SESSION_START_EQUITY_ENV  = os.getenv("SESSION_START_EQUITY","").strip()
 SESSION_START_EQUITY      = float(SESSION_START_EQUITY_ENV) if SESSION_START_EQUITY_ENV else None
@@ -115,7 +126,7 @@ KILL_SWITCH       = os.getenv("KILL_SWITCH","OFF").lower() in ("1","true","yes",
 KILL_SWITCH_MODE  = os.getenv("KILL_SWITCH_MODE","halt").lower()   # 'halt' or 'flatten'
 
 # =============================
-# State / ledgers (unchanged)
+# State / ledgers
 # =============================
 COUNTS        = defaultdict(int)
 COMBO_COUNTS  = defaultdict(int)
@@ -136,14 +147,14 @@ EQUITY_HIGH_WATER    = None
 _rr_idx = 0
 
 # =============================
-# Models / classes (unchanged)
+# Models / classes
 # =============================
 class LiveTrade:
     def __init__(self, combo, symbol, tf_min, side, entry, tp, sl, qty, entry_time):
         self.combo = combo
         self.symbol = symbol
         self.tf_min = int(tf_min)
-        self.side = side
+        self.side = side            # "buy" or "sell" (normalized)
         self.entry = float(entry) if entry is not None else float("nan")
         self.tp = float(tp) if tp is not None else float("nan")
         self.sl = float(sl) if sl is not None else float("nan")
@@ -155,7 +166,7 @@ class LiveTrade:
         self.reason = None
 
 # =============================
-# Time/session helpers (unchanged)
+# Time/session helpers
 # =============================
 def _now_et():
     return datetime.now(timezone.utc).astimezone(ZoneInfo(MARKET_TZ))
@@ -178,7 +189,7 @@ def _after_0930_now():
     return (ts.hour > 9) or (ts.hour == 9 and ts.minute >= 30)
 
 # =============================
-# Math / sizing (unchanged)
+# Math / sizing
 # =============================
 def _position_qty(entry_price: float, stop_price: float,
                   equity=EQUITY_USD, risk_pct=RISK_PCT, max_pos_pct=MAX_POS_PCT,
@@ -194,27 +205,28 @@ def _position_qty(entry_price: float, stop_price: float,
     return int(max(qty, min_qty if qty > 0 else 0))
 
 # =============================
-# Alpaca data/universe (replaces Polygon)
+# Universe (Alpaca)
 # =============================
 def get_universe_symbols() -> list:
-    """SCANNER_SYMBOLS override, else Alpaca /v2/assets filtered by ALLOWED_EXCHANGES/MIN_PRICE via adapter."""
+    """SCANNER_SYMBOLS override, else Alpaca assets via adapter."""
     if SCANNER_SYMBOLS:
         return [s.strip().upper() for s in SCANNER_SYMBOLS.split(",") if s.strip()]
-    syms = _alpaca_universe(limit=10000)
-    # NOTE: Polygon grouped-daily prefilter has no 1:1 Alpaca equivalent; skipping by design.
-    if USE_GROUPED_DAILY_PREFILTER and SCANNER_DEBUG:
-        print("[VOL FILTER] Skipped Polygon grouped-daily prefilter (no direct Alpaca equivalent).", flush=True)
-    return syms
+    return _alpaca_universe(limit=10000)
 
 # =============================
-# Performance tracking (unchanged)
+# Performance tracking
 # =============================
 def _combo_key(strategy: str, symbol: str, tf_min: int) -> str:
     return f"{strategy}|{symbol}|{int(tf_min)}"
 
 def _perf_init(combo: str):
     if combo not in PERF:
-        PERF[combo] = {"trades":0,"wins":0,"losses":0,"gross_profit":0.0,"gross_loss":0.0,"net_pnl":0.0,"max_dd":0.0,"equity_curve":[0.0]}
+        PERF[combo] = {
+            "trades": 0, "wins": 0, "losses": 0,
+            "gross_profit": 0.0, "gross_loss": 0.0,
+            "net_pnl": 0.0, "max_dd": 0.0,
+            "equity_curve": [0.0],
+        }
 
 def _perf_update(combo: str, pnl: float):
     _perf_init(combo)
@@ -266,7 +278,7 @@ def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, c
             print(f"[CLOSE] {t.combo} {t.reason.upper()} qty={t.qty} entry={t.entry:.2f} exit={t.exit:.2f} pnl={pnl:+.2f}", flush=True)
 
 # =============================
-# Sentiment (unchanged)
+# Sentiment
 # =============================
 def compute_sentiment():
     look_min = max(5, SENTIMENT_LOOKBACK_MIN)
@@ -293,7 +305,7 @@ def compute_sentiment():
     return "neutral"
 
 # =============================
-# ML adapter with sentiment regime (unchanged)
+# ML adapter
 # =============================
 def _ml_features_and_pred(bars: pd.DataFrame):
     try:
@@ -364,26 +376,31 @@ def signal_ml_pattern(symbol: str, df1m: pd.DataFrame, tf_min: int,
         elif sentiment == "bear":
             want_long = False
 
+    # Build signals — use "sell" for short to align with Alpaca bridge
     if want_long:
         qty = _position_qty(price, long_sl)
         if qty > 0:
-            return {"action":"buy","orderType":"market","price":None,
-                    "tp_abs": long_tp,"sl_abs": long_sl,
-                    "barTime": ts.tz_convert("UTC").isoformat(),"entry": price,
-                    "quantity": int(qty),
-                    "meta":{"note":"ml_pattern_long","proba_up": proba_up,"sentiment": sentiment}}
+            return {
+                "action":"buy","orderType":"market","price":None,
+                "tp_abs": long_tp,"sl_abs": long_sl,
+                "barTime": ts.tz_convert("UTC").isoformat(),"entry": price,
+                "quantity": int(qty),
+                "meta":{"note":"ml_pattern_long","proba_up": proba_up,"sentiment": sentiment}
+            }
     if want_short:
         qty = _position_qty(price, short_sl)
         if qty > 0:
-            return {"action":"sell_short","orderType":"market","price":None,
-                    "tp_abs": short_tp,"sl_abs": short_sl,
-                    "barTime": ts.tz_convert("UTC").isoformat(),"entry": price,
-                    "quantity": int(qty),
-                    "meta":{"note":"ml_pattern_short","proba_up": proba_up,"sentiment": sentiment}}
+            return {
+                "action":"sell","orderType":"market","price":None,
+                "tp_abs": short_tp,"sl_abs": short_sl,
+                "barTime": ts.tz_convert("UTC").isoformat(),"entry": price,
+                "quantity": int(qty),
+                "meta":{"note":"ml_pattern_short","proba_up": proba_up,"sentiment": sentiment}
+            }
     return None
 
 # =============================
-# Equity / guards (swap REST equity source)
+# Equity / guards
 # =============================
 def _realized_day_pnl() -> float:
     return sum(float(p.get("net_pnl", 0.0)) for p in PERF.values())
@@ -406,33 +423,21 @@ def _unrealized_day_pnl() -> float:
 def _current_equity_local() -> float:
     return START_EQUITY + _realized_day_pnl() + _unrealized_day_pnl()
 
-def _opposite(action: str) -> str:
-    a = (action or "").lower()
-    if a == "buy":
-        return "sell"
-    if a == "sell":
-        return "buy"
-    return "exit"
-
-def flatten_all_open_positions_webhook():
-    """
-    Replace legacy webhook flatten with direct broker flatten.
-    """
-    ok = close_all_positions()
-    print(f"[FLATTEN] close_all_positions -> ok={bool(ok)}", flush=True)
-    # Mark locals closed
-    for (sym, tf), trades in list(OPEN_TRADES.items()):
-        for t in trades:
-            if t.is_open:
-                t.is_open = False
-                t.exit_time = datetime.now(timezone.utc).isoformat()
-                t.exit = t.entry
-                t.reason = "flatten"
+def check_kill_switch() -> bool:
+    global HALTED, HALT_TRADING
+    if KILL_SWITCH and not HALTED:
+        HALTED = True
+        HALT_TRADING = True
+        print(f"[GUARD] Kill switch ON (mode={KILL_SWITCH_MODE}). Trading halted.", flush=True)
+        if KILL_SWITCH_MODE == "flatten":
+            _cancel_and_flatten_in_passes("KILL")
+        return True
+    return HALTED
 
 def ensure_session_baseline():
     """
     Establish broker-equity session baseline once per day if using broker guard.
-    Uses Alpaca equity via adapter when enabled.
+    Baseline optionally waits for 9:30 if SESSION_BASELINE_AT_0930=1.
     """
     global SESSION_START_EQUITY, EQUITY_BASELINE_DATE, EQUITY_BASELINE_SET, EQUITY_HIGH_WATER
     if not USE_BROKER_EQUITY_GUARD:
@@ -466,16 +471,6 @@ def _active_equity_and_limits():
         dn_lim = START_EQUITY * (1.0 - DAILY_DD_PCT)
         return eq_now, up_lim, dn_lim, "local"
 
-def check_kill_switch() -> bool:
-    global HALTED
-    if KILL_SWITCH and not HALTED:
-        HALTED = True
-        print(f"[GUARD] Kill switch ON (mode={KILL_SWITCH_MODE}). Trading halted.", flush=True)
-        if KILL_SWITCH_MODE == "flatten":
-            flatten_all_open_positions_webhook()
-        return True
-    return HALTED
-
 def check_daily_guards():
     global HALT_TRADING, HALTED, EQUITY_HIGH_WATER
     eq_now, up_lim, dn_lim, mode = _active_equity_and_limits()
@@ -494,54 +489,83 @@ def check_daily_guards():
             HALT_TRADING = True; HALTED = True
             print(f"[GUARD:{mode}] ✅ Profit target hit. Halting entries.", flush=True)
             if DAILY_FLATTEN_ON_HIT:
-                flatten_all_open_positions_webhook()
+                _cancel_and_flatten_in_passes("TP")
         elif eq_now <= dn_lim and not HALTED:
             HALT_TRADING = True; HALTED = True
             print(f"[GUARD:{mode}] ⛔ Drawdown limit hit. Halting entries.", flush=True)
             if DAILY_FLATTEN_ON_HIT:
-                flatten_all_open_positions_webhook()
-
-    if TRAIL_GUARD_ENABLED and EQUITY_HIGH_WATER and not HALTED:
-        trail_floor = EQUITY_HIGH_WATER * (1.0 - TRAIL_DD_PCT)
-        if eq_now <= trail_floor:
-            HALT_TRADING = True; HALTED = True
-            print(f"[GUARD:{mode}] 🛑 Trailing DD hit ({TRAIL_DD_PCT:.0%} from peak).", flush=True)
-            if TRAIL_FLATTEN_ON_HIT:
-                flatten_all_open_positions_webhook()
+                _cancel_and_flatten_in_passes("DD")
 
 def reset_daily_state_if_new_day():
-    global DAY_STAMP, HALT_TRADING, HALTED, EQUITY_HIGH_WATER
+    global DAY_STAMP, HALT_TRADING, HALTED, EQUITY_HIGH_WATER, EQUITY_BASELINE_SET
     today = datetime.now().astimezone().strftime("%Y-%m-%d")
     if today != DAY_STAMP:
         DAY_STAMP = today
         HALT_TRADING = False
         HALTED = False
         EQUITY_HIGH_WATER = None
+        EQUITY_BASELINE_SET = False
         print(f"[NEW DAY] State reset. START_EQUITY={START_EQUITY:.2f} DAY={DAY_STAMP}", flush=True)
 
-# ---- EOD manager (pre-close flatten + safety net) ----
+# =============================
+# EOD manager (HALT @ 3:45 ET, cancel+flatten in passes, safety net after bell)
+# =============================
+def _cancel_and_flatten_in_passes(tag: str, max_passes: int = 6, sleep_sec: float = 2.0):
+    try:
+        okc, infoc = cancel_all_orders()
+        print(f"[EOD:{tag}] Cancel orders -> ok={okc} info={infoc}", flush=True)
+    except Exception as e:
+        print(f"[EOD:{tag}] Cancel orders -> exception: {e}", flush=True)
+
+    for i in range(1, max_passes + 1):
+        try:
+            pos = list_positions() or []
+        except Exception as e:
+            print(f"[EOD:{tag}] list_positions exception: {e}", flush=True)
+            pos = []
+        if not pos:
+            print(f"[EOD:{tag}] Flat confirmed after {i-1} pass(es).", flush=True)
+            break
+        try:
+            okf, infof = close_all_positions()
+            print(f"[EOD:{tag}] Flatten pass {i}/{max_passes} -> ok={okf} info={infof} (open={len(pos)})", flush=True)
+        except Exception as e:
+            print(f"[EOD:{tag}] Flatten pass {i}/{max_passes} -> exception: {e}", flush=True)
+        # Re-cancel in case new/recreated orders appear
+        try:
+            okc2, infoc2 = cancel_all_orders()
+            print(f"[EOD:{tag}] Re-cancel -> ok={okc2} info={infoc2}", flush=True)
+        except Exception as e:
+            print(f"[EOD:{tag}] Re-cancel -> exception: {e}", flush=True)
+        time.sleep(sleep_sec)
+
+    # Mark locals closed (best-effort)
+    for (sym, tf), trades in list(OPEN_TRADES.items()):
+        for t in trades:
+            if t.is_open:
+                t.is_open = False
+                t.exit_time = datetime.now(timezone.utc).isoformat()
+                t.exit = t.entry
+                t.reason = f"eod_{tag.lower()}"
+
 def eod_manager():
-    """
-    3:50–4:00 ET: halt entries and flatten.
-    4:00–4:02 ET: safety net to ensure flat.
-    """
     global HALT_TRADING
     ts = _now_et()
-    # Pre-close window
-    if ts.hour == 15 and ts.minute >= 50:
+    # Pre-close window: 3:45–4:00 ET
+    if (ts.hour == 15 and ts.minute >= 45) and (ts.hour < 16):
         if not HALT_TRADING:
-            print("[EOD] Pre-close: halting new entries and flattening (3:50–4:00 ET).", flush=True)
+            print("[EOD] Pre-close: HALTING new entries at 3:45 ET and starting cancel+flatten passes.", flush=True)
         HALT_TRADING = True
-        flatten_all_open_positions_webhook()
-    # Safety net right after the bell
-    elif ts.hour == 16 and ts.minute < 3:
+        _cancel_and_flatten_in_passes("PRE")
+    # Safety net: 4:00–4:05 ET
+    elif ts.hour == 16 and ts.minute < 5:
         if not HALT_TRADING:
-            print("[EOD] Post-bell safety: halting entries and ensuring flat (4:00–4:02 ET).", flush=True)
+            print("[EOD] Post-bell safety: halting entries and ensuring flat (4:00–4:05 ET).", flush=True)
         HALT_TRADING = True
-        flatten_all_open_positions_webhook()
+        _cancel_and_flatten_in_passes("POST")
 
 # =============================
-# Routing & signal handling (send via Alpaca bridge)
+# Routing & signal handling (Alpaca bridge expects TradersPost-like payload)
 # =============================
 def _throttle_ok():
     now = time.time()
@@ -551,6 +575,28 @@ def _throttle_ok():
         return False, f"throttled: {len(_order_times)}/{MAX_ORDERS_PER_MIN} in last 60s"
     _order_times.append(now)
     return True, ""
+
+def _build_payload(symbol: str, sig: dict) -> dict:
+    payload = {
+        "ticker": symbol,
+        "action": sig.get("action"),
+        "orderType": sig.get("orderType", "market"),
+        "quantity": int(sig.get("quantity", 0)),
+        "meta": sig.get("meta", {})
+    }
+    # absolute TP/SL for bracket
+    tp_abs = sig.get("tp_abs", sig.get("takeProfit"))
+    sl_abs = sig.get("sl_abs", sig.get("stopLoss"))
+    if tp_abs is not None:
+        payload["takeProfit"] = {"limitPrice": float(round(tp_abs, 2))}
+    if sl_abs is not None:
+        payload["stopLoss"]   = {"stopPrice": float(round(sl_abs, 2))}
+    # helpful audit
+    if sig.get("barTime"): payload["meta"]["barTime"] = sig["barTime"]
+    if sig.get("entry")   : payload["entry"] = float(sig["entry"])
+    payload["meta"]["environment"] = "paper" if PAPER_MODE else "live"
+    payload["meta"]["runId"] = RUN_ID
+    return payload
 
 def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
     ok_throttle, why = _throttle_ok()
@@ -567,8 +613,8 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
 
     _record_open_trade(strat_name, symbol, tf_min, sig)
 
-    # Send via Alpaca adapter
-    ok, info = send_to_broker(symbol, sig, strategy_tag=strat_name)
+    payload = _build_payload(symbol, sig)
+    ok, info = send_to_broker(payload)
     try:
         COMBO_COUNTS[f"{combo_key}::orders.{'ok' if ok else 'err'}"] += 1
         COUNTS["orders.ok" if ok else "orders.err"] += 1
@@ -577,7 +623,7 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
     print(f"[ORDER] {combo_key} -> action={sig.get('action')} qty={sig.get('quantity')} ok={ok} info={info}", flush=True)
 
 # =============================
-# Universe scan loop (batching) (unchanged)
+# Batching helper
 # =============================
 def _batched_symbols(universe: list):
     global _rr_idx
@@ -589,103 +635,6 @@ def _batched_symbols(universe: list):
     batch = universe[start:end]
     _rr_idx = 0 if end >= N else end
     return batch
-
-# =============================
-# Main (unchanged except Polygon/TP refs removed + EOD manager)
-# =============================
-def main():
-    print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD=python app_scanner_merged.py", flush=True)
-    print(f"[BOOT] PAPER_MODE={'paper' if PAPER_MODE else 'live'} POLL_SECONDS={POLL_SECONDS} TFs={TF_MIN_LIST}", flush=True)
-    print(f"[BOOT] CONF_THR={CONF_THR} R_MULT={R_MULT} SHORTS_ENABLED={int(SHORTS_ENABLED)} USE_SENTIMENT_REGIME={int(USE_SENTIMENT_REGIME)}", flush=True)
-    print(f"[BOOT] DAILY_GUARD_ENABLED={int(DAILY_GUARD_ENABLED)} UP={DAILY_TP_PCT:.0%} DOWN={DAILY_DD_PCT:.0%} FLATTEN={int(DAILY_FLATTEN_ON_HIT)}", flush=True)
-    print(f"[BOOT] BROKER_GUARD={int(USE_BROKER_EQUITY_GUARD)} BASELINE_AT_0930={int(SESSION_BASELINE_AT_0930)} TRAIL_DD={TRAIL_DD_PCT:.0%}", flush=True)
-
-    # Universe
-    symbols = get_universe_symbols()
-    print(f"[UNIVERSE] symbols={len(symbols)} TFs={TF_MIN_LIST} batch={SCAN_BATCH_SIZE} "
-          f"vol_gate(today)={SCANNER_MIN_TODAY_VOL} MIN_PRICE={MIN_PRICE} EXCH={sorted(ALLOWED_EXCHANGES)}", flush=True)
-
-    # Initial baseline (if broker guard)
-    if USE_BROKER_EQUITY_GUARD:
-        ensure_session_baseline()
-
-    while True:
-        loop_start = time.time()
-        try:
-            reset_daily_state_if_new_day()
-
-            # --- Close phase
-            touched = set((k[0], k[1]) for k in OPEN_TRADES.keys())
-            for (sym, tf) in touched:
-                try:
-                    df = fetch_bars_1m(sym, lookback_minutes=max(60, tf * 12))
-                    if df is None or df.empty:
-                        continue
-                    try:
-                        df.index = df.index.tz_convert(MARKET_TZ)
-                    except Exception:
-                        df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
-                    bars = _resample(df, tf)
-                    if bars is not None and not bars.empty:
-                        row = bars.iloc[-1]
-                        ts  = bars.index[-1]
-                        LAST_PRICE[sym] = float(row["close"])
-                        _maybe_close_on_bar(sym, tf, ts, float(row["high"]), float(row["low"]), float(row["close"]))
-                except Exception as e:
-                    print(f"[CLOSE-PHASE ERROR] {sym} {tf}m: {e}", flush=True)
-
-            # --- Guards
-            if check_kill_switch():
-                pass
-            else:
-                check_daily_guards()
-
-            # --- EOD manager (pre-close + safety net) BEFORE deciding to enter
-            eod_manager()
-
-            allow_entries = not (HALT_TRADING or HALTED)
-            if not allow_entries:
-                time.sleep(POLL_SECONDS); continue
-
-            # --- Scan & signal phase
-            sentiment = compute_sentiment() if USE_SENTIMENT_REGIME else "neutral"
-            print(f"[SENTIMENT] {sentiment}", flush=True)
-
-            batch = _batched_symbols(symbols) if USE_GROUPED_DAILY_PREFILTER else symbols
-            for sym in batch:
-                df1m = fetch_bars_1m(sym, lookback_minutes=max(240, max(TF_MIN_LIST)*240))
-                if df1m is None or df1m.empty:
-                    continue
-                try:
-                    df1m.index = df1m.index.tz_convert(MARKET_TZ)
-                except Exception:
-                    df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
-
-                for tf in TF_MIN_LIST:
-                    sig = compute_signal("ml_pattern", sym, tf, df1m=df1m, sentiment=sentiment)
-                    if not sig:
-                        continue
-
-                    dk = hashlib.sha256(f"ml_pattern|{sym}|{tf}|{sig['action']}|{sig.get('barTime','')}".encode()).hexdigest()
-                    if dk in _sent_keys:
-                        continue
-                    _sent_keys.add(dk)
-
-                    open_positions = sum(1 for lst in OPEN_TRADES.values() for t in lst if t.is_open)
-                    if open_positions >= MAX_CONCURRENT_POSITIONS:
-                        print(f"[LIMIT] Max concurrent reached: {open_positions}/{MAX_CONCURRENT_POSITIONS}", flush=True)
-                        break
-
-                    handle_signal("ml_pattern", sym, tf, sig)
-
-            # (Old 16:00–16:10 EOD block removed; handled by eod_manager())
-
-        except Exception as e:
-            import traceback
-            print("[LOOP ERROR]", e, traceback.format_exc(), flush=True)
-
-        elapsed = time.time() - loop_start
-        time.sleep(max(1, POLL_SECONDS - int(elapsed)))
 
 # =============================
 # Signal computation (unchanged)
@@ -726,5 +675,116 @@ def compute_signal(strategy_name, symbol, tf_minutes, df1m=None, sentiment="neut
         )
     return None
 
+# =============================
+# Main
+# =============================
+def main():
+    global HALT_TRADING
+
+    print(f"[BOOT] RUN_ID={RUN_ID} BRANCH={RENDER_GIT_BRANCH} COMMIT={RENDER_GIT_COMMIT} START_CMD=python ml_merged_app.py", flush=True)
+    print(f"[BOOT] PAPER_MODE={'paper' if PAPER_MODE else 'live'} POLL_SECONDS={POLL_SECONDS} TFs={TF_MIN_LIST}", flush=True)
+    print(f"[BOOT] CONF_THR={CONF_THR} R_MULT={R_MULT} SHORTS_ENABLED={int(SHORTS_ENABLED)} USE_SENTIMENT_REGIME={int(USE_SENTIMENT_REGIME)}", flush=True)
+    print(f"[BOOT] DAILY_GUARD_ENABLED={int(DAILY_GUARD_ENABLED)} UP={DAILY_TP_PCT:.0%} DOWN={DAILY_DD_PCT:.0%} FLATTEN={int(DAILY_FLATTEN_ON_HIT)} START_EQUITY={START_EQUITY:.2f}", flush=True)
+    print(f"[BOOT] BROKER_GUARD={int(USE_BROKER_EQUITY_GUARD)} BASELINE_AT_0930={int(SESSION_BASELINE_AT_0930)} TRAIL_DD={TRAIL_DD_PCT:.0%}", flush=True)
+
+    # Universe
+    symbols = get_universe_symbols()
+    if SCANNER_SYMBOLS:
+        print(f"[BOOT] SCANNER_SYMBOLS override detected ({len(symbols)} symbols).", flush=True)
+    print(f"[UNIVERSE] symbols={len(symbols)} TFs={TF_MIN_LIST} batch={SCAN_BATCH_SIZE} "
+          f"vol_gate(today)={SCANNER_MIN_TODAY_VOL} MIN_PRICE={MIN_PRICE} EXCH={sorted(ALLOWED_EXCHANGES)}", flush=True)
+
+    # Initial baseline (if broker guard)
+    if USE_BROKER_EQUITY_GUARD:
+        ensure_session_baseline()
+
+    while True:
+        loop_start = time.time()
+        try:
+            reset_daily_state_if_new_day()
+
+            # --- Close phase: update MTM and check TP/SL on last bar for open trades
+            touched = set((k[0], k[1]) for k in OPEN_TRADES.keys())
+            for (sym, tf) in touched:
+                try:
+                    df = fetch_bars_1m(sym, lookback_minutes=max(60, tf * 12))
+                    if df is None or df.empty:
+                        continue
+                    try:
+                        df.index = df.index.tz_convert(MARKET_TZ)
+                    except Exception:
+                        df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
+                    bars = _resample(df, tf)
+                    if bars is not None and not bars.empty:
+                        row = bars.iloc[-1]
+                        ts  = bars.index[-1]
+                        LAST_PRICE[sym] = float(row["close"])
+                        _maybe_close_on_bar(sym, tf, ts, float(row["high"]), float(row["low"]), float(row["close"]))
+                except Exception as e:
+                    print(f"[CLOSE-PHASE ERROR] {sym} {tf}m: {e}", flush=True)
+
+            # --- Guards (kill, daily, trail)
+            if not check_kill_switch():
+                check_daily_guards()
+
+            # --- EOD manager (pre-close + safety net) BEFORE deciding to enter
+            eod_manager()
+
+            allow_entries = not (HALT_TRADING or HALTED)
+            if not allow_entries:
+                time.sleep(POLL_SECONDS)
+                continue
+
+            # --- Scan & signal phase
+            sentiment = compute_sentiment() if USE_SENTIMENT_REGIME else "neutral"
+            print(f"[SENTIMENT] {sentiment}", flush=True)
+
+            batch = _batched_symbols(symbols)
+            for sym in batch:
+                df1m = fetch_bars_1m(sym, lookback_minutes=max(240, max(TF_MIN_LIST)*240))
+                if df1m is None or df1m.empty:
+                    continue
+                try:
+                    df1m.index = df1m.index.tz_convert(MARKET_TZ)
+                except Exception:
+                    df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
+
+                # price/vol gates here on 1m data
+                try:
+                    last_px = float(df1m["close"].iloc[-1])
+                except Exception:
+                    continue
+                if last_px < MIN_PRICE:
+                    continue
+                today_mask = df1m.index.date == df1m.index[-1].date()
+                todays_vol = float(df1m.loc[today_mask, "volume"].sum()) if today_mask.any() else 0.0
+                if todays_vol < SCANNER_MIN_TODAY_VOL:
+                    continue
+
+                for tf in TF_MIN_LIST:
+                    sig = compute_signal("ml_pattern", sym, tf, sentiment=sentiment, df1m=df1m)
+                    if not sig:
+                        continue
+
+                    dk = hashlib.sha256(f"ml_pattern|{sym}|{tf}|{sig['action']}|{sig.get('barTime','')}".encode()).hexdigest()
+                    if dk in _sent_keys:
+                        continue
+                    _sent_keys.add(dk)
+
+                    open_positions = sum(1 for lst in OPEN_TRADES.values() for t in lst if t.is_open)
+                    if open_positions >= MAX_CONCURRENT_POSITIONS:
+                        print(f"[LIMIT] Max concurrent reached: {open_positions}/{MAX_CONCURRENT_POSITIONS}", flush=True)
+                        break
+
+                    handle_signal("ml_pattern", sym, tf, sig)
+
+        except Exception as e:
+            import traceback
+            print("[LOOP ERROR]", e, traceback.format_exc(), flush=True)
+
+        elapsed = time.time() - loop_start
+        time.sleep(max(1, POLL_SECONDS - int(elapsed)))
+
+# ------------------------------------------------------------------------------------
 if __name__ == "__main__":
     main()
