@@ -416,6 +416,20 @@ def check_daily_guard_and_maybe_halt():
         if DAILY_FLATTEN_ON_HIT:
             flatten_all_open_positions()
 
+def _active_equity_and_limits():
+    if USE_BROKER_EQUITY_GUARD:
+        ensure_session_baseline()
+        base = SESSION_START_EQUITY if SESSION_START_EQUITY is not None else EQUITY_USD
+        eq_now = get_account_equity(base)
+        up_lim = base * (1.0 + DAILY_TP_PCT)
+        dn_lim = base * (1.0 - DAILY_DD_PCT)
+        return eq_now, up_lim, dn_lim, "broker"
+    else:
+        eq_now = _current_equity_local()
+        up_lim = START_EQUITY * (1.0 + DAILY_TP_PCT)
+        dn_lim = START_EQUITY * (1.0 - DAILY_DD_PCT)
+        return eq_now, up_lim, dn_lim, "local"
+
 # =============================
 # Routing & signal handling
 # =============================
@@ -562,6 +576,7 @@ def main():
     print(f"[BOOT] POLL_SECONDS={POLL_SECONDS} TFs={TF_MIN_LIST} CONF_THRESHOLD={SCANNER_CONF_THRESHOLD} R_MULTIPLE={SCANNER_R_MULTIPLE}", flush=True)
     print(f"[BOOT] DAILY_GUARD_ENABLED={int(DAILY_GUARD_ENABLED)} UP={DAILY_TP_PCT:.0%} DOWN={DAILY_DD_PCT:.0%} FLATTEN={int(DAILY_FLATTEN_ON_HIT)} START_EQUITY={START_EQUITY:.2f}", flush=True)
     print(f"[BOOT] SENTIMENT_LOOKBACK_MIN={SENTIMENT_LOOKBACK_MIN} SENTIMENT_ONLY_GATE={int(SENTIMENT_ONLY_GATE)} NEUTRAL_ACTION={SENTIMENT_NEUTRAL_ACTION.upper()}", flush=True)
+    print(f"[BOOT] BROKER_GUARD={int(USE_BROKER_EQUITY_GUARD)} BASELINE_AT_0930={int(SESSION_BASELINE_AT_0930)} TRAIL_DD={TRAIL_DD_PCT:.0%}", flush=True)
 
     # Universe (Alpaca assets)
     symbols = get_universe_symbols()
