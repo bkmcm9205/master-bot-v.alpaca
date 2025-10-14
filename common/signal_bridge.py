@@ -154,12 +154,17 @@ def send_to_broker(symbol_or_payload, sig=None, strategy_tag=None):
         # Enforce 1¢ distance if we know base price (entry or limit)
         base_price = _to_float(payload.get("entry") or payload.get("price") or order.get("limit_price"))
         if base_price is not None:
-            if tp is not None and (tp - base_price) < 0.01:
-                tp = round(base_price + 0.01, 2)
-            if sl is not None:
-                if side == "buy" and (base_price - sl) < 0.01:
+            if side == "buy":
+                # Longs: TP >= base + 0.01 ; SL <= base - 0.01
+                if tp is not None and (tp < base_price + 0.01):
+                    tp = round(base_price + 0.01, 2)
+                if sl is not None and (sl > base_price - 0.01):
                     sl = round(base_price - 0.01, 2)
-                if side == "sell" and (sl - base_price) < 0.01:
+            else:
+                # Shorts: TP <= base - 0.01 ; SL >= base + 0.01
+                if tp is not None and (tp > base_price - 0.01):
+                    tp = round(base_price - 0.01, 2)
+                if sl is not None and (sl < base_price + 0.01):
                     sl = round(base_price + 0.01, 2)
 
         if tp is not None or sl is not None:
