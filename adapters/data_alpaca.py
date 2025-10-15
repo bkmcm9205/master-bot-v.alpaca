@@ -106,7 +106,7 @@ def fetch_1m(symbol: str, start_iso: str, end_iso: str, limit: int = 10000,
     # Expected keys: t (ISO), o,h,l,c,v
     # Normalize to milliseconds epoch or ISO -> pandas datetime
     try:
-        df["ts"] = pd.to_datetime(df["t"], utc=True)
+        df["ts"] = _parse_alpaca_ts(df["t"])
     except Exception:
         # Fallback: if "t" is epoch ns
         df["ts"] = pd.to_datetime(df["t"], unit="ns", utc=True)
