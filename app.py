@@ -393,9 +393,9 @@ def check_daily_guards():
     dn_lim = SESSION_START_EQUITY * (1.0 - DAILY_DD_PCT)
 
     print(f"[DAILY-GUARD] eq={eq_now:.2f} start={SESSION_START_EQUITY:.2f} "
-    f"targets +{DAILY_TP_PCT*100:.1f}%({up_lim:.2f}) / -{DAILY_DD_PCT*100:.1f}%({dn_lim:.2f})",
-        flush=True)
-    
+          f"targets +{DAILY_TP_PCT*100:.1f}%({up_lim:.2f}) / -{DAILY_DD_PCT*100:.1f}%({dn_lim:.2f})",
+          flush=True)
+
     if HALT_TRADING:
         return
 
