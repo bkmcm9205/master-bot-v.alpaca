@@ -406,6 +406,7 @@ def check_daily_guard_and_maybe_halt():
     print(f"[DAILY-GUARD] eq={equity:.2f} start={START_EQUITY:.2f} "
           f"targets +{DAILY_TP_PCT*100:.1f}%({up_lim:.2f}) / -{DAILY_DD_PCT*100:.1f}%({dn_lim:.2f})",
           flush=True)
+    print(f"[BOOT] BROKER_GUARD={int(USE_BROKER_EQUITY_GUARD)} BASELINE_AT_0930={int(SESSION_BASELINE_AT_0930)} TRAIL_DD={TRAIL_DD_PCT:.0%}", flush=True)
     if HALT_TRADING:
         return
     if equity >= up_lim:
