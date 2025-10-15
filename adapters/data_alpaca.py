@@ -6,6 +6,30 @@ from datetime import datetime
 import pandas as pd
 import requests
 
+import re
+import pandas as pd
+import numpy as np
+
+_TS_ISO_DOT = re.compile(r".*\.\d+Z$")   # 2025-10-14T15:32:01.123Z
+_TS_ISO_NODOT = re.compile(r".*Z$")      # 2025-10-14T15:32:01Z
+
+def _parse_alpaca_ts(series: pd.Series) -> pd.Series:
+    """Parse Alpaca 't' timestamps (ns epoch OR RFC3339) without inference warnings."""
+    if np.issubdtype(series.dtype, np.integer) or np.issubdtype(series.dtype, np.floating):
+        # ns epoch (rare in v2 stocks bars, but handle it)
+        return pd.to_datetime(series, unit="ns", utc=True)
+    s0 = series.iloc[0]
+    if isinstance(s0, str):
+        s0 = s0.strip()
+        if _TS_ISO_DOT.match(s0):
+            # e.g. 2025-10-14T15:32:01.123Z
+            return pd.to_datetime(series, format="%Y-%m-%dT%H:%M:%S.%fZ", utc=True)
+        if _TS_ISO_NODOT.match(s0):
+            # e.g. 2025-10-14T15:32:01Z
+            return pd.to_datetime(series, format="%Y-%m-%dT%H:%M:%SZ", utc=True)
+    # Fallback (last resort): allow mixed/odd strings
+    return pd.to_datetime(series, utc=True, errors="coerce")
+
 DATA_BASE = os.getenv("ALPACA_DATA_BASE_URL", "https://data.alpaca.markets").rstrip("/")
 ALP_KEY   = os.getenv("ALPACA_API_KEY_ID", "")
 ALP_SEC   = os.getenv("ALPACA_SECRET_KEY", "")
