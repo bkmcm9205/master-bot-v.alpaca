@@ -113,7 +113,7 @@ DRY_RUN      = os.getenv("DRY_RUN", "0").lower() in ("1","true","yes")
 PAPER_MODE   = os.getenv("PAPER_MODE", "true").lower() != "false"
 SCANNER_DEBUG= os.getenv("SCANNER_DEBUG", "0").lower() in ("1","true","yes")
 
-EXTRA_TICKS = int(os.getenv("EXTRA_TICKS", "1"))  # extra pennies to clear Alpaca base_price drift
+EXTRA_TICKS = int(os.getenv("EXTRA_TICKS", "2"))  # extra pennies to clear Alpaca base_price drift
 
 TF_MIN_LIST  = [int(x) for x in os.getenv("TF_MIN_LIST", "1,2,3,5,10").split(",") if x.strip()]
 MAX_UNIVERSE_PAGES = int(os.getenv("MAX_UNIVERSE_PAGES", "3"))
@@ -121,6 +121,7 @@ SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE", "150"))
 SCANNER_MIN_AVG_VOL = int(os.getenv("SCANNER_MIN_AVG_VOL", "0"))
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "3.0"))
+MIN_SHORT_PRICE = float(os.getenv("MIN_SHORT_PRICE", "5.0"))  # skip shorting very low-priced name
 
 # Risk / sizing
 EQUITY_USD  = float(os.getenv("EQUITY_USD",  "100000"))
@@ -277,20 +278,35 @@ def _tick_round(px: float, tick: float = MIN_TICK) -> float:
     # Avoid float display errors like 9.029999...
     return float(f"{q:.4f}")
 
-def _apply_tick_rules(side: str, base: float, tp: float, sl: float, tick: float = MIN_TICK, extra_ticks: int = EXTRA_TICKS):
+def _apply_tick_rules(side: str, base: float, tp: float, sl: float,
+                      tick: float = MIN_TICK, extra_ticks: int = EXTRA_TICKS):
     """
-    Enforce Alpaca bracket constraints with a safety buffer.
-    Long:  TP >= base + tick*buf, SL <= base - tick*buf
-    Short: TP <= base - tick*buf, SL >= base + tick*buf
+    Enforce Alpaca bracket constraints with directional rounding vs broker base_price.
+    Long:  TP >= base + buf (ceil), SL <= base - buf (floor)
+    Short: TP <= base - buf (floor), SL >= base + buf (ceil)
     """
+    import math
     buf = tick * max(1, int(extra_ticks))
+
+    def _ceil_to_tick(x: float, t: float) -> float:
+        return math.ceil(x / t) * t
+
+    def _floor_to_tick(x: float, t: float) -> float:
+        return math.floor(x / t) * t
+
     if side == "long":
+        # make sure we’re outside broker ranges *and* round in safe directions
         tp = max(tp, base + buf)
         sl = min(sl, base - buf)
+        tp = _ceil_to_tick(tp, tick)
+        sl = _floor_to_tick(sl, tick)
     else:  # short
         tp = min(tp, base - buf)
         sl = max(sl, base + buf)
-    return _tick_round(tp, tick), _tick_round(sl, tick)
+        tp = _floor_to_tick(tp, tick)
+        sl = _ceil_to_tick(sl, tick)
+
+    return float(tp), float(sl)
 
 # ==============================
 # DATA MODEL
@@ -1218,10 +1234,25 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
     COUNTS["signals"] += 1
     COMBO_COUNTS[f"{combo_key}::signals"] += 1
 
+    # --- pre-send short sanity gates ---
+    if sig.get("action") in ("sell", "sell_short"):
+        # denylist: symbols that returned "cannot be sold short"
+        if 'SHORT_DENY' not in globals():
+            globals()['SHORT_DENY'] = set()
+        if symbol in SHORT_DENY:
+            print(f"[ORDER-SKIP] {symbol} on denylist (not shortable).", flush=True)
+            return
+
+        # optional min price for shorts
+        last_px = float(sig.get("entry") or LAST_PRICE.get(symbol, 0.0) or 0.0)
+        if last_px and last_px < MIN_SHORT_PRICE:
+            print(f"[ORDER-SKIP] {symbol} short @ {last_px:.2f} < MIN_SHORT_PRICE={MIN_SHORT_PRICE:.2f}.", flush=True)
+            return
+
     # send first, only record on success
     ok, info = send_to_broker(symbol, sig, strategy_tag="ml_pattern")
 
-        # If Alpaca rejects due to bracket distances, adjust once and retry
+    # If Alpaca rejects due to bracket distances, adjust once and retry
     info_str = str(info)
     if (not ok) and any(key in info_str for key in ("take_profit.limit_price", "stop_loss.stop_price")):
         try:
@@ -1243,7 +1274,7 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
             side = "long" if sig.get("action") == "buy" else "short"
             tp = float(sig["takeProfit"]); sl = float(sig["stopLoss"])
 
-            # Re-apply rules vs Alpaca's base_price with a small safety buffer
+            # Re-apply rules vs Alpaca's base_price with directional rounding + buffer
             tp2, sl2 = _apply_tick_rules(side, base, tp, sl, tick=MIN_TICK, extra_ticks=EXTRA_TICKS)
 
             # Only resend if levels actually changed
