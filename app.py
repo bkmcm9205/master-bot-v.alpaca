@@ -258,6 +258,10 @@ _PERSIST_OK_S    = {}    # (symbol, tf) -> consecutive bars over short threshold
 _BARCACHE: "OrderedDict[str, pd.DataFrame]" = OrderedDict()   # 1m bars per symbol (tz-aware)
 _RESAMPLE_CACHE: dict[tuple[str,int], tuple[pd.Timestamp, pd.DataFrame]] = {}
 
+# per-batch stage counts (pipeline gates) and per-model reasons
+COUNTS_STAGE = defaultdict(int)   # already used by SCAN-AUDIT; harmless to reassign
+COUNTS_MODEL = defaultdict(int)   # used by MODEL-AUDIT inside _ml_features_and_pred_core
+
 # ==============================
 # DATA MODEL
 # ==============================
