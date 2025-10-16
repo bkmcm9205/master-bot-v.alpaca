@@ -1214,18 +1214,47 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
     combo_key = _combo_key(strat_name, symbol, tf_min)
     COUNTS["signals"] += 1
     COMBO_COUNTS[f"{combo_key}::signals"] += 1
-    meta = sig.get("meta", {})
-    meta["combo"] = combo_key
-    meta["timeframe"] = f"{int(tf_min)}m"
-    sig["meta"] = meta
-    _record_open_trade(strat_name, symbol, tf_min, sig)
 
+    # send first, only record on success
     ok, info = send_to_broker(symbol, sig, strategy_tag="ml_pattern")
+
+    # If Alpaca rejects due to bracket distances, adjust once and retry
+    info_str = str(info)
+    if (not ok) and any(key in info_str for key in ("take_profit.limit_price", "stop_loss.stop_price")):
+        try:
+            base = float(sig.get("entry") or LAST_PRICE.get(symbol, 0.0) or 0.0)
+            side = "long" if sig.get("action") == "buy" else "short"
+            tp = float(sig["takeProfit"]); sl = float(sig["stopLoss"])
+            tp2, sl2 = _apply_tick_rules(side, base, tp, sl)
+            if (abs(tp2 - tp) >= MIN_TICK/2) or (abs(sl2 - sl) >= MIN_TICK/2):
+                sig2 = dict(sig)
+                sig2["takeProfit"] = tp2
+                sig2["stopLoss"]   = sl2
+                ok, info = send_to_broker(symbol, sig2, strategy_tag="ml_pattern")
+                if ok:
+                    sig = sig2  # keep the adjusted levels for local bookkeeping
+        except Exception:
+            pass
+
+    # If Alpaca says asset cannot be shorted, add to denylist
+    if (not ok) and ("cannot be sold short" in info_str):
+        SHORT_DENY.add(symbol)
+
+    # Update counters and optionally record the open trade
     try:
         COMBO_COUNTS[f"{combo_key}::orders.{'ok' if ok else 'err'}"] += 1
         COUNTS["orders.ok" if ok else "orders.err"] += 1
     except Exception:
         pass
+
+    if ok:
+        # enrich meta, then record open trade
+        meta = sig.get("meta", {})
+        meta["combo"] = combo_key
+        meta["timeframe"] = f"{int(tf_min)}m"
+        sig["meta"] = meta
+        _record_open_trade(strat_name, symbol, tf_min, sig)
+
     print(f"[ORDER] {combo_key} -> action={sig.get('action')} qty={sig.get('quantity')} ok={ok} info={info}", flush=True)
 
 # ==============================
