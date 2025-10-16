@@ -1211,27 +1211,45 @@ def _get_sector(symbol: str) -> str:
     return "UNKNOWN"
 
 def _prune_by_correlation(candidates, ret_series_map, max_corr=1.0):
+    """
+    Prunes highly-correlated candidates based on recent returns in ret_series_map.
+    Accepts candidate tuples of length 5 or 6:
+      (prob, sym, tf, sig, k) OR (prob, sym, tf, sig, k, sector)
+    Returns a filtered list with original tuples preserved.
+    """
     if max_corr >= 0.999:  # effectively off
         return candidates
+
     chosen = []
     for item in candidates:
-        ok = True
-        _, sym, _, _, _ = item
+        # Support both 5- and 6-tuples without raising.
+        # Index 1 is symbol in both layouts.
+        sym = item[1]
         r1 = ret_series_map.get(sym)
+
+        # If we don't have returns for this symbol, keep it.
         if r1 is None or len(r1) < 5:
-            chosen.append(item); continue
+            chosen.append(item)
+            continue
+
+        ok = True
         for j in chosen:
             sym2 = j[1]
             r2 = ret_series_map.get(sym2)
-            if r2 is None: continue
+            if r2 is None or len(r2) < 5:
+                continue
             n = min(len(r1), len(r2))
-            if n < 5: continue
-            c = float(np.corrcoef(r1[-n:], r2[-n:])[0,1])
+            if n < 5:
+                continue
+            # Corr on the overlapping tail
+            c = float(np.corrcoef(r1[-n:], r2[-n:])[0, 1])
             if np.isfinite(c) and abs(c) > max_corr:
                 ok = False
                 break
+
         if ok:
             chosen.append(item)
+
     return chosen
 
 # ==============================
