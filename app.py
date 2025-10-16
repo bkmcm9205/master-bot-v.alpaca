@@ -224,6 +224,10 @@ CONF_THR_RUNTIME = CONF_THR
 
 COUNTS_STAGE = defaultdict(int)  
 
+# --- Shortable cache (for proactive short filtering) ---
+SHORTABLE_SET = set()
+SHORTABLE_LAST = None
+
 # ==============================
 # STATE / LEDGERS
 # ==============================
@@ -1369,6 +1373,42 @@ def _prune_by_correlation(candidates, ret_series_map, max_corr=1.0):
 
     return chosen
 
+def _refresh_shortable_if_needed():
+    """
+    Refresh cached set of shortable symbols from Alpaca every SHORTABLE_REFRESH_MIN minutes.
+    This is cheap enough to call each loop; it only fetches when stale.
+    """
+    global SHORTABLE_SET, SHORTABLE_LAST
+    if not os.getenv("SKIP_NON_SHORTABLE", "0").lower() in ("1","true","yes"):
+        return
+
+    try:
+        mins = int(os.getenv("SHORTABLE_REFRESH_MIN", "30"))
+    except Exception:
+        mins = 30
+
+    now = datetime.now(timezone.utc)
+    if SHORTABLE_LAST and (now - SHORTABLE_LAST) < timedelta(minutes=mins):
+        return
+
+    try:
+        base = os.getenv("ALPACA_TRADE_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+        url = f"{base}/v2/assets?status=active&tradable=true&shortable=true"
+        headers = {
+            "APCA-API-KEY-ID": os.getenv("APCA_API_KEY_ID") or os.getenv("APCA-API-KEY-ID") or "",
+            "APCA-API-SECRET-KEY": os.getenv("APCA_API_SECRET_KEY") or os.getenv("APCA-API-SECRET-KEY") or "",
+        }
+        r = requests.get(url, headers=headers, timeout=20)
+        if r.status_code == 200:
+            data = r.json()
+            SHORTABLE_SET = {str(it.get("symbol","")).upper() for it in data if it.get("symbol")}
+            SHORTABLE_LAST = now
+            print(f"[SHORTABLE] cached {len(SHORTABLE_SET)} symbols (ttl ~{mins}m)", flush=True)
+        else:
+            print(f"[SHORTABLE] fetch failed {r.status_code} {r.text[:200]}", flush=True)
+    except Exception as e:
+        print(f"[SHORTABLE] exception {e}", flush=True)
+
 # ==============================
 # MAIN LOOP
 # ==============================
@@ -1480,7 +1520,10 @@ def main():
             # reset per-batch debug tallies
             COUNTS_STAGE.clear()
             COUNTS_MODEL.clear()
-            
+
+            # Ensure shortable cache is fresh (if enabled)
+            _refresh_shortable_if_needed()
+
             batch = _batched_symbols(symbols)
             if SCANNER_DEBUG:
                 total = len(symbols)
@@ -1533,6 +1576,13 @@ def main():
                         if SCANNER_DEBUG:
                             print(f"[PYRAMID-BLOCK] {sym} already has open exposure. Skipping.", flush=True)
                         continue
+
+                    # NEW: proactively skip non-shortables
+                    if os.getenv("SKIP_NON_SHORTABLE","0").lower() in ("1","true","yes"):
+                        if sig.get("action") == "sell_short" and SHORTABLE_SET and (sym.upper() not in SHORTABLE_SET):
+                            COUNTS_STAGE["05_not_shortable"] += 1
+                            continue
+                            
                     k = _dedupe_key(sym, tf, sig["action"], sig.get("barTime", ""))
                     if k in _sent_keys:
                         continue
