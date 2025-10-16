@@ -1360,6 +1360,10 @@ def main():
             except Exception:
                 _REF_BARS_1M[RS_SYMBOL] = pd.DataFrame()
 
+            # reset per-batch debug tallies
+            COUNTS_STAGE.clear()
+            COUNTS_MODEL.clear()
+            
             batch = _batched_symbols(symbols)
             if SCANNER_DEBUG:
                 total = len(symbols)
@@ -1367,7 +1371,7 @@ def main():
                 start_idx = (s - len(batch)) if s else 0
                 print(f"[SCAN] symbols {start_idx}:{start_idx+len(batch)} / {total}  (batch={len(batch)})", flush=True)
 
-                    # --- gather candidates for this batch ---
+                       # --- gather candidates for this batch ---
             candidates = []
             ret_series_map = {}  # for correlation pruning
 
@@ -1416,27 +1420,27 @@ def main():
                     if k in _sent_keys:
                         continue
 
-                    # pull confidence for ranking (supports either 'proba' or 'proba_up')
                     meta = sig.get("meta", {})
                     prob = float(meta.get("proba", meta.get("proba_up", 0.0)))
                     candidates.append((prob, sym, tf, sig, k, _get_sector(sym)))
+                    COUNTS_STAGE["16_signal_ok"] += 1
 
-            # --- Debug summary of why signals were filtered in this batch ---
-            if SCANNER_DEBUG and COUNTS_STAGE:
-                msg = " | ".join(f"{k}:{v}" for k, v in sorted(COUNTS_STAGE.items()))
-                print(f"[SCAN-AUDIT] {msg}", flush=True)
+            # --- Debug summaries ---
+            if SCANNER_DEBUG:
+                if COUNTS_STAGE:
+                    msg = " | ".join(f"{k}:{v}" for k, v in sorted(COUNTS_STAGE.items()))
+                    print(f"[SCAN-AUDIT] {msg}", flush=True)
+                print(f"[CAND-COUNT] raw={len(candidates)}", flush=True)
 
-            # (optional) quick peek at the strongest few candidates found in this batch
-            if SCANNER_DEBUG and candidates:
-                preview = sorted(candidates, key=lambda x: x[0], reverse=True)[:5]
-                snap = ", ".join(f"{s}:{p:.3f}@{tf}m" for p, s, tf, _, _, _ in preview)
-                print(f"[CAND-PEEK] top5 {snap}", flush=True)
-
-            # --- selection: sort, sector cap, correlation prune, top-K, then send ---
+            # --- selection: sort, sector cap, correlation prune, top-K ---
             if candidates:
                 candidates.sort(key=lambda x: x[0], reverse=True)
+                if SCANNER_DEBUG:
+                    print(f"[SELECT] after-sort={len(candidates)} top5=" +
+                          ", ".join(f"{s}:{p:.3f}@{tf}m" for p, s, tf, *_ in candidates[:5]), flush=True)
 
                 # sector cap
+                before_sec = len(candidates)
                 if MAX_PER_SECTOR > 0:
                     sec_count = defaultdict(int)
                     kept = []
@@ -1446,12 +1450,21 @@ def main():
                             kept.append(item)
                             sec_count[sec] += 1
                     candidates = kept
+                if SCANNER_DEBUG:
+                    print(f"[SELECT] after-sector={len(candidates)} (was {before_sec})", flush=True)
 
                 # correlation prune
+                before_corr = len(candidates)
                 if MAX_CAND_CORR < 0.999:
                     candidates = _prune_by_correlation(candidates, ret_series_map, MAX_CAND_CORR)
+                if SCANNER_DEBUG:
+                    print(f"[SELECT] after-corr={len(candidates)} (was {before_corr})", flush=True)
 
+                # top-K
                 chosen = candidates[:BATCH_TOP_K] if BATCH_TOP_K else candidates
+                if SCANNER_DEBUG:
+                    print(f"[SELECT] chosen={len(chosen)}", flush=True)
+
                 for prob, sym, tf, sig, k, _ in chosen:
                     _sent_keys.add(k)
                     handle_signal("ml_pattern", sym, tf, sig)
