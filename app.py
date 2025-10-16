@@ -1082,7 +1082,7 @@ def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
         COUNTS_STAGE["13_no_atr"] += 1
         return None
 
-        if side == "long":
+    if side == "long":
         sl = price - atr_k * atr14
         tp = price + r_multiple * atr_k * atr14
         tp, sl = _apply_tick_rules("long", price, tp, sl)
