@@ -263,6 +263,32 @@ from collections import defaultdict
 COUNTS_STAGE = defaultdict(int)   # already used by SCAN-AUDIT; harmless to reassign
 COUNTS_MODEL = defaultdict(int)   # used by MODEL-AUDIT inside _ml_features_and_pred_core
 
+# --- Broker constraint helpers & runtime denylist ---
+MIN_TICK = float(os.getenv("MIN_TICK", "0.01"))  # stock tick size
+SHORT_DENY = set()  # symbols we learned are not shortable (lifetime: this process)
+
+def _tick_round(px: float, tick: float = MIN_TICK) -> float:
+    # round to nearest tick; for stocks MIN_TICK=0.01
+    if not np.isfinite(px):
+        return px
+    q = round(px / tick) * tick
+    # Avoid float display errors like 9.029999...
+    return float(f"{q:.4f}")
+
+def _apply_tick_rules(side: str, base: float, tp: float, sl: float, tick: float = MIN_TICK):
+    """
+    Enforce Alpaca bracket constraints with tick rounding.
+    Long:  TP >= base+tick, SL <= base-tick
+    Short: TP <= base-tick, SL >= base+tick
+    """
+    if side == "long":
+        tp = max(tp, base + tick)
+        sl = min(sl, base - tick)
+    else:  # short
+        tp = min(tp, base - tick)
+        sl = max(sl, base + tick)
+    return _tick_round(tp, tick), _tick_round(sl, tick)
+
 # ==============================
 # DATA MODEL
 # ==============================
@@ -1056,13 +1082,18 @@ def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
         COUNTS_STAGE["13_no_atr"] += 1
         return None
 
-    if side == "long":
+        if side == "long":
         sl = price - atr_k * atr14
         tp = price + r_multiple * atr_k * atr14
+        tp, sl = _apply_tick_rules("long", price, tp, sl)
         qty = _position_qty(price, sl); action = "buy"
     else:  # short
+        # Skip symbols we already learned are not shortable this session
+        if symbol in SHORT_DENY:
+            return None
         sl = price + atr_k * atr14
         tp = price - r_multiple * atr_k * atr14
+        tp, sl = _apply_tick_rules("short", price, tp, sl)
         qty = _position_qty(price, sl); action = "sell_short"
 
     if qty <= 0:
