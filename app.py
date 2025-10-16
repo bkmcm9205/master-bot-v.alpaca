@@ -623,7 +623,7 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
         ref = _REF_BARS_1M.get(RS_SYMBOL)
         if ref is not None and not ref.empty:
             ref = ref.reindex(out.index, method="pad")
-            out["rs"] = out["close"].pct_change(10) - ref["close"].pct_change(10)
+            out["rs"] = out["close"].pct_change(10, fill_method=None) - ref["close"].pct_change(10, fill_method=None)
         else:
             out["rs"] = 0.0
     except Exception:
@@ -700,13 +700,39 @@ def _fit_base_model(X_trn, y_trn):
 def _calibrate(clf, X_trn, y_trn):
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import TimeSeriesSplit
-    if PURGED_CV_FOLDS and PURGED_CV_FOLDS >= 2:
-        cv = list(PurgedKFold(PURGED_CV_FOLDS, PURGED_EMBARGO_FRAC).split(X_trn))
-    else:
-        cv = TimeSeriesSplit(n_splits=3)
-    cal = CalibratedClassifierCV(clf, method="isotonic", cv=cv)
-    cal.fit(X_trn, y_trn)
-    return cal
+    import numpy as np
+
+    # If there aren't at least two classes in the training set,
+    # return the base model (no calibration possible).
+    try:
+        if getattr(y_trn, "nunique", None):
+            nuniq = int(y_trn.nunique())
+        else:
+            nuniq = len(np.unique(y_trn))
+        if nuniq < 2:
+            return clf
+
+        # Choose CV
+        if PURGED_CV_FOLDS and PURGED_CV_FOLDS >= 2:
+            cv_splits = list(PurgedKFold(PURGED_CV_FOLDS, PURGED_EMBARGO_FRAC).split(X_trn))
+        else:
+            cv_splits = list(TimeSeriesSplit(n_splits=3).split(X_trn))
+
+        # Keep only folds where BOTH train and test contain two classes
+        valid = []
+        for tr, te in cv_splits:
+            y_tr, y_te = y_trn.iloc[tr], y_trn.iloc[te]
+            if len(np.unique(y_tr)) >= 2 and len(np.unique(y_te)) >= 2:
+                valid.append((tr, te))
+        if not valid:
+            return clf
+
+        cal = CalibratedClassifierCV(clf, method="isotonic", cv=valid)
+        cal.fit(X_trn, y_trn)
+        return cal
+    except Exception as e:
+        print(f"[ML] Calibration fallback (using base model): {e}", flush=True)
+        return clf
 
 def _ml_features_and_pred_core(bars: pd.DataFrame, h: int):
     if bars is None or bars.empty or len(bars) < 300:
@@ -727,7 +753,36 @@ def _ml_features_and_pred_core(bars: pd.DataFrame, h: int):
         return None, None, None
 
     base = _fit_base_model(X_trn, y_trn)
+    # If the base model only saw one class, skip calibration and set proba logic accordingly.
+    try:
+        classes_ = getattr(base, "classes_", None)
+        if classes_ is not None and len(classes_) < 2:
+            # Predict_proba will be shape (n,1). If the single class is 1, prob_up=1, else 0.
+            p_live = base.predict_proba(x_live)
+            if p_live.shape[1] == 1:
+                only_cls = int(classes_[0])
+                proba_up = 1.0 if only_cls == 1 else 0.0
+                pred_up  = int(proba_up >= 0.5)
+                ts = df.index[-1]
+                return ts, float(proba_up), int(pred_up)
+    except Exception:
+        pass
+
+    # Otherwise proceed with calibration (now robust)
     clf = _calibrate(base, X_trn, y_trn)
+
+    proba_mat = clf.predict_proba(x_live)
+    if proba_mat.shape[1] == 1:
+        # Calibrator/base returned single class unexpectedly; map it safely.
+        classes_ = getattr(clf, "classes_", [1])
+        only_cls = int(classes_[0]) if len(classes_) else 1
+        proba_up = 1.0 if only_cls == 1 else 0.0
+    else:
+        proba_up = float(proba_mat[0, 1])
+
+    pred_up  = int(proba_up >= 0.5)
+    ts = df.index[-1]
+    return ts, proba_up, pred_up
 
     # Meta-labeling (optional): stack base proba + a few features
     if TB_ENABLED and META_ENABLED:
