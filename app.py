@@ -1350,81 +1350,81 @@ def main():
                 print(f"[SCAN] symbols {start_idx}:{start_idx+len(batch)} / {total}  (batch={len(batch)})", flush=True)
 
                     # --- gather candidates for this batch ---
-        candidates = []
-        ret_series_map = {}  # for correlation pruning
+            candidates = []
+            ret_series_map = {}  # for correlation pruning
 
-        for sym in batch:
-            df1m = fetch_bars_1m(
-                sym,
-                lookback_minutes=max(
-                    int(os.getenv("LOOKBACK_MINUTES_RTH", "2400")),
-                    max(TF_MIN_LIST) * 300
+            for sym in batch:
+                df1m = fetch_bars_1m(
+                    sym,
+                    lookback_minutes=max(
+                        int(os.getenv("LOOKBACK_MINUTES_RTH", "2400")),
+                        max(TF_MIN_LIST) * 300
+                    )
                 )
-            )
-            if df1m is None or df1m.empty:
-                continue
-            try:
-                df1m.index = df1m.index.tz_convert(MARKET_TZ)
-            except Exception:
-                df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
-
-            # store returns for corr pruning
-            try:
-                ret_series_map[sym] = df1m["close"].pct_change().dropna().tail(CORR_LOOKBACK).to_numpy()
-            except Exception:
-                pass
-
-            for tf in TF_MIN_LIST:
-                sig = signal_ml_pattern_dual(sym, df1m, tf)
-                if not sig:
+                if df1m is None or df1m.empty:
                     continue
-                if NO_PYRAMIDING and _has_open_position(sym):
-                    if SCANNER_DEBUG:
-                        print(f"[PYRAMID-BLOCK] {sym} already has open exposure. Skipping.", flush=True)
-                    continue
-                k = _dedupe_key(sym, tf, sig["action"], sig.get("barTime", ""))
-                if k in _sent_keys:
-                    continue
+                try:
+                    df1m.index = df1m.index.tz_convert(MARKET_TZ)
+                except Exception:
+                    df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
 
-                # pull confidence for ranking (supports either 'proba' or 'proba_up')
-                meta = sig.get("meta", {})
-                prob = float(meta.get("proba", meta.get("proba_up", 0.0)))
-                candidates.append((prob, sym, tf, sig, k, _get_sector(sym)))
+                # store returns for corr pruning
+                try:
+                    ret_series_map[sym] = df1m["close"].pct_change().dropna().tail(CORR_LOOKBACK).to_numpy()
+                except Exception:
+                    pass
 
-        # --- Debug summary of why signals were filtered in this batch ---
-        if SCANNER_DEBUG and COUNTS_STAGE:
-            msg = " | ".join(f"{k}:{v}" for k, v in sorted(COUNTS_STAGE.items()))
-            print(f"[SCAN-AUDIT] {msg}", flush=True)
+                for tf in TF_MIN_LIST:
+                    sig = signal_ml_pattern_dual(sym, df1m, tf)
+                    if not sig:
+                        continue
+                    if NO_PYRAMIDING and _has_open_position(sym):
+                        if SCANNER_DEBUG:
+                            print(f"[PYRAMID-BLOCK] {sym} already has open exposure. Skipping.", flush=True)
+                        continue
+                    k = _dedupe_key(sym, tf, sig["action"], sig.get("barTime", ""))
+                    if k in _sent_keys:
+                        continue
 
-        # (optional) quick peek at the strongest few candidates found in this batch
-        if SCANNER_DEBUG and candidates:
-            preview = sorted(candidates, key=lambda x: x[0], reverse=True)[:5]
-            snap = ", ".join(f"{s}:{p:.3f}@{tf}m" for p, s, tf, _, _, _ in preview)
-            print(f"[CAND-PEEK] top5 {snap}", flush=True)
+                    # pull confidence for ranking (supports either 'proba' or 'proba_up')
+                    meta = sig.get("meta", {})
+                    prob = float(meta.get("proba", meta.get("proba_up", 0.0)))
+                    candidates.append((prob, sym, tf, sig, k, _get_sector(sym)))
 
-        # --- selection: sort, sector cap, correlation prune, top-K, then send ---
-        if candidates:
-            candidates.sort(key=lambda x: x[0], reverse=True)
+            # --- Debug summary of why signals were filtered in this batch ---
+            if SCANNER_DEBUG and COUNTS_STAGE:
+                msg = " | ".join(f"{k}:{v}" for k, v in sorted(COUNTS_STAGE.items()))
+                print(f"[SCAN-AUDIT] {msg}", flush=True)
 
-            # sector cap
-            if MAX_PER_SECTOR > 0:
-                sec_count = defaultdict(int)
-                kept = []
-                for item in candidates:
-                    sec = item[5]
-                    if sec_count[sec] < MAX_PER_SECTOR:
-                        kept.append(item)
-                        sec_count[sec] += 1
-                candidates = kept
+            # (optional) quick peek at the strongest few candidates found in this batch
+            if SCANNER_DEBUG and candidates:
+                preview = sorted(candidates, key=lambda x: x[0], reverse=True)[:5]
+                snap = ", ".join(f"{s}:{p:.3f}@{tf}m" for p, s, tf, _, _, _ in preview)
+                print(f"[CAND-PEEK] top5 {snap}", flush=True)
 
-            # correlation prune
-            if MAX_CAND_CORR < 0.999:
-                candidates = _prune_by_correlation(candidates, ret_series_map, MAX_CAND_CORR)
+            # --- selection: sort, sector cap, correlation prune, top-K, then send ---
+            if candidates:
+                candidates.sort(key=lambda x: x[0], reverse=True)
 
-            chosen = candidates[:BATCH_TOP_K] if BATCH_TOP_K else candidates
-            for prob, sym, tf, sig, k, _ in chosen:
-                _sent_keys.add(k)
-                handle_signal("ml_pattern", sym, tf, sig)
+                # sector cap
+                if MAX_PER_SECTOR > 0:
+                    sec_count = defaultdict(int)
+                    kept = []
+                    for item in candidates:
+                        sec = item[5]
+                        if sec_count[sec] < MAX_PER_SECTOR:
+                            kept.append(item)
+                            sec_count[sec] += 1
+                    candidates = kept
+
+                # correlation prune
+                if MAX_CAND_CORR < 0.999:
+                    candidates = _prune_by_correlation(candidates, ret_series_map, MAX_CAND_CORR)
+
+                chosen = candidates[:BATCH_TOP_K] if BATCH_TOP_K else candidates
+                for prob, sym, tf, sig, k, _ in chosen:
+                    _sent_keys.add(k)
+                    handle_signal("ml_pattern", sym, tf, sig)
 
         except Exception as e:
             import traceback
