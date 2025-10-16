@@ -90,6 +90,7 @@ import pandas as pd, numpy as np
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict, deque
 from zoneinfo import ZoneInfo
+from collections import OrderedDict
 
 # ---- Alpaca adapters (data + broker) ----
 from adapters.data_alpaca import (
@@ -204,6 +205,12 @@ REGIME_MA                = int(os.getenv("REGIME_MA","200"))
 REGIME_MIN_RVOL          = float(os.getenv("REGIME_MIN_RVOL","0.005"))  # 0.5%
 REGIME_MAX_RVOL          = float(os.getenv("REGIME_MAX_RVOL","0.05"))   # 5%
 
+# --- Caching (OFF by default) ---
+CACHE_ENABLED        = os.getenv("CACHE_ENABLED","0").lower() in ("1","true","yes")
+CACHE_MAX_MINUTES    = int(os.getenv("CACHE_MAX_MINUTES","5000"))   # ~8–9 RTH days
+CACHE_MAX_SYMBOLS    = int(os.getenv("CACHE_MAX_SYMBOLS","2000"))   # LRU cap
+CACHE_PERSIST_PATH   = os.getenv("CACHE_PERSIST_PATH","")           # optional (unused here)
+
 # Render boot info
 RENDER_GIT_COMMIT = os.getenv("RENDER_GIT_COMMIT", "unknown")[:12]
 RENDER_GIT_BRANCH = os.getenv("RENDER_GIT_BRANCH", os.getenv("BRANCH", "unknown"))
@@ -244,6 +251,10 @@ _RELIABILITY = {     # confidence buckets: (wins, total)
 # Short-side smoothing & persistence state
 _PROBA_EMA_SHORT = {}    # (symbol, tf) -> smoothed short probability
 _PERSIST_OK_S    = {}    # (symbol, tf) -> consecutive bars over short threshold
+
+# In-memory caches
+_BARCACHE: "OrderedDict[str, pd.DataFrame]" = OrderedDict()   # 1m bars per symbol (tz-aware)
+_RESAMPLE_CACHE: dict[tuple[str,int], tuple[pd.Timestamp, pd.DataFrame]] = {}
 
 # ==============================
 # DATA MODEL
@@ -328,28 +339,133 @@ def build_universe() -> list[str]:
     return syms
 
 def fetch_bars_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(minutes=lookback_minutes)
-    start_iso = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    end_iso   = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    df = _alpaca_fetch_1m(symbol, start_iso=start_iso, end_iso=end_iso, limit=10000)
-    if df is None or df.empty:
-        return pd.DataFrame()
+    """
+    Cached wrapper around Alpaca minute bars.
+    - When CACHE_ENABLED=1: incrementally updates the per-symbol 1m cache, then returns the requested window.
+    - When off: direct API call (original behavior).
+    Returns tz-aware ET ohlcv DataFrame (open/high/low/close/volume).
+    """
+    # Fallback to non-cached path
+    if not CACHE_ENABLED:
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(minutes=lookback_minutes)
+        start_iso = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        end_iso   = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        df = _alpaca_fetch_1m(symbol, start_iso=start_iso, end_iso=end_iso, limit=10000)
+        if df is None or df.empty:
+            return pd.DataFrame()
+        try:
+            df.index = df.index.tz_convert(MARKET_TZ)
+        except Exception:
+            df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
+        # price gate
+        try:
+            last_px = float(df["close"].iloc[-1])
+            if last_px < MIN_PRICE:
+                return pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+        return df[["open","high","low","close","volume"]].copy()
+
+    # ----- Cached path -----
+    # Helper: LRU admit/evict
+    def _touch(sym: str):
+        _BARCACHE.setdefault(sym, pd.DataFrame())
+        _BARCACHE.move_to_end(sym, last=True)
+        # LRU evict if needed
+        while len(_BARCACHE) > max(1, CACHE_MAX_SYMBOLS):
+            _BARCACHE.popitem(last=False)
+
+    # Ensure cache entry exists
+    cached = _BARCACHE.get(symbol)
+    if cached is None or cached.empty:
+        # First fill: backfill full requested window (capped by CACHE_MAX_MINUTES)
+        end = datetime.now(timezone.utc)
+        need_minutes = min(max(1, lookback_minutes), CACHE_MAX_MINUTES)
+        start = end - timedelta(minutes=need_minutes)
+        start_iso = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        end_iso   = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        df_new = _alpaca_fetch_1m(symbol, start_iso=start_iso, end_iso=end_iso, limit=10000)
+        if df_new is None or df_new.empty:
+            return pd.DataFrame()
+        try:
+            df_new.index = df_new.index.tz_convert(MARKET_TZ)
+        except Exception:
+            df_new.index = df_new.index.tz_localize("UTC").tz_convert(MARKET_TZ)
+        cached = df_new
+    else:
+        # Incremental update: fetch bars strictly after last cached index
+        try:
+            last_ts = cached.index[-1].tz_convert("UTC") if hasattr(cached.index[-1], "tzinfo") else cached.index[-1]
+        except Exception:
+            last_ts = None
+        end = datetime.now(timezone.utc)
+        # Only fetch if we’re beyond the last cached minute
+        if last_ts is not None:
+            start = (last_ts + timedelta(minutes=1)).replace(tzinfo=timezone.utc)
+        else:
+            start = end - timedelta(minutes=min(lookback_minutes, CACHE_MAX_MINUTES))
+        if start < end:
+            start_iso = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            end_iso   = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            df_inc = _alpaca_fetch_1m(symbol, start_iso=start_iso, end_iso=end_iso, limit=10000)
+            if df_inc is not None and not df_inc.empty:
+                try:
+                    df_inc.index = df_inc.index.tz_convert(MARKET_TZ)
+                except Exception:
+                    df_inc.index = df_inc.index.tz_localize("UTC").tz_convert(MARKET_TZ)
+                # Merge, sort, dedupe
+                cached = pd.concat([cached, df_inc], axis=0)
+                cached = cached[~cached.index.duplicated(keep="last")].sort_index()
+
+    # Trim cache to CACHE_MAX_MINUTES (LRU keeps symbol count in check)
+    if len(cached) > 0 and CACHE_MAX_MINUTES > 0:
+        cutoff = cached.index[-1] - timedelta(minutes=CACHE_MAX_MINUTES)
+        cached = cached[cached.index >= cutoff]
+
+    # Store back & LRU-touch
+    _BARCACHE[symbol] = cached
+    _touch(symbol)
+
+    # price gate on latest
     try:
-        df.index = df.index.tz_convert(MARKET_TZ)
-    except Exception:
-        df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
-    try:
-        last_px = float(df["close"].iloc[-1])
+        last_px = float(cached["close"].iloc[-1])
         if last_px < MIN_PRICE:
             return pd.DataFrame()
     except Exception:
         return pd.DataFrame()
-    return df[["open","high","low","close","volume"]].copy()
+
+    # Return only requested window (but served from cache)
+    if lookback_minutes > 0 and len(cached) > 0:
+        cutoff2 = cached.index[-1] - timedelta(minutes=lookback_minutes)
+        out = cached[cached.index >= cutoff2]
+    else:
+        out = cached
+
+    return out[["open","high","low","close","volume"]].copy()
 
 def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
+    """
+    Cache-aware resample:
+    - If we’ve already resampled this (symbol, tf) source slice and no new 1m rows are added, return cached.
+    - If new rows exist, recompute resample (simple, robust).
+    Note: We keep it simple (full recompute on new data) — big win still comes from 1m caching.
+    """
     if df1m is None or df1m.empty:
         return pd.DataFrame()
+
+    # Identify this source by its last timestamp (cheap & robust)
+    src_last = df1m.index[-1]
+
+    # Try cache hit if caller provided a symbol hint via index name
+    # (Many pandas readers leave index.name None; so we don’t rely on the symbol key here.)
+    cache_key = (id(df1m), int(tf_min))  # buffer-identity-based; safe per-call
+
+    cached = _RESAMPLE_CACHE.get(cache_key)
+    if cached and cached[0] is not None and cached[0] == src_last:
+        return cached[1]
+
+    # Otherwise (new data), perform resample
     rule = f"{int(tf_min)}min"
     agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
     bars = df1m.resample(rule, origin="start_day", label="right").agg(agg).dropna()
@@ -357,6 +473,8 @@ def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
         bars.index = bars.index.tz_convert(MARKET_TZ)
     except Exception:
         bars.index = bars.index.tz_localize("UTC").tz_convert(MARKET_TZ)
+
+    _RESAMPLE_CACHE[cache_key] = (src_last, bars)
     return bars
 
 # ==============================
