@@ -113,6 +113,8 @@ DRY_RUN      = os.getenv("DRY_RUN", "0").lower() in ("1","true","yes")
 PAPER_MODE   = os.getenv("PAPER_MODE", "true").lower() != "false"
 SCANNER_DEBUG= os.getenv("SCANNER_DEBUG", "0").lower() in ("1","true","yes")
 
+EXTRA_TICKS = int(os.getenv("EXTRA_TICKS", "1"))  # extra pennies to clear Alpaca base_price drift
+
 TF_MIN_LIST  = [int(x) for x in os.getenv("TF_MIN_LIST", "1,2,3,5,10").split(",") if x.strip()]
 MAX_UNIVERSE_PAGES = int(os.getenv("MAX_UNIVERSE_PAGES", "3"))
 SCAN_BATCH_SIZE    = int(os.getenv("SCAN_BATCH_SIZE", "150"))
@@ -275,18 +277,19 @@ def _tick_round(px: float, tick: float = MIN_TICK) -> float:
     # Avoid float display errors like 9.029999...
     return float(f"{q:.4f}")
 
-def _apply_tick_rules(side: str, base: float, tp: float, sl: float, tick: float = MIN_TICK):
+def _apply_tick_rules(side: str, base: float, tp: float, sl: float, tick: float = MIN_TICK, extra_ticks: int = EXTRA_TICKS):
     """
-    Enforce Alpaca bracket constraints with tick rounding.
-    Long:  TP >= base+tick, SL <= base-tick
-    Short: TP <= base-tick, SL >= base+tick
+    Enforce Alpaca bracket constraints with a safety buffer.
+    Long:  TP >= base + tick*buf, SL <= base - tick*buf
+    Short: TP <= base - tick*buf, SL >= base + tick*buf
     """
+    buf = tick * max(1, int(extra_ticks))
     if side == "long":
-        tp = max(tp, base + tick)
-        sl = min(sl, base - tick)
+        tp = max(tp, base + buf)
+        sl = min(sl, base - buf)
     else:  # short
-        tp = min(tp, base - tick)
-        sl = max(sl, base + tick)
+        tp = min(tp, base - buf)
+        sl = max(sl, base + buf)
     return _tick_round(tp, tick), _tick_round(sl, tick)
 
 # ==============================
@@ -1218,21 +1221,39 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
     # send first, only record on success
     ok, info = send_to_broker(symbol, sig, strategy_tag="ml_pattern")
 
-    # If Alpaca rejects due to bracket distances, adjust once and retry
+        # If Alpaca rejects due to bracket distances, adjust once and retry
     info_str = str(info)
     if (not ok) and any(key in info_str for key in ("take_profit.limit_price", "stop_loss.stop_price")):
         try:
-            base = float(sig.get("entry") or LAST_PRICE.get(symbol, 0.0) or 0.0)
+            # Try to parse Alpaca's base_price from the error payload
+            broker_base = None
+            try:
+                s = info_str
+                jstart = s.find("{")
+                if jstart != -1:
+                    j = json.loads(s[jstart:])
+                    bp = j.get("base_price")
+                    if bp is not None:
+                        broker_base = float(bp)
+            except Exception:
+                broker_base = None
+
+            base = broker_base if (broker_base is not None) \
+                   else float(sig.get("entry") or LAST_PRICE.get(symbol, 0.0) or 0.0)
             side = "long" if sig.get("action") == "buy" else "short"
             tp = float(sig["takeProfit"]); sl = float(sig["stopLoss"])
-            tp2, sl2 = _apply_tick_rules(side, base, tp, sl)
+
+            # Re-apply rules vs Alpaca's base_price with a small safety buffer
+            tp2, sl2 = _apply_tick_rules(side, base, tp, sl, tick=MIN_TICK, extra_ticks=EXTRA_TICKS)
+
+            # Only resend if levels actually changed
             if (abs(tp2 - tp) >= MIN_TICK/2) or (abs(sl2 - sl) >= MIN_TICK/2):
                 sig2 = dict(sig)
                 sig2["takeProfit"] = tp2
                 sig2["stopLoss"]   = sl2
                 ok, info = send_to_broker(symbol, sig2, strategy_tag="ml_pattern")
                 if ok:
-                    sig = sig2  # keep the adjusted levels for local bookkeeping
+                    sig = sig2  # keep adjusted levels for local bookkeeping
         except Exception:
             pass
 
