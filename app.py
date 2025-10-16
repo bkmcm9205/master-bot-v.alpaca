@@ -259,6 +259,7 @@ _BARCACHE: "OrderedDict[str, pd.DataFrame]" = OrderedDict()   # 1m bars per symb
 _RESAMPLE_CACHE: dict[tuple[str,int], tuple[pd.Timestamp, pd.DataFrame]] = {}
 
 # per-batch stage counts (pipeline gates) and per-model reasons
+from collections import defaultdict
 COUNTS_STAGE = defaultdict(int)   # already used by SCAN-AUDIT; harmless to reassign
 COUNTS_MODEL = defaultdict(int)   # used by MODEL-AUDIT inside _ml_features_and_pred_core
 
