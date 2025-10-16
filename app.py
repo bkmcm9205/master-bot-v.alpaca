@@ -557,7 +557,7 @@ def _dedupe_key(symbol: str, tf: int, action: str, bar_time: str) -> str:
 # Tunables for ML/labels (base)
 _H = 5
 _RET_THR = 0.0025
-_MIN_SAMPLES = 240
+_MIN_SAMPLES = int(os.getenv("ML_MIN_SAMPLES", "240"))
 
 _FEATURES = [
     "ret1","ret3","ret5","ret10",
@@ -1367,6 +1367,18 @@ def main():
                     df1m.index = df1m.index.tz_convert(MARKET_TZ)
                 except Exception:
                     df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
+
+                # --- quick liquidity gate: require some intraday activity today ---
+                try:
+                    today = _now_et().date()
+                    today_mask = df1m.index.date == today
+                    today_vol = int(df1m.loc[today_mask, "volume"].sum())
+                    min_today = int(os.getenv("SCANNER_MIN_TODAY_VOL", "0"))
+                    if today_vol < min_today:
+                        COUNTS_STAGE["00_low_today_vol"] += 1
+                        continue
+                except Exception:
+                    pass
 
                 # store returns for corr pruning
                 try:
