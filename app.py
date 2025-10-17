@@ -1451,6 +1451,36 @@ def _refresh_shortable_if_needed():
         print(f"[SHORTABLE] exception {e}", flush=True)
 
 # ==============================
+# BROKER AUTH PROBE (boot banner)
+# ==============================
+def probe_alpaca_auth():
+    """Simple startup check that Alpaca keys are valid and account is reachable."""
+    try:
+        base = os.getenv("ALPACA_TRADE_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+        key = os.getenv("APCA_API_KEY_ID") or os.getenv("APCA-API-KEY-ID")
+        sec = os.getenv("APCA_API_SECRET_KEY") or os.getenv("APCA-API-SECRET-KEY")
+        if not key or not sec:
+            print("[PROBE] missing Alpaca API credentials", flush=True)
+            return False
+
+        r = requests.get(f"{base}/v2/account", headers={
+            "APCA-API-KEY-ID": key,
+            "APCA-API-SECRET-KEY": sec
+        }, timeout=10)
+
+        if r.status_code == 200:
+            acct = r.json()
+            print(f"[PROBE] GET /v2/account -> {r.status_code} key={key[:3]}…{key[-3:]} base={base}", flush=True)
+            print(f"[PROBE] account_number={acct.get('account_number')} status={acct.get('status')} currency={acct.get('currency')}", flush=True)
+            return True
+        else:
+            print(f"[PROBE] Alpaca auth failed ({r.status_code}): {r.text}", flush=True)
+            return False
+    except Exception as e:
+        print(f"[PROBE] Alpaca auth exception: {e}", flush=True)
+        return False
+
+# ==============================
 # MAIN LOOP
 # ==============================
 def main():
