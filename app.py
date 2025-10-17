@@ -227,6 +227,7 @@ COUNTS_STAGE = defaultdict(int)
 # --- Shortable cache (for proactive short filtering) ---
 SHORTABLE_SET = set()
 SHORTABLE_LAST = None
+_SHORTABLE_ONEOFF = {}        
 
 # ==============================
 # STATE / LEDGERS
@@ -311,6 +312,46 @@ def _apply_tick_rules(side: str, base: float, tp: float, sl: float,
         sl = _ceil_to_tick(sl, tick)
 
     return float(tp), float(sl)
+
+def _is_shortable(symbol: str) -> bool:
+    """
+    Reliable check: if we already know from caches, use that; otherwise
+    query Alpaca /v2/assets/{symbol} once and cache the result.
+    """
+    s = symbol.upper()
+
+    # trust a positive decision from bulk cache if present
+    if SHORTABLE_SET:
+        if s in SHORTABLE_SET:
+            return True
+        # If bulk cache exists and doesn't contain s, it *might* still be shortable
+        # (pagination, attributes quirks). We'll fall back to the one-off check.
+
+    # one-off cache
+    if s in _SHORTABLE_ONEOFF:
+        return _SHORTABLE_ONEOFF[s]
+
+    # live query
+    try:
+        base = os.getenv("ALPACA_TRADE_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+        url = f"{base}/v2/assets/{s}"
+        headers = {
+            "APCA-API-KEY-ID": os.getenv("APCA_API_KEY_ID") or os.getenv("APCA-API-KEY-ID") or "",
+            "APCA-API-SECRET-KEY": os.getenv("APCA_API_SECRET_KEY") or os.getenv("APCA-API-SECRET-KEY") or "",
+        }
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code == 200:
+            data = r.json()
+            flag = bool(data.get("shortable", False)) and bool(data.get("tradable", False))
+            _SHORTABLE_ONEOFF[s] = flag
+            return flag
+        else:
+            # if the asset fetch fails, be safe and treat as not shortable
+            _SHORTABLE_ONEOFF[s] = False
+            return False
+    except Exception:
+        _SHORTABLE_ONEOFF[s] = False
+        return False
 
 # ==============================
 # DATA MODEL
@@ -1421,7 +1462,6 @@ def main():
     print(f"[BOOT] ADV: TB={int(TB_ENABLED)} META={int(META_ENABLED)} PERSIST_BARS={PERSIST_BARS} CONS_TF={CONSENSUS_TF} BATCH_TOP_K={BATCH_TOP_K} REGIME={int(REGIME_ENABLED)}", flush=True)
     print(f"[BOOT] DAILY_GUARD_ENABLED={int(DAILY_GUARD_ENABLED)} UP={DAILY_TP_PCT:.0%} DOWN={DAILY_DD_PCT:.0%} FLATTEN={int(DAILY_FLATTEN_ON_HIT)} START_EQUITY={START_EQUITY:.2f}", flush=True)
 
-    from common.signal_bridge import probe_alpaca_auth
     probe_alpaca_auth()
 
     symbols = build_universe()
@@ -1445,7 +1485,8 @@ def main():
                         df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
                     bars = _resample(df, tf)
                     if bars is not None and not bars.empty:
-                        row = bars.iloc[-1]; ts  = bars.index[-1]
+                        row = bars.iloc[-1]
+                        ts  = bars.index[-1]
                         LAST_PRICE[sym] = float(row["close"])
                         _maybe_close_on_bar(sym, tf, ts, float(row["high"]), float(row["low"]), float(row["close"]))
                 except Exception as e:
@@ -1456,6 +1497,7 @@ def main():
 
             # ---- EOD manager
             now_et = _now_et()
+
             def _cancel_all_open_orders_safely():
                 try:
                     ok, info = cancel_all_orders()
@@ -1504,7 +1546,7 @@ def main():
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # ---- Scan & signal phase
+            # ---- Scan gating
             if SCANNER_MARKET_HOURS_ONLY and not _market_session_now():
                 if SCANNER_DEBUG:
                     print("[SCAN] Skipping — market session closed.", flush=True)
@@ -1517,13 +1559,17 @@ def main():
             except Exception:
                 _REF_BARS_1M[RS_SYMBOL] = pd.DataFrame()
 
-            # reset per-batch debug tallies
+            # reset per-batch audit tallies
             COUNTS_STAGE.clear()
             COUNTS_MODEL.clear()
 
-            # Ensure shortable cache is fresh (if enabled)
-            _refresh_shortable_if_needed()
+            # (Optional) shortable prefetch hook; safe if no-op in your codebase
+            try:
+                _refresh_shortable_if_needed()  # if you implemented it; otherwise this is a no-op wrapper
+            except Exception:
+                pass
 
+            # ---- Build batch
             batch = _batched_symbols(symbols)
             if SCANNER_DEBUG:
                 total = len(symbols)
@@ -1531,11 +1577,11 @@ def main():
                 start_idx = (s - len(batch)) if s else 0
                 print(f"[SCAN] symbols {start_idx}:{start_idx+len(batch)} / {total}  (batch={len(batch)})", flush=True)
 
-                       # --- gather candidates for this batch ---
             candidates = []
             ret_series_map = {}  # for correlation pruning
 
             for sym in batch:
+                # ---- fetch & normalize bars ----
                 df1m = fetch_bars_1m(
                     sym,
                     lookback_minutes=max(
@@ -1544,6 +1590,7 @@ def main():
                     )
                 )
                 if df1m is None or df1m.empty:
+                    COUNTS_STAGE["02_no_data"] += 1
                     continue
                 try:
                     df1m.index = df1m.index.tz_convert(MARKET_TZ)
@@ -1553,7 +1600,7 @@ def main():
                 # --- quick liquidity gate: require some intraday activity today ---
                 try:
                     today = _now_et().date()
-                    today_mask = df1m.index.date == today
+                    today_mask = (df1m.index.date == today)
                     today_vol = int(df1m.loc[today_mask, "volume"].sum())
                     min_today = int(os.getenv("SCANNER_MIN_TODAY_VOL", "0"))
                     if today_vol < min_today:
@@ -1562,52 +1609,76 @@ def main():
                 except Exception:
                     pass
 
+                # --- optional ETF/ETN heuristic skip (keeps noise down on paper) ---
+                if os.getenv("SKIP_ETFS", "0").lower() in ("1", "true", "yes"):
+                    s_up = sym.upper()
+                    looks_etf = (
+                        s_up.endswith("U") or
+                        s_up.endswith("W") or
+                        s_up in ("SPY", "QQQ", "IWM")
+                    ) or (len(s_up) > 4)
+                    if looks_etf:
+                        COUNTS_STAGE["06_skip_etf"] += 1
+                        if SCANNER_DEBUG:
+                            print(f"[SKIP] {sym} ETF/ETN by heuristic.", flush=True)
+                        continue
+
                 # store returns for corr pruning
                 try:
                     ret_series_map[sym] = df1m["close"].pct_change().dropna().tail(CORR_LOOKBACK).to_numpy()
                 except Exception:
                     pass
 
+                # ---- per-timeframe signals (with shortable scan gate) ----
                 for tf in TF_MIN_LIST:
                     sig = signal_ml_pattern_dual(sym, df1m, tf)
                     if not sig:
                         continue
+
+                    # Proactively skip non-shortable shorts (avoid 422 spam)
+                    if (
+                        os.getenv("SKIP_NON_SHORTABLE", "1").lower() in ("1", "true", "yes")
+                        and sig.get("action") == "sell_short"
+                    ):
+                        try:
+                            # quick memory denylist first
+                            if sym in SHORT_DENY:
+                                COUNTS_STAGE["05_not_shortable"] += 1
+                                continue
+                            # reliable live check
+                            if not _is_shortable(sym):
+                                SHORT_DENY.add(sym)
+                                COUNTS_STAGE["05_not_shortable"] += 1
+                                if SCANNER_DEBUG:
+                                    print(f"[SKIP] {sym} not shortable (scan gate).", flush=True)
+                                continue
+                        except Exception:
+                            # if check fails, be conservative and skip the short
+                            COUNTS_STAGE["05_not_shortable"] += 1
+                            continue
+
                     if NO_PYRAMIDING and _has_open_position(sym):
                         if SCANNER_DEBUG:
                             print(f"[PYRAMID-BLOCK] {sym} already has open exposure. Skipping.", flush=True)
                         continue
 
-                    # NEW: proactively skip non-shortables
-                    if os.getenv("SKIP_NON_SHORTABLE","0").lower() in ("1","true","yes"):
-                        if sig.get("action") == "sell_short" and SHORTABLE_SET and (sym.upper() not in SHORTABLE_SET):
-                            COUNTS_STAGE["05_not_shortable"] += 1
-                            continue
-                            
                     k = _dedupe_key(sym, tf, sig["action"], sig.get("barTime", ""))
                     if k in _sent_keys:
                         continue
 
-                    meta = sig.get("meta", {})
-                    prob = float(meta.get("proba", meta.get("proba_up", 0.0)))
+                    prob = float(sig.get("meta", {}).get("proba_up", 0.0))
                     candidates.append((prob, sym, tf, sig, k, _get_sector(sym)))
-                    COUNTS_STAGE["16_signal_ok"] += 1
 
-            # --- Debug summaries ---
-            if SCANNER_DEBUG:
-                if COUNTS_STAGE:
-                    msg = " | ".join(f"{k}:{v}" for k, v in sorted(COUNTS_STAGE.items()))
-                    print(f"[SCAN-AUDIT] {msg}", flush=True)
-                print(f"[CAND-COUNT] raw={len(candidates)}", flush=True)
-
-            # --- selection: sort, sector cap, correlation prune, top-K ---
+            # -------- selection: sort, optional sector cap, corr prune, top-K, then send --------
             if candidates:
+                # order by model confidence, highest first
                 candidates.sort(key=lambda x: x[0], reverse=True)
-                if SCANNER_DEBUG:
-                    print(f"[SELECT] after-sort={len(candidates)} top5=" +
-                          ", ".join(f"{s}:{p:.3f}@{tf}m" for p, s, tf, *_ in candidates[:5]), flush=True)
+                print(f"[CAND-COUNT] raw={len(candidates)}", flush=True)
+                top5_preview = ", ".join([f"{c[1]}:{c[0]:.3f}@{c[2]}m" for c in candidates[:5]])
+                if top5_preview:
+                    print(f"[SELECT] after-sort={len(candidates)} top5={top5_preview}", flush=True)
 
-                # sector cap
-                before_sec = len(candidates)
+                # sector cap (optional)
                 if MAX_PER_SECTOR > 0:
                     sec_count = defaultdict(int)
                     kept = []
@@ -1616,25 +1687,30 @@ def main():
                         if sec_count[sec] < MAX_PER_SECTOR:
                             kept.append(item)
                             sec_count[sec] += 1
+                    if SCANNER_DEBUG:
+                        print(f"[SELECT] after-sector={len(kept)} (was {len(candidates)})", flush=True)
                     candidates = kept
-                if SCANNER_DEBUG:
-                    print(f"[SELECT] after-sector={len(candidates)} (was {before_sec})", flush=True)
 
-                # correlation prune
-                before_corr = len(candidates)
+                # correlation prune (optional)
                 if MAX_CAND_CORR < 0.999:
+                    prev = len(candidates)
                     candidates = _prune_by_correlation(candidates, ret_series_map, MAX_CAND_CORR)
-                if SCANNER_DEBUG:
-                    print(f"[SELECT] after-corr={len(candidates)} (was {before_corr})", flush=True)
+                    if SCANNER_DEBUG:
+                        print(f"[SELECT] after-corr={len(candidates)} (was {prev})", flush=True)
+                else:
+                    if SCANNER_DEBUG:
+                        print(f"[SELECT] after-corr={len(candidates)} (was {len(candidates)})", flush=True)
 
-                # top-K
+                # top-K throttle
                 chosen = candidates[:BATCH_TOP_K] if BATCH_TOP_K else candidates
-                if SCANNER_DEBUG:
-                    print(f"[SELECT] chosen={len(chosen)}", flush=True)
+                print(f"[SELECT] chosen={len(chosen)}", flush=True)
 
                 for prob, sym, tf, sig, k, _ in chosen:
                     _sent_keys.add(k)
                     handle_signal("ml_pattern", sym, tf, sig)
+            else:
+                if SCANNER_DEBUG:
+                    print("[CAND-COUNT] raw=0", flush=True)
 
         except Exception as e:
             import traceback
