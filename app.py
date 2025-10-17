@@ -1044,83 +1044,76 @@ def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
             COUNTS_STAGE["07_below_threshold_L"] += 1
         _PERSIST_OK[("L",)+key_pt] = 0
 
-    # ---------- SHORT branch ----------
+       # ---------- SHORT branch ----------
     short_ok = False
     p_short = -1.0
     if ENABLE_SHORTS:
-        p_down_raw = 1.0 - p_raw
-        p_short = _smooth(_PROBA_EMA_SHORT, key_pt, p_down_raw, PROBA_EMA_ALPHA)
+        # Gate *only* the short side — do NOT skip the whole symbol
+        if not _is_shortable(symbol):
+            if SCANNER_DEBUG:
+                print(f"[SHORT-SKIP] {symbol} not shortable; long still allowed.", flush=True)
+            p_short = -1.0
+        else:
+            p_down_raw = 1.0 - p_raw
+            p_short = _smooth(_PROBA_EMA_SHORT, key_pt, p_down_raw, PROBA_EMA_ALPHA)
 
-        # higher-TF consensus (short)
-        if CONSENSUS_TF and CONSENSUS_TF != tf_min:
-            bars_hi = _resample(df1m, CONSENSUS_TF)
-            if bars_hi is None or bars_hi.empty:
-                COUNTS_STAGE["09_consensus_resample_empty_S"] += 1
-                p_short = -1
-            else:
-                last_ts2 = bars_hi.index[-1]
-                last_ts2_iso = last_ts2.tz_convert("UTC").isoformat() if hasattr(last_ts2, "tzinfo") else str(last_ts2)
-                cache_key2s = (symbol, int(CONSENSUS_TF), last_ts2_iso, float(bars_hi["close"].iloc[-1]))
-                cached2s = _ML_CACHE.get(cache_key2s)
-                if cached2s:
-                    ts2s, p2s, pred2s = cached2s
-                else:
-                    ts2s, p2s, pred2s = _ml_features_and_pred(bars_hi)
-                    if ts2s is not None:
-                        _ML_CACHE[cache_key2s] = (ts2s, p2s, pred2s)
-                if (ts2s is None) or (p2s is None):
-                    COUNTS_STAGE["10_consensus_model_none_S"] += 1
-                    p_short = -1
-                elif pred2s != 0:
-                    COUNTS_STAGE["11_consensus_pred_down_S"] += 1
+            # higher-TF consensus (short)
+            if CONSENSUS_TF and CONSENSUS_TF != tf_min:
+                bars_hi = _resample(df1m, CONSENSUS_TF)
+                if bars_hi is None or bars_hi.empty:
                     p_short = -1
                 else:
-                    p_short = float((p_short ** (1 - CONSENSUS_WEIGHT)) * ((1.0 - float(p2s)) ** CONSENSUS_WEIGHT))
+                    last_ts2 = bars_hi.index[-1]
+                    last_ts2_iso = last_ts2.tz_convert("UTC").isoformat() if hasattr(last_ts2, "tzinfo") else str(last_ts2)
+                    cache_key2s = (symbol, int(CONSENSUS_TF), last_ts2_iso, float(bars_hi["close"].iloc[-1]))
+                    cached2s = _ML_CACHE.get(cache_key2s)
+                    if cached2s:
+                        ts2s, p2s, pred2s = cached2s
+                    else:
+                        ts2s, p2s, pred2s = _ml_features_and_pred(bars_hi)
+                        if ts2s is not None:
+                            _ML_CACHE[cache_key2s] = (ts2s, p2s, pred2s)
+                    if (ts2s is None) or (p2s is None) or (pred2s != 0):
+                        p_short = -1
+                    else:
+                        p_short = float((p_short ** (1 - CONSENSUS_WEIGHT)) * ((1.0 - float(p2s)) ** CONSENSUS_WEIGHT))
 
-        # dynamic quantile (short): track mirrored series (1 - p_short)
-        if p_short >= 0 and CONF_ROLL_N > 0:
-            dq = _CONF_HIST.get(("S",)+key_pt)
-            if dq is None:
-                dq = deque(maxlen=CONF_ROLL_N)
-                _CONF_HIST[("S",)+key_pt] = dq
-            if len(dq) >= max(10, int(0.5*CONF_ROLL_N)):
-                qthr = float(np.quantile(np.array(dq), CONF_Q))
-                if p_short < qthr:
-                    COUNTS_STAGE["12_below_dyn_quantile_S"] += 1
+            # dynamic quantile (short): mirror long space with 1 - dq
+            if p_short >= 0 and CONF_ROLL_N > 0:
+                dq = _CONF_HIST.get(key_pt)
+                if dq is None:
+                    dq = deque(maxlen=CONF_ROLL_N)
+                    _CONF_HIST[key_pt] = dq
+                if len(dq) >= max(10, int(0.5*CONF_ROLL_N)):
+                    qthr = float(np.quantile(1.0 - np.array(dq), CONF_Q))
+                    if p_short < qthr:
+                        p_short = -1
+                if p_short >= 0:
+                    dq.append(1.0 - p_short)
+
+            # regime gate (short when RS_SYMBOL < EMA)
+            if REGIME_ENABLED and p_short >= 0:
+                ref = _REF_BARS_1M.get(RS_SYMBOL, pd.DataFrame())
+                if ref is None or ref.empty or len(ref) < max(REGIME_MA+5, 60):
                     p_short = -1
-            if p_short >= 0:
-                dq.append(p_short)
+                else:
+                    ema = ref["close"].ewm(span=REGIME_MA, adjust=False).mean().iloc[-1]
+                    below = float(ref["close"].iloc[-1]) < float(ema)
+                    rvol = ref["close"].pct_change().rolling(30).std().iloc[-1]
+                    if not (below and REGIME_MIN_RVOL <= float(rvol) <= REGIME_MAX_RVOL):
+                        p_short = -1
 
-        # regime gate (short when SPY < EMA)
-        if REGIME_ENABLED and p_short >= 0:
-            ref = _REF_BARS_1M.get(RS_SYMBOL, pd.DataFrame())
-            if ref is None or ref.empty or len(ref) < max(REGIME_MA+5, 60):
-                COUNTS_STAGE["05_regime_ref_missing_S"] += 1
-                p_short = -1
-            else:
-                ema = ref["close"].ewm(span=REGIME_MA, adjust=False).mean().iloc[-1]
-                below = float(ref["close"].iloc[-1]) < float(ema)
-                rvol = ref["close"].pct_change().rolling(30).std().iloc[-1]
-                if not (below and REGIME_MIN_RVOL <= float(rvol) <= REGIME_MAX_RVOL):
-                    COUNTS_STAGE["06_regime_fail_S"] += 1
-                    p_short = -1
-
-        # persistence (short)
-        thr_short = max(CONF_THR_RUNTIME, SHORT_CONF_THR)
-        if p_short >= 0 and p_short >= thr_short + MIN_PROBA_GAP:
-            if PERSIST_BARS >= 2:
-                c = _PERSIST_OK_S.get(("S",)+key_pt, 0) + 1
-                _PERSIST_OK_S[("S",)+key_pt] = c
-                if c < PERSIST_BARS:
-                    COUNTS_STAGE["08_persist_not_met_S"] += 1
+            # persistence (short)
+            thr_short = max(CONF_THR_RUNTIME, SHORT_CONF_THR)
+            if p_short >= 0 and p_short >= thr_short + MIN_PROBA_GAP:
+                if PERSIST_BARS >= 2:
+                    c = _PERSIST_OK_S.get(key_pt, 0) + 1
+                    _PERSIST_OK_S[key_pt] = c
+                    short_ok = (c >= PERSIST_BARS)
                 else:
                     short_ok = True
             else:
-                short_ok = True
-        else:
-            if p_short >= 0:
-                COUNTS_STAGE["07_below_threshold_S"] += 1
-            _PERSIST_OK_S[("S",)+key_pt] = 0
+                _PERSIST_OK_S[key_pt] = 0
 
     # choose side
     side = None
@@ -1664,28 +1657,6 @@ def main():
                     sig = signal_ml_pattern_dual(sym, df1m, tf)
                     if not sig:
                         continue
-
-                    # Proactively skip non-shortable shorts (avoid 422 spam)
-                    if (
-                        os.getenv("SKIP_NON_SHORTABLE", "1").lower() in ("1", "true", "yes")
-                        and sig.get("action") == "sell_short"
-                    ):
-                        try:
-                            # quick memory denylist first
-                            if sym in SHORT_DENY:
-                                COUNTS_STAGE["05_not_shortable"] += 1
-                                continue
-                            # reliable live check
-                            if not _is_shortable(sym):
-                                SHORT_DENY.add(sym)
-                                COUNTS_STAGE["05_not_shortable"] += 1
-                                if SCANNER_DEBUG:
-                                    print(f"[SKIP] {sym} not shortable (scan gate).", flush=True)
-                                continue
-                        except Exception:
-                            # if check fails, be conservative and skip the short
-                            COUNTS_STAGE["05_not_shortable"] += 1
-                            continue
 
                     if NO_PYRAMIDING and _has_open_position(sym):
                         if SCANNER_DEBUG:
