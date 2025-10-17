@@ -315,23 +315,24 @@ def _apply_tick_rules(side: str, base: float, tp: float, sl: float,
 
 def _is_shortable(symbol: str) -> bool:
     """
-    Reliable check: if we already know from caches, use that; otherwise
-    query Alpaca /v2/assets/{symbol} once and cache the result.
+    Hard override if FORCE_ALLOW_SHORTS=1. Otherwise, use cached/broker check.
+    This silences any 'not shortable (scan gate)' skips regardless of where
+    the check is called from.
     """
+    if os.getenv("FORCE_ALLOW_SHORTS", "0").lower() in ("1", "true", "yes"):
+        return True
+
     s = symbol.upper()
 
     # trust a positive decision from bulk cache if present
     if SHORTABLE_SET:
         if s in SHORTABLE_SET:
             return True
-        # If bulk cache exists and doesn't contain s, it *might* still be shortable
-        # (pagination, attributes quirks). We'll fall back to the one-off check.
+        # fall through; absence doesn't prove not-shortable
 
-    # one-off cache
     if s in _SHORTABLE_ONEOFF:
         return _SHORTABLE_ONEOFF[s]
 
-    # live query
     try:
         base = os.getenv("ALPACA_TRADE_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
         url = f"{base}/v2/assets/{s}"
@@ -339,19 +340,17 @@ def _is_shortable(symbol: str) -> bool:
             "APCA-API-KEY-ID": os.getenv("APCA_API_KEY_ID") or os.getenv("APCA-API-KEY-ID") or "",
             "APCA-API-SECRET-KEY": os.getenv("APCA_API_SECRET_KEY") or os.getenv("APCA-API-SECRET-KEY") or "",
         }
-        r = requests.get(url, headers=headers, timeout=15)
+        r = requests.get(url, headers=headers, timeout=10)
         if r.status_code == 200:
             data = r.json()
             flag = bool(data.get("shortable", False)) and bool(data.get("tradable", False))
             _SHORTABLE_ONEOFF[s] = flag
             return flag
-        else:
-            # if the asset fetch fails, be safe and treat as not shortable
-            _SHORTABLE_ONEOFF[s] = False
-            return False
     except Exception:
-        _SHORTABLE_ONEOFF[s] = False
-        return False
+        pass
+
+    _SHORTABLE_ONEOFF[s] = False
+    return False
 
 # ==============================
 # DATA MODEL
@@ -1472,6 +1471,69 @@ def probe_alpaca_auth():
     except Exception as e:
         print(f"[PROBE] Alpaca auth exception: {e}", flush=True)
         return False
+
+# ---- Alpaca key normalization + probe (drop-in) ----
+def _get_alpaca_keys():
+    """
+    Return (key_id, secret_key) by checking multiple common env var names.
+    """
+    key = (
+        os.getenv("APCA_API_KEY_ID")
+        or os.getenv("ALPACA_API_KEY_ID")
+        or os.getenv("APCA-API-KEY-ID")  # last-resort; hyphens usually not settable
+    )
+    secret = (
+        os.getenv("APCA_API_SECRET_KEY")
+        or os.getenv("ALPACA_API_SECRET_KEY")
+        or os.getenv("APCA-API-SECRET-KEY")
+    )
+    return key, secret
+
+def _mask(s, keep=4):
+    if not s:
+        return "None"
+    s = str(s)
+    if len(s) <= keep*2:
+        return "*" * len(s)
+    return f"{s[:keep]}…{s[-keep:]}"
+
+def probe_alpaca_auth():
+    """
+    Logs which env vars are detected, base URLs, and does a /v2/account probe.
+    Prevents false 'missing credentials' confusion.
+    """
+    key, secret = _get_alpaca_keys()
+    trade_base = os.getenv("ALPACA_TRADE_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
+    data_base  = os.getenv("ALPACA_DATA_BASE_URL",  "https://data.alpaca.markets").rstrip("/")
+
+    # Clear, masked boot log
+    print(
+        "[PROBE] Alpaca env "
+        f"key={_mask(key)} secret={_mask(secret)} "
+        f"trade_base={trade_base} data_base={data_base} PAPER_MODE={'1' if PAPER_MODE else '0'}",
+        flush=True,
+    )
+
+    if not key or not secret:
+        print("[PROBE] missing Alpaca API credentials (env not found)", flush=True)
+        return
+
+    try:
+        headers = {
+            "APCA-API-KEY-ID": key,
+            "APCA-API-SECRET-KEY": secret,
+        }
+        r = requests.get(f"{trade_base}/v2/account", headers=headers, timeout=15)
+        if r.status_code == 200:
+            acct = r.json()
+            acct_num = acct.get("account_number", "unknown")
+            status   = acct.get("status", "unknown")
+            ccy      = acct.get("currency", "USD")
+            print(f"[PROBE] GET /v2/account -> 200 account={acct_num} status={status} currency={ccy}", flush=True)
+        else:
+            print(f"[PROBE] GET /v2/account -> {r.status_code} body={r.text[:180]}", flush=True)
+    except Exception as e:
+        print(f"[PROBE] exception contacting Alpaca: {e}", flush=True)
 
 # ==============================
 # MAIN LOOP
