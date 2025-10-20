@@ -1720,6 +1720,21 @@ def main():
                     if not sig:
                         continue
 
+                # --- panic logger: show why a symbol/timeframe isn't passing
+                if SCANNER_DEBUG and not sig:
+                    try:
+                        # quick probe of raw probs so we can see what's happening
+                        bars_tf = _resample(df1m, tf)
+                        if bars_tf is not None and not bars_tf.empty and len(bars_tf) > 300:
+                            ts_probe, p_up_probe, _ = _ml_features_and_pred(bars_tf)
+                            if ts_probe is not None and p_up_probe is not None:
+                                thrL = max(CONF_THR_RUNTIME, CONF_THR)
+                                thrS = max(CONF_THR_RUNTIME, float(os.getenv("SHORT_CONF_THR","0.7")))
+                                print(f"[PROBE] {sym} {tf}m p_up={p_up_probe:.3f} "
+                                      f"long_thr={thrL:.3f} short_thr={thrS:.3f}", flush=True)
+                    except Exception:
+                        pass
+
                     if NO_PYRAMIDING and _has_open_position(sym):
                         if SCANNER_DEBUG:
                             print(f"[PYRAMID-BLOCK] {sym} already has open exposure. Skipping.", flush=True)
