@@ -925,7 +925,7 @@ def _ml_features_and_pred(bars: pd.DataFrame):
         return _ml_features_and_pred_core(bars, _H)
 
 # ============================================================
-# SHORT/LONG SIGNAL (dual-side wrapper) — with audit counters
+# SHORT/LONG SIGNAL (dual-side wrapper) — with audit counters + market bias gate
 # ============================================================
 
 def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
@@ -956,6 +956,25 @@ def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
         COUNTS_STAGE["04_off_session"] += 1
         return None
 
+    # === Market bias gate (optional; uses RS_SYMBOL 1m bars in _REF_BARS_1M) ===
+    try:
+        if os.getenv("MARKET_BIAS_ENABLED", "1").lower() in ("1", "true", "yes"):
+            ref = _REF_BARS_1M.get(RS_SYMBOL, pd.DataFrame())
+            look_min = int(os.getenv("MARKET_BIAS_LOOKBACK_MIN", "30"))
+            bias_up  = float(os.getenv("MARKET_BIAS_RET_UP", "0.002"))   # +0.2% over look_min minutes
+            bias_dn  = float(os.getenv("MARKET_BIAS_RET_DN", "-0.002"))  # -0.2% over look_min minutes
+            if ref is not None and not ref.empty:
+                ref_recent = ref.tail(max(look_min, 10))
+                rb = float(ref_recent["close"].iloc[-1]) / float(ref_recent["close"].iloc[0]) - 1.0
+            else:
+                rb = 0.0
+            MARKET_UP   = rb >= bias_up
+            MARKET_DOWN = rb <= bias_dn
+        else:
+            MARKET_UP = MARKET_DOWN = False
+    except Exception:
+        MARKET_UP = MARKET_DOWN = False
+
     # helper smoothing
     def _smooth(store: dict, key, p, alpha: float):
         if alpha <= 0:
@@ -971,8 +990,12 @@ def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
     # ---------- LONG branch ----------
     p_long = _smooth(_PROBA_EMA, key_pt, p_raw, PROBA_EMA_ALPHA)
 
+    # If market is down strongly, suppress longs
+    if MARKET_DOWN:
+        p_long = -1.0
+
     # higher-TF consensus (long)
-    if CONSENSUS_TF and CONSENSUS_TF != tf_min:
+    if p_long >= 0 and CONSENSUS_TF and CONSENSUS_TF != tf_min:
         bars_hi = _resample(df1m, CONSENSUS_TF)
         if bars_hi is None or bars_hi.empty:
             COUNTS_STAGE["09_consensus_resample_empty_L"] += 1
@@ -1043,76 +1066,80 @@ def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
             COUNTS_STAGE["07_below_threshold_L"] += 1
         _PERSIST_OK[("L",)+key_pt] = 0
 
-       # ---------- SHORT branch ----------
+    # ---------- SHORT branch ----------
     short_ok = False
     p_short = -1.0
     if ENABLE_SHORTS:
-        # Gate *only* the short side — do NOT skip the whole symbol
-        if not _is_shortable(symbol):
-            if SCANNER_DEBUG:
-                print(f"[SHORT-SKIP] {symbol} not shortable; long still allowed.", flush=True)
+        # If market is up strongly, suppress shorts
+        if MARKET_UP:
             p_short = -1.0
         else:
-            p_down_raw = 1.0 - p_raw
-            p_short = _smooth(_PROBA_EMA_SHORT, key_pt, p_down_raw, PROBA_EMA_ALPHA)
-
-            # higher-TF consensus (short)
-            if CONSENSUS_TF and CONSENSUS_TF != tf_min:
-                bars_hi = _resample(df1m, CONSENSUS_TF)
-                if bars_hi is None or bars_hi.empty:
-                    p_short = -1
-                else:
-                    last_ts2 = bars_hi.index[-1]
-                    last_ts2_iso = last_ts2.tz_convert("UTC").isoformat() if hasattr(last_ts2, "tzinfo") else str(last_ts2)
-                    cache_key2s = (symbol, int(CONSENSUS_TF), last_ts2_iso, float(bars_hi["close"].iloc[-1]))
-                    cached2s = _ML_CACHE.get(cache_key2s)
-                    if cached2s:
-                        ts2s, p2s, pred2s = cached2s
-                    else:
-                        ts2s, p2s, pred2s = _ml_features_and_pred(bars_hi)
-                        if ts2s is not None:
-                            _ML_CACHE[cache_key2s] = (ts2s, p2s, pred2s)
-                    if (ts2s is None) or (p2s is None) or (pred2s != 0):
-                        p_short = -1
-                    else:
-                        p_short = float((p_short ** (1 - CONSENSUS_WEIGHT)) * ((1.0 - float(p2s)) ** CONSENSUS_WEIGHT))
-
-            # dynamic quantile (short): mirror long space with 1 - dq
-            if p_short >= 0 and CONF_ROLL_N > 0:
-                dq = _CONF_HIST.get(key_pt)
-                if dq is None:
-                    dq = deque(maxlen=CONF_ROLL_N)
-                    _CONF_HIST[key_pt] = dq
-                if len(dq) >= max(10, int(0.5*CONF_ROLL_N)):
-                    qthr = float(np.quantile(1.0 - np.array(dq), CONF_Q))
-                    if p_short < qthr:
-                        p_short = -1
-                if p_short >= 0:
-                    dq.append(1.0 - p_short)
-
-            # regime gate (short when RS_SYMBOL < EMA)
-            if REGIME_ENABLED and p_short >= 0:
-                ref = _REF_BARS_1M.get(RS_SYMBOL, pd.DataFrame())
-                if ref is None or ref.empty or len(ref) < max(REGIME_MA+5, 60):
-                    p_short = -1
-                else:
-                    ema = ref["close"].ewm(span=REGIME_MA, adjust=False).mean().iloc[-1]
-                    below = float(ref["close"].iloc[-1]) < float(ema)
-                    rvol = ref["close"].pct_change().rolling(30).std().iloc[-1]
-                    if not (below and REGIME_MIN_RVOL <= float(rvol) <= REGIME_MAX_RVOL):
-                        p_short = -1
-
-            # persistence (short)
-            thr_short = max(CONF_THR_RUNTIME, SHORT_CONF_THR)
-            if p_short >= 0 and p_short >= thr_short + MIN_PROBA_GAP:
-                if PERSIST_BARS >= 2:
-                    c = _PERSIST_OK_S.get(key_pt, 0) + 1
-                    _PERSIST_OK_S[key_pt] = c
-                    short_ok = (c >= PERSIST_BARS)
-                else:
-                    short_ok = True
+            # Gate *only* the short side — do NOT skip the whole symbol
+            if not _is_shortable(symbol):
+                if SCANNER_DEBUG:
+                    print(f"[SHORT-SKIP] {symbol} not shortable; long still allowed.", flush=True)
+                p_short = -1.0
             else:
-                _PERSIST_OK_S[key_pt] = 0
+                p_down_raw = 1.0 - p_raw
+                p_short = _smooth(_PROBA_EMA_SHORT, key_pt, p_down_raw, PROBA_EMA_ALPHA)
+
+                # higher-TF consensus (short)
+                if CONSENSUS_TF and CONSENSUS_TF != tf_min:
+                    bars_hi = _resample(df1m, CONSENSUS_TF)
+                    if bars_hi is None or bars_hi.empty:
+                        p_short = -1
+                    else:
+                        last_ts2 = bars_hi.index[-1]
+                        last_ts2_iso = last_ts2.tz_convert("UTC").isoformat() if hasattr(last_ts2, "tzinfo") else str(last_ts2)
+                        cache_key2s = (symbol, int(CONSENSUS_TF), last_ts2_iso, float(bars_hi["close"].iloc[-1]))
+                        cached2s = _ML_CACHE.get(cache_key2s)
+                        if cached2s:
+                            ts2s, p2s, pred2s = cached2s
+                        else:
+                            ts2s, p2s, pred2s = _ml_features_and_pred(bars_hi)
+                            if ts2s is not None:
+                                _ML_CACHE[cache_key2s] = (ts2s, p2s, pred2s)
+                        if (ts2s is None) or (p2s is None) or (pred2s != 0):
+                            p_short = -1
+                        else:
+                            p_short = float((p_short ** (1 - CONSENSUS_WEIGHT)) * ((1.0 - float(p2s)) ** CONSENSUS_WEIGHT))
+
+                # dynamic quantile (short): mirror long space with 1 - dq
+                if p_short >= 0 and CONF_ROLL_N > 0:
+                    dq = _CONF_HIST.get(key_pt)
+                    if dq is None:
+                        dq = deque(maxlen=CONF_ROLL_N)
+                        _CONF_HIST[key_pt] = dq
+                    if len(dq) >= max(10, int(0.5*CONF_ROLL_N)):
+                        qthr = float(np.quantile(1.0 - np.array(dq), CONF_Q))
+                        if p_short < qthr:
+                            p_short = -1
+                    if p_short >= 0:
+                        dq.append(1.0 - p_short)
+
+                # regime gate (short when RS_SYMBOL < EMA)
+                if REGIME_ENABLED and p_short >= 0:
+                    ref = _REF_BARS_1M.get(RS_SYMBOL, pd.DataFrame())
+                    if ref is None or ref.empty or len(ref) < max(REGIME_MA+5, 60):
+                        p_short = -1
+                    else:
+                        ema = ref["close"].ewm(span=REGIME_MA, adjust=False).mean().iloc[-1]
+                        below = float(ref["close"].iloc[-1]) < float(ema)
+                        rvol = ref["close"].pct_change().rolling(30).std().iloc[-1]
+                        if not (below and REGIME_MIN_RVOL <= float(rvol) <= REGIME_MAX_RVOL):
+                            p_short = -1
+
+                # persistence (short)
+                thr_short = max(CONF_THR_RUNTIME, SHORT_CONF_THR)
+                if p_short >= 0 and p_short >= thr_short + MIN_PROBA_GAP:
+                    if PERSIST_BARS >= 2:
+                        c = _PERSIST_OK_S.get(key_pt, 0) + 1
+                        _PERSIST_OK_S[key_pt] = c
+                        short_ok = (c >= PERSIST_BARS)
+                    else:
+                        short_ok = True
+                else:
+                    _PERSIST_OK_S[key_pt] = 0
 
     # choose side
     side = None
