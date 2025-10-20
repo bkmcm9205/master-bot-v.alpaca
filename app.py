@@ -1714,33 +1714,46 @@ def main():
                 except Exception:
                     pass
 
-                # ---- per-timeframe signals (with shortable scan gate) ----
+                                # ---- per-timeframe signals (with shortable scan gate) ----
                 for tf in TF_MIN_LIST:
                     sig = signal_ml_pattern_dual(sym, df1m, tf)
+
+                    # --- safety guard: skip if no signal or malformed ---
                     if not sig:
                         continue
+                    if ("action" not in sig) or ("barTime" not in sig):
+                        if SCANNER_DEBUG:
+                            print(f"[WARN] malformed signal for {sym} {tf}m -> {sig}", flush=True)
+                        continue
 
-                # --- panic logger: show why a symbol/timeframe isn't passing
-                if SCANNER_DEBUG and not sig:
-                    try:
-                        # quick probe of raw probs so we can see what's happening
-                        bars_tf = _resample(df1m, tf)
-                        if bars_tf is not None and not bars_tf.empty and len(bars_tf) > 300:
-                            ts_probe, p_up_probe, _ = _ml_features_and_pred(bars_tf)
-                            if ts_probe is not None and p_up_probe is not None:
-                                thrL = max(CONF_THR_RUNTIME, CONF_THR)
-                                thrS = max(CONF_THR_RUNTIME, float(os.getenv("SHORT_CONF_THR","0.7")))
-                                print(f"[PROBE] {sym} {tf}m p_up={p_up_probe:.3f} "
-                                      f"long_thr={thrL:.3f} short_thr={thrS:.3f}", flush=True)
-                    except Exception:
-                        pass
+                    # --- panic logger: show why a symbol/timeframe isn't passing ---
+                    if SCANNER_DEBUG and not sig:
+                        try:
+                            bars_tf = _resample(df1m, tf)
+                            if bars_tf is not None and not bars_tf.empty and len(bars_tf) > 300:
+                                ts_probe, p_up_probe, _ = _ml_features_and_pred(bars_tf)
+                                if ts_probe is not None and p_up_probe is not None:
+                                    thrL = max(CONF_THR_RUNTIME, CONF_THR)
+                                    thrS = max(CONF_THR_RUNTIME, float(os.getenv("SHORT_CONF_THR", "0.7")))
+                                    print(f"[PROBE] {sym} {tf}m p_up={p_up_probe:.3f} "
+                                          f"long_thr={thrL:.3f} short_thr={thrS:.3f}", flush=True)
+                        except Exception:
+                            pass
 
+                    # --- prevent pyramiding (duplicate positions) ---
                     if NO_PYRAMIDING and _has_open_position(sym):
                         if SCANNER_DEBUG:
                             print(f"[PYRAMID-BLOCK] {sym} already has open exposure. Skipping.", flush=True)
                         continue
 
-                    k = _dedupe_key(sym, tf, sig["action"], sig.get("barTime", ""))
+                    # --- dedupe key guard (was causing the crash) ---
+                    try:
+                        k = _dedupe_key(sym, tf, sig["action"], sig.get("barTime", ""))
+                    except Exception as e:
+                        if SCANNER_DEBUG:
+                            print(f"[DEDUPE-ERROR] {sym} {tf}m -> {e}", flush=True)
+                        continue
+
                     if k in _sent_keys:
                         continue
 
