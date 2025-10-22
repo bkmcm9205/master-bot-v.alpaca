@@ -1,89 +1,15 @@
 # ====================================================================================
-# app.py — Upgrade Summary (v2025-10-15)
+# app.py — ML v3 Dual-Side with Long Failsafe, Market Bias, and Audit (2025-10-22)
 # ====================================================================================
-# This version includes ALL changes discussed tonight, ready for long/short live use.
+# Key additions vs your last post:
+# - AUDIT: live counters showing whether longs are dying at model vs gates.
+# - FAILSAFE: automatic intraday relaxation of long threshold if zero are passing.
+# - MARKET BIAS: on green RS_SYMBOL tape, prefer longs unless shorts beat by margin.
+# - DEBUG: per-symbol/TF signal line via DEBUG_DUMP_SIG=1.
+# - GC: light cache clear after-hours to avoid memory creep on Render.
 #
-# CORE MODELING (ML v3)
-# - Rich feature set: ret1, ret3, ret5, ret10, vol10, vol20, rsi14, stoch_k,
-#   ema10_slope, ema20_slope, atrp, body_tr, dvolz, vwap_dist, gap_pct, rs.
-# - Recency-weighted RandomForest fit (exponential time weights).
-# - Probability calibration via isotonic with time-aware CV (or purged CV when enabled).
-# - Optional triple-barrier labeling (TB_* vars) and meta-labeling (META_ENABLED).
-# - Optional multi-horizon ensemble (MULTI_H_*), geometric-mean probability blend.
-#
-# LONG + SHORT SIGNAL ENGINE
-# - Unified dual-side function: signal_ml_pattern_dual(...) (long and short).
-# - Scan loop calls signal_ml_pattern_dual (replaces prior long-only call).
-# - Both sides use ATR-based TP/SL; shorts are placed with action="sell_short".
-# - Separate short controls: ENABLE_SHORTS, SHORT_CONF_THR.
-# - Confidence smoothing & persistence tracked independently per side
-#   (_PROBA_EMA / _PROBA_EMA_SHORT, _PERSIST_OK / _PERSIST_OK_S).
-#
-# CONFIDENCE GATES & SELECTION
-# - Runtime threshold CONF_THR_RUNTIME (auto-raised by drift monitor when enabled).
-# - MIN_PROBA_GAP enforces margin above threshold.
-# - PERSIST_BARS requires N consecutive over-threshold bars before entry.
-# - Higher-TF consensus (CONSENSUS_TF, CONSENSUS_WEIGHT) for both long & short.
-# - Rolling quantile gate (CONF_ROLL_N, CONF_Q) using _CONF_HIST per (symbol, tf).
-# - Cost-aware ranking (COST_BPS, COST_WEIGHTING).
-# - Regime gate (REGIME_ENABLED): longs only when RS_SYMBOL > EMA(REGIME_MA) and
-#   realized vol between REGIME_MIN_RVOL and REGIME_MAX_RVOL; shorts require below EMA.
-#
-# CANDIDATE PRUNING & PORTFOLIO CONSTRAINTS
-# - Candidates sorted by adjusted confidence; optional BATCH_TOP_K cap.
-# - Sector cap (MAX_PER_SECTOR) via _get_sector (stub returns "UNKNOWN" by default).
-# - Correlation pruning (MAX_CAND_CORR, CORR_LOOKBACK) using recent returns.
-#
-# DRIFT MONITORING & AUTO-RESPONSE
-# - Reliability buckets (_RELIABILITY) track win rate by confidence bucket.
-# - If DRIFT_MONITOR=1 and high-confidence buckets underperform (< MIN_BUCKET_WIN),
-#   CONF_THR_RUNTIME nudges up by AUTO_THR_STEP, capped at AUTO_THR_MAX.
-#
-# DATA PLUMBING & CACHING
-# - Per-bar ML cache _ML_CACHE keyed by (symbol, tf, bar_end_iso, last_close).
-# - Maintains _REF_BARS_1M[RS_SYMBOL] for RS/regime features each loop.
-#
-# DEDUPE & SAFETY
-# - Dedupe key includes RUN_ID to avoid cross-run collisions.
-# - KILL_SWITCH halts entries immediately without redeploy.
-# - EOD manager: 3:45 halt new entries; 3:50 cancel+flatten; 4:00 safety net.
-#
-# ORDER ROUTING & BOOKKEEPING
-# - handle_signal(...) unchanged in shape; receives long/short orders.
-# - LiveTrade stores proba for drift stats; close logic updates reliability buckets.
-#
-# NEW/CHANGED ENV VARS (set in Render as needed)
-# - Shorting:          ENABLE_SHORTS, SHORT_CONF_THR
-# - Confidence:        PROBA_EMA_ALPHA, MIN_PROBA_GAP, CONSENSUS_TF, CONSENSUS_WEIGHT, BATCH_TOP_K
-# - RS/benchmark:      RS_SYMBOL
-# - Rolling quantile:  CONF_ROLL_N, CONF_Q
-# - Triple-barrier:    TB_ENABLED, TB_ATR_K, TB_TIMEOUT_H
-# - Meta-labeling:     META_ENABLED
-# - Purged CV:         PURGED_CV_FOLDS, PURGED_EMBARGO_FRAC
-# - Multi-horizon:     MULTI_H_ENABLED, MULTI_H_LIST
-# - Cost-aware:        COST_BPS, COST_WEIGHTING
-# - Portfolio:         MAX_PER_SECTOR, MAX_CAND_CORR, CORR_LOOKBACK
-# - Drift auto:        DRIFT_MONITOR, AUTO_THR_STEP, AUTO_THR_MAX, MIN_BUCKET_WIN
-# - Regime gate:       REGIME_ENABLED, REGIME_MA, REGIME_MIN_RVOL, REGIME_MAX_RVOL
-# - Kill switch:       KILL_SWITCH
-#
-# QUICK TOGGLES (typical starting defaults)
-# - ENABLE_SHORTS=1
-# - SHORT_CONF_THR≈CONF_THR (e.g., 0.80 if you want shorts stricter)
-# - PROBA_EMA_ALPHA=0.0 (set 0.3–0.5 if you want smoothing)
-# - PERSIST_BARS=0 (set 2 for two-bar confirmation)
-# - CONSENSUS_TF=0 (set 5 to require 5m confirmation of 1m)
-# - CONF_ROLL_N=0 (set 100–300 to activate rolling-quantile gate)
-# - DRIFT_MONITOR=0 (set 1 to auto-raise threshold if high-p buckets underperform)
-# - MULTI_H_ENABLED=0 (set 1 with MULTI_H_LIST=3,5,10 for ensemble)
-# - REGIME_ENABLED=0 (set 1 to restrict longs/shorts by market regime)
-#
-# NOTES
-# - NO_PYRAMIDING prevents accumulating into a symbol across TFs.
-# - FIXED_NOTIONAL sizing is the default (USE_FIXED_NOTIONAL=1). Set to 0 to use
-#   risk-based sizing (EQUITY_USD, RISK_PCT, MAX_POS_PCT, ROUND_LOT).
-# - Dedupe includes RUN_ID so each deployment has fresh signal keys.
-# =============================================================================
+# Drop-in file. No other files changed.
+# ====================================================================================
 
 import os, time, json, math, requests
 import pandas as pd, numpy as np
@@ -112,6 +38,7 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "10"))
 DRY_RUN      = os.getenv("DRY_RUN", "0").lower() in ("1","true","yes")
 PAPER_MODE   = os.getenv("PAPER_MODE", "true").lower() != "false"
 SCANNER_DEBUG= os.getenv("SCANNER_DEBUG", "0").lower() in ("1","true","yes")
+DEBUG_DUMP_SIG = os.getenv("DEBUG_DUMP_SIG", "0").lower() in ("1","true","yes")
 
 EXTRA_TICKS = int(os.getenv("EXTRA_TICKS", "2"))  # extra pennies to clear Alpaca base_price drift
 
@@ -164,7 +91,7 @@ CONSENSUS_TF             = int(os.getenv("CONSENSUS_TF","0"))         # 0 = off
 CONSENSUS_WEIGHT         = float(os.getenv("CONSENSUS_WEIGHT","0.5"))
 BATCH_TOP_K              = int(os.getenv("BATCH_TOP_K","0"))          # 0 = take all
 
-# --- Relative strength benchmark (for features)
+# --- Relative strength benchmark (for features & tilt)
 RS_SYMBOL                = os.getenv("RS_SYMBOL","SPY").upper()
 
 # --- Rolling confidence quantile gate (dynamic threshold)
@@ -222,12 +149,12 @@ RUN_ID            = datetime.now().astimezone().strftime("%Y-%m-%d_%H-%M-%S")
 # Runtime-adjustable threshold (for drift auto)
 CONF_THR_RUNTIME = CONF_THR
 
-COUNTS_STAGE = defaultdict(int)  
+COUNTS_STAGE = defaultdict(int)
 
 # --- Shortable cache (for proactive short filtering) ---
 SHORTABLE_SET = set()
 SHORTABLE_LAST = None
-_SHORTABLE_ONEOFF = {}        
+_SHORTABLE_ONEOFF = {}
 
 # ==============================
 # STATE / LEDGERS
@@ -276,11 +203,8 @@ MIN_TICK = float(os.getenv("MIN_TICK", "0.01"))  # stock tick size
 SHORT_DENY = set()  # symbols we learned are not shortable (lifetime: this process)
 
 def _tick_round(px: float, tick: float = MIN_TICK) -> float:
-    # round to nearest tick; for stocks MIN_TICK=0.01
-    if not np.isfinite(px):
-        return px
+    if not np.isfinite(px): return px
     q = round(px / tick) * tick
-    # Avoid float display errors like 9.029999...
     return float(f"{q:.4f}")
 
 def _apply_tick_rules(side: str, base: float, tp: float, sl: float,
@@ -300,39 +224,23 @@ def _apply_tick_rules(side: str, base: float, tp: float, sl: float,
         return math.floor(x / t) * t
 
     if side == "long":
-        # make sure we’re outside broker ranges *and* round in safe directions
-        tp = max(tp, base + buf)
-        sl = min(sl, base - buf)
-        tp = _ceil_to_tick(tp, tick)
-        sl = _floor_to_tick(sl, tick)
+        tp = max(tp, base + buf); sl = min(sl, base - buf)
+        tp = _ceil_to_tick(tp, tick); sl = _floor_to_tick(sl, tick)
     else:  # short
-        tp = min(tp, base - buf)
-        sl = max(sl, base + buf)
-        tp = _floor_to_tick(tp, tick)
-        sl = _ceil_to_tick(sl, tick)
+        tp = min(tp, base - buf); sl = max(sl, base + buf)
+        tp = _floor_to_tick(tp, tick); sl = _ceil_to_tick(sl, tick)
 
     return float(tp), float(sl)
 
 def _is_shortable(symbol: str) -> bool:
     """
     Hard override if FORCE_ALLOW_SHORTS=1. Otherwise, use cached/broker check.
-    This silences any 'not shortable (scan gate)' skips regardless of where
-    the check is called from.
     """
     if os.getenv("FORCE_ALLOW_SHORTS", "0").lower() in ("1", "true", "yes"):
         return True
-
     s = symbol.upper()
-
-    # trust a positive decision from bulk cache if present
-    if SHORTABLE_SET:
-        if s in SHORTABLE_SET:
-            return True
-        # fall through; absence doesn't prove not-shortable
-
-    if s in _SHORTABLE_ONEOFF:
-        return _SHORTABLE_ONEOFF[s]
-
+    if SHORTABLE_SET and s in SHORTABLE_SET: return True
+    if s in _SHORTABLE_ONEOFF: return _SHORTABLE_ONEOFF[s]
     try:
         base = os.getenv("ALPACA_TRADE_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
         url = f"{base}/v2/assets/{s}"
@@ -348,7 +256,6 @@ def _is_shortable(symbol: str) -> bool:
             return flag
     except Exception:
         pass
-
     _SHORTABLE_ONEOFF[s] = False
     return False
 
@@ -383,12 +290,9 @@ def _is_rth(ts):
     return ((h > 9) or (h == 9 and m >= 30)) and (h < 16)
 
 def _in_session(ts):
-    if _is_rth(ts):
-        return True
-    if ALLOW_PREMARKET and (4 <= ts.hour < 9 or (ts.hour == 9 and ts.minute < 30)):
-        return True
-    if ALLOW_AFTERHOURS and (16 <= ts.hour < 20):
-        return True
+    if _is_rth(ts): return True
+    if ALLOW_PREMARKET and (4 <= ts.hour < 9 or (ts.hour == 9 and ts.minute < 30)): return True
+    if ALLOW_AFTERHOURS and (16 <= ts.hour < 20): return True
     return False
 
 def _market_session_now():
@@ -401,19 +305,15 @@ def _market_session_now():
 def _position_qty(entry_price: float, stop_price: float,
                   equity=EQUITY_USD, risk_pct=RISK_PCT, max_pos_pct=MAX_POS_PCT,
                   min_qty=MIN_QTY, round_lot=ROUND_LOT) -> int:
-    if entry_price is None:
-        return 0
+    if entry_price is None: return 0
     if USE_FIXED_NOTIONAL:
-        if entry_price <= 0:
-            return 0
+        if entry_price <= 0: return 0
         raw = FIXED_NOTIONAL / max(1e-9, float(entry_price))
         qty = math.floor(raw / max(1, round_lot)) * max(1, round_lot)
         return int(max(qty, min_qty if qty > 0 else 0))
-    if stop_price is None:
-        return 0
+    if stop_price is None: return 0
     risk_per_share = abs(float(entry_price) - float(stop_price))
-    if risk_per_share <= 0:
-        return 0
+    if risk_per_share <= 0: return 0
     qty_risk     = (equity * risk_pct) / risk_per_share
     qty_notional = (equity * max_pos_pct) / max(1e-9, float(entry_price))
     qty = math.floor(max(min(qty_risk, qty_notional), 0) / max(1, round_lot)) * max(1, round_lot)
@@ -441,66 +341,52 @@ def fetch_bars_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
     - When off: direct API call (original behavior).
     Returns tz-aware ET ohlcv DataFrame (open/high/low/close/volume).
     """
-    # Fallback to non-cached path
     if not CACHE_ENABLED:
         end = datetime.now(timezone.utc)
         start = end - timedelta(minutes=lookback_minutes)
         start_iso = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         end_iso   = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         df = _alpaca_fetch_1m(symbol, start_iso=start_iso, end_iso=end_iso, limit=10000)
-        if df is None or df.empty:
-            return pd.DataFrame()
+        if df is None or df.empty: return pd.DataFrame()
         try:
             df.index = df.index.tz_convert(MARKET_TZ)
         except Exception:
             df.index = df.index.tz_localize("UTC").tz_convert(MARKET_TZ)
-        # price gate
         try:
             last_px = float(df["close"].iloc[-1])
-            if last_px < MIN_PRICE:
-                return pd.DataFrame()
+            if last_px < MIN_PRICE: return pd.DataFrame()
         except Exception:
             return pd.DataFrame()
         return df[["open","high","low","close","volume"]].copy()
 
     # ----- Cached path -----
-    # Helper: LRU admit/evict
     def _touch(sym: str):
         _BARCACHE.setdefault(sym, pd.DataFrame())
         _BARCACHE.move_to_end(sym, last=True)
-        # LRU evict if needed
         while len(_BARCACHE) > max(1, CACHE_MAX_SYMBOLS):
             _BARCACHE.popitem(last=False)
 
-    # Ensure cache entry exists
     cached = _BARCACHE.get(symbol)
     if cached is None or cached.empty:
-        # First fill: backfill full requested window (capped by CACHE_MAX_MINUTES)
         end = datetime.now(timezone.utc)
         need_minutes = min(max(1, lookback_minutes), CACHE_MAX_MINUTES)
         start = end - timedelta(minutes=need_minutes)
         start_iso = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         end_iso   = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
         df_new = _alpaca_fetch_1m(symbol, start_iso=start_iso, end_iso=end_iso, limit=10000)
-        if df_new is None or df_new.empty:
-            return pd.DataFrame()
+        if df_new is None or df_new.empty: return pd.DataFrame()
         try:
             df_new.index = df_new.index.tz_convert(MARKET_TZ)
         except Exception:
             df_new.index = df_new.index.tz_localize("UTC").tz_convert(MARKET_TZ)
         cached = df_new
     else:
-        # Incremental update: fetch bars strictly after last cached index
         try:
             last_ts = cached.index[-1].tz_convert("UTC") if hasattr(cached.index[-1], "tzinfo") else cached.index[-1]
         except Exception:
             last_ts = None
         end = datetime.now(timezone.utc)
-        # Only fetch if we’re beyond the last cached minute
-        if last_ts is not None:
-            start = (last_ts + timedelta(minutes=1)).replace(tzinfo=timezone.utc)
-        else:
-            start = end - timedelta(minutes=min(lookback_minutes, CACHE_MAX_MINUTES))
+        start = (last_ts + timedelta(minutes=1)).replace(tzinfo=timezone.utc) if last_ts is not None else end - timedelta(minutes=min(lookback_minutes, CACHE_MAX_MINUTES))
         if start < end:
             start_iso = start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
             end_iso   = end.replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -510,28 +396,22 @@ def fetch_bars_1m(symbol: str, lookback_minutes: int = 2400) -> pd.DataFrame:
                     df_inc.index = df_inc.index.tz_convert(MARKET_TZ)
                 except Exception:
                     df_inc.index = df_inc.index.tz_localize("UTC").tz_convert(MARKET_TZ)
-                # Merge, sort, dedupe
                 cached = pd.concat([cached, df_inc], axis=0)
                 cached = cached[~cached.index.duplicated(keep="last")].sort_index()
 
-    # Trim cache to CACHE_MAX_MINUTES (LRU keeps symbol count in check)
     if len(cached) > 0 and CACHE_MAX_MINUTES > 0:
         cutoff = cached.index[-1] - timedelta(minutes=CACHE_MAX_MINUTES)
         cached = cached[cached.index >= cutoff]
 
-    # Store back & LRU-touch
     _BARCACHE[symbol] = cached
     _touch(symbol)
 
-    # price gate on latest
     try:
         last_px = float(cached["close"].iloc[-1])
-        if last_px < MIN_PRICE:
-            return pd.DataFrame()
+        if last_px < MIN_PRICE: return pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
-    # Return only requested window (but served from cache)
     if lookback_minutes > 0 and len(cached) > 0:
         cutoff2 = cached.index[-1] - timedelta(minutes=lookback_minutes)
         out = cached[cached.index >= cutoff2]
@@ -544,24 +424,14 @@ def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
     """
     Cache-aware resample:
     - If we’ve already resampled this (symbol, tf) source slice and no new 1m rows are added, return cached.
-    - If new rows exist, recompute resample (simple, robust).
-    Note: We keep it simple (full recompute on new data) — big win still comes from 1m caching.
     """
     if df1m is None or df1m.empty:
         return pd.DataFrame()
-
-    # Identify this source by its last timestamp (cheap & robust)
     src_last = df1m.index[-1]
-
-    # Try cache hit if caller provided a symbol hint via index name
-    # (Many pandas readers leave index.name None; so we don’t rely on the symbol key here.)
-    cache_key = (id(df1m), int(tf_min))  # buffer-identity-based; safe per-call
-
+    cache_key = (id(df1m), int(tf_min))
     cached = _RESAMPLE_CACHE.get(cache_key)
     if cached and cached[0] is not None and cached[0] == src_last:
         return cached[1]
-
-    # Otherwise (new data), perform resample
     rule = f"{int(tf_min)}min"
     agg = {"open":"first","high":"max","low":"min","close":"last","volume":"sum"}
     bars = df1m.resample(rule, origin="start_day", label="right").agg(agg).dropna()
@@ -569,7 +439,6 @@ def _resample(df1m: pd.DataFrame, tf_min: int) -> pd.DataFrame:
         bars.index = bars.index.tz_convert(MARKET_TZ)
     except Exception:
         bars.index = bars.index.tz_localize("UTC").tz_convert(MARKET_TZ)
-
     _RESAMPLE_CACHE[cache_key] = (src_last, bars)
     return bars
 
@@ -624,7 +493,6 @@ def _maybe_close_on_bar(symbol: str, tf_min: int, ts, high: float, low: float, c
             t.reason= "tp" if hit_tp else "sl"
             pnl = (t.exit - t.entry) * t.qty if t.side == "buy" else (t.entry - t.exit) * t.qty
             _perf_update(t.combo, pnl)
-            # Drift monitor bucket update
             try:
                 if DRIFT_MONITOR and t.proba is not None and np.isfinite(t.proba):
                     p = float(t.proba)
@@ -648,7 +516,6 @@ def _dedupe_key(symbol: str, tf: int, action: str, bar_time: str) -> str:
 # ==============================
 # ML STRATEGY (Upgraded v3)
 # ==============================
-# Tunables for ML/labels (base)
 _H = 5
 _RET_THR = 0.0025
 _MIN_SAMPLES = int(os.getenv("ML_MIN_SAMPLES", "240"))
@@ -664,31 +531,25 @@ _FEATURES = [
 
 def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    # Basic returns
     out["ret1"]  = out["close"].pct_change(1)
     out["ret3"]  = out["close"].pct_change(3)
     out["ret5"]  = out["close"].pct_change(5)
     out["ret10"] = out["close"].pct_change(10)
-    # Rolling vol
     out["vol10"] = out["close"].pct_change().rolling(10).std()
     out["vol20"] = out["close"].pct_change().rolling(20).std()
-    # RSI(14)
     delta = out["close"].diff()
     up = delta.clip(lower=0).rolling(14).mean()
     down = -delta.clip(upper=0).rolling(14).mean()
     rs = up / (down.replace(0, np.nan))
     out["rsi14"] = 100 - (100 / (1 + rs))
-    # Stoch %K(14,3)
     hh = out["high"].rolling(14).max()
     ll = out["low"].rolling(14).min()
     out["stoch_k"] = 100 * (out["close"] - ll) / (hh - ll).replace(0, np.nan)
     out["stoch_k"] = out["stoch_k"].rolling(3).mean()
-    # EMAs + slopes
     ema10 = out["close"].ewm(span=10, adjust=False).mean()
     ema20 = out["close"].ewm(span=20, adjust=False).mean()
     out["ema10_slope"] = ema10.pct_change()
     out["ema20_slope"] = ema20.pct_change()
-    # ATR(14) & ATR%
     tr = pd.concat([
         (out["high"] - out["low"]),
         (out["high"] - out["close"].shift()).abs(),
@@ -696,25 +557,20 @@ def _build_features(df: pd.DataFrame) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     out["atr14"] = tr.rolling(14).mean()
     out["atrp"]  = out["atr14"] / out["close"]
-    # Candle structure
     body = (out["close"] - out["open"]).abs()
     rng  = (out["high"] - out["low"]).replace(0, np.nan)
     out["body_tr"] = (body / rng).clip(0, 5)
-    # Liquidity proxy
     if "volume" in out.columns:
         out["dvol20"] = (out["close"] * out["volume"]).rolling(20).mean()
         out["dvolz"]  = (out["dvol20"] / out["dvol20"].rolling(60).mean()) - 1.0
     else:
         out["dvolz"] = 0.0
-    # VWAP distance
     try:
         vwap = (out["close"] * out.get("volume", pd.Series(index=out.index))).cumsum() / out.get("volume", pd.Series(index=out.index)).replace(0,np.nan).cumsum()
         out["vwap_dist"] = (out["close"] / vwap) - 1.0
     except Exception:
         out["vwap_dist"] = 0.0
-    # Gap %
     out["gap_pct"] = out["open"] / out["close"].shift(1) - 1.0
-    # Relative strength vs RS_SYMBOL (10-bar)
     try:
         ref = _REF_BARS_1M.get(RS_SYMBOL)
         if ref is not None and not ref.empty:
@@ -733,7 +589,6 @@ def _make_labels_basic(out: pd.DataFrame, h=_H, thr=_RET_THR):
     return y
 
 def _make_labels_tb(out: pd.DataFrame, h=_H, atr_k=1.0):
-    # Triple-barrier: TP/SL via ATR*k within h bars ahead
     price = out["close"]
     tr = pd.concat([
         (out["high"] - out["low"]),
@@ -755,7 +610,6 @@ class PurgedKFold:
     def __init__(self, n_splits=3, embargo_frac=0.01):
         self.n_splits = max(2, int(n_splits))
         self.embargo_frac = float(embargo_frac)
-
     def split(self, X):
         n = len(X)
         fold_sizes = np.full(self.n_splits, n // self.n_splits, dtype=int)
@@ -785,7 +639,6 @@ def _fit_base_model(X_trn, y_trn):
         class_weight="balanced",
     )
     n = len(X_trn)
-    # Recency weights
     hl = max(8, int(n * 0.25))
     lam = np.log(2) / hl
     w = np.exp(lam * (np.arange(n) - n))
@@ -797,24 +650,14 @@ def _calibrate(clf, X_trn, y_trn):
     from sklearn.calibration import CalibratedClassifierCV
     from sklearn.model_selection import TimeSeriesSplit
     import numpy as np
-
-    # If there aren't at least two classes in the training set,
-    # return the base model (no calibration possible).
     try:
-        if getattr(y_trn, "nunique", None):
-            nuniq = int(y_trn.nunique())
-        else:
-            nuniq = len(np.unique(y_trn))
+        nuniq = int(y_trn.nunique()) if getattr(y_trn, "nunique", None) else len(np.unique(y_trn))
         if nuniq < 2:
             return clf
-
-        # Choose CV
         if PURGED_CV_FOLDS and PURGED_CV_FOLDS >= 2:
             cv_splits = list(PurgedKFold(PURGED_CV_FOLDS, PURGED_EMBARGO_FRAC).split(X_trn))
         else:
             cv_splits = list(TimeSeriesSplit(n_splits=3).split(X_trn))
-
-        # Keep only folds where BOTH train and test contain two classes
         valid = []
         for tr, te in cv_splits:
             y_tr, y_te = y_trn.iloc[tr], y_trn.iloc[te]
@@ -822,7 +665,6 @@ def _calibrate(clf, X_trn, y_trn):
                 valid.append((tr, te))
         if not valid:
             return clf
-
         cal = CalibratedClassifierCV(clf, method="isotonic", cv=valid)
         cal.fit(X_trn, y_trn)
         return cal
@@ -842,18 +684,14 @@ def _ml_features_and_pred_core(bars: pd.DataFrame, h: int):
     X, y = X[valid], y[valid]
     if len(X) < _MIN_SAMPLES:
         return None, None, None
-
     x_live = X.iloc[[-1]]
     X_trn, y_trn = X.iloc[:-1], y.iloc[:-1]
     if len(X_trn) < _MIN_SAMPLES:
         return None, None, None
-
     base = _fit_base_model(X_trn, y_trn)
-    # If the base model only saw one class, skip calibration and set proba logic accordingly.
     try:
         classes_ = getattr(base, "classes_", None)
         if classes_ is not None and len(classes_) < 2:
-            # Predict_proba will be shape (n,1). If the single class is 1, prob_up=1, else 0.
             p_live = base.predict_proba(x_live)
             if p_live.shape[1] == 1:
                 only_cls = int(classes_[0])
@@ -863,83 +701,99 @@ def _ml_features_and_pred_core(bars: pd.DataFrame, h: int):
                 return ts, float(proba_up), int(pred_up)
     except Exception:
         pass
-
-    # Otherwise proceed with calibration (now robust)
     clf = _calibrate(base, X_trn, y_trn)
-
     proba_mat = clf.predict_proba(x_live)
     if proba_mat.shape[1] == 1:
-        # Calibrator/base returned single class unexpectedly; map it safely.
         classes_ = getattr(clf, "classes_", [1])
         only_cls = int(classes_[0]) if len(classes_) else 1
         proba_up = 1.0 if only_cls == 1 else 0.0
     else:
         proba_up = float(proba_mat[0, 1])
-
-    pred_up  = int(proba_up >= 0.5)
-    ts = df.index[-1]
-    return ts, proba_up, pred_up
-
-    # Meta-labeling (optional): stack base proba + a few features
-    if TB_ENABLED and META_ENABLED:
-        from sklearn.linear_model import LogisticRegression
-        p_trn = clf.predict_proba(X_trn)[:,1]
-        meta_X = np.column_stack([
-            p_trn,
-            X_trn["rsi14"].to_numpy(),
-            X_trn["atrp"].to_numpy(),
-            X_trn["vwap_dist"].to_numpy(),
-        ])
-        meta_y = y_trn.to_numpy().astype(int)
-        meta = LogisticRegression(max_iter=1000, class_weight="balanced", n_jobs=None)
-        meta.fit(meta_X, meta_y)
-        p_live_base = float(clf.predict_proba(x_live)[0,1])
-        x_meta_live = np.array([[p_live_base,
-                                 float(x_live["rsi14"].iloc[0]),
-                                 float(x_live["atrp"].iloc[0]),
-                                 float(x_live["vwap_dist"].iloc[0])]])
-        proba_up = float(meta.predict_proba(x_meta_live)[0,1])
-    else:
-        proba_up = float(clf.predict_proba(x_live)[0,1])
-
     pred_up  = int(proba_up >= 0.5)
     ts = df.index[-1]
     return ts, proba_up, pred_up
 
 def _ml_features_and_pred(bars: pd.DataFrame):
     if MULTI_H_ENABLED:
-        ps = []
-        last_r = None
+        ps = []; last_r = None
         for h in MULTI_H_LIST:
             r = _ml_features_and_pred_core(bars, h)
-            if r[0] is None:
-                continue
+            if r[0] is None: continue
             ps.append(r[1]); last_r = r
-        if not ps:
-            return None, None, None
-        # geometric mean across horizons
+        if not ps: return None, None, None
         p = float(np.exp(np.mean(np.log(np.clip(ps, 1e-6, 1-1e-6)))))
         ts, _, _ = last_r
         return ts, p, int(p >= 0.5)
     else:
         return _ml_features_and_pred_core(bars, _H)
 
-# ============================================================
-# SHORT/LONG SIGNAL (dual-side wrapper) — with audit + market tilt
-# ============================================================
+# ==============================
+# AUDIT & FAILSAFE FOR LONGS
+# ==============================
+_AUDIT = {
+    "scanned": 0,        # symbols * TFs examined
+    "model_ok": 0,       # got p_up
+    "p_up_ge_050": 0,    # p_up >= 0.50
+    "p_up_ge_thr": 0,    # p_up >= current long threshold
+    "long_ok": 0,        # passed all long gates (pre-selection)
+    "last_print": 0.0,
+}
 
+def _audit_reset():
+    for k in list(_AUDIT.keys()):
+        if k != "last_print": _AUDIT[k] = 0
+
+def _audit_note(p_up, long_ok, thr_long):
+    _AUDIT["scanned"] += 1
+    if p_up is not None:
+        _AUDIT["model_ok"] += 1
+        if p_up >= 0.50:
+            _AUDIT["p_up_ge_050"] += 1
+        if p_up >= thr_long:
+            _AUDIT["p_up_ge_thr"] += 1
+    if long_ok:
+        _AUDIT["long_ok"] += 1
+
+def _audit_maybe_print(thr_long):
+    import time as _t
+    now = _t.time()
+    if now - _AUDIT["last_print"] < 15:    # print at most every 15s
+        return
+    _AUDIT["last_print"] = now
+    S  = max(1, _AUDIT["scanned"])
+    mo = _AUDIT["model_ok"]
+    ge50 = _AUDIT["p_up_ge_050"]
+    gethr= _AUDIT["p_up_ge_thr"]
+    lok  = _AUDIT["long_ok"]
+    print(f"[AUDIT] scanned={S} model_ok={mo} p>=.50={ge50} p>=thr={gethr} long_ok={lok} thr_long={thr_long:.3f}", flush=True)
+
+def _failsafe_adjust_long_threshold(curr_thr, session_minutes):
+    """
+    If we’ve scanned a lot and long_ok is zero, temporarily relax the long threshold.
+    Only activates if p_up >= .50 exists for >=1% of scans (i.e., model is alive).
+    """
+    S = _AUDIT["scanned"]; lok = _AUDIT["long_ok"]; ge50 = _AUDIT["p_up_ge_050"]
+    if S < 200:  # wait for some mass
+        return curr_thr
+    if lok > 0:
+        return curr_thr
+    if ge50 < 0.01 * S:
+        return curr_thr
+
+    if session_minutes <= 30:
+        return min(curr_thr, 0.58)
+    elif session_minutes <= 90:
+        return min(curr_thr, 0.62)
+    else:
+        return min(curr_thr, 0.66)
+
+# ============================================================
+# SHORT/LONG SIGNAL (dual-side wrapper) — with audit + market bias
+# ============================================================
 def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
                            conf_threshold=CONF_THR, r_multiple=R_MULT, atr_k=1.0):
-    """
-    Dual-side ML signal generator with:
-      - probability-based higher-TF consensus
-      - independent short quantile history
-      - sign-based market tilt
-      - **market-bias selection** (prefer longs on green tape; prefer shorts on red)
-      - optional debug line per symbol/TF via DEBUG_DUMP_SIG=1
-    """
-    dbg = os.getenv("DEBUG_DUMP_SIG", "0").lower() in ("1","true","yes")
-    gates = []  # collect reasons to help debugging (only appended when dbg)
+    dbg = DEBUG_DUMP_SIG
+    gates = []  # reasons for skips (debug only)
 
     if df1m is None or df1m.empty or not isinstance(df1m.index, pd.DatetimeIndex):
         COUNTS_STAGE["01_df_empty"] += 1
@@ -973,29 +827,28 @@ def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
         if dbg: gates.append("off_session")
         return None
 
-    # === Market tilt based on RS_SYMBOL 60m return sign ===
+    # === Market tilt based on RS_SYMBOL 60-bar return sign ===
     TILT_ON        = os.getenv("TILT_ON", "1").lower() in ("1","true","yes")
     TILT_RETMIN    = float(os.getenv("TILT_RET_MIN", "0.003"))  # 0.3%
     TILT_DELTA     = float(os.getenv("TILT_DELTA", "0.12"))
     TILT_LONG_BIAS = os.getenv("TILT_LONG_BIAS", "1").lower() in ("1","true","yes")
     TILT_SHORT_BIAS= os.getenv("TILT_SHORT_BIAS","1").lower() in ("1","true","yes")
-    BIAS_DELTA     = float(os.getenv("BIAS_DELTA","0.05"))      # margin advantage needed to override bias
+    BIAS_DELTA     = float(os.getenv("BIAS_DELTA","0.05"))
 
     tilt = 0
     if TILT_ON:
         ref = _REF_BARS_1M.get(RS_SYMBOL, pd.DataFrame())
         if ref is not None and not ref.empty and len(ref) > 60:
             try:
-                ret_60m = float(ref["close"].iloc[-1] / ref["close"].iloc[-60] - 1.0)
-                if abs(ret_60m) >= TILT_RETMIN:
-                    tilt = 1 if ret_60m > 0 else -1
+                ret_60 = float(ref["close"].iloc[-1] / ref["close"].iloc[-60] - 1.0)
+                if abs(ret_60) >= TILT_RETMIN:
+                    tilt = 1 if ret_60 > 0 else -1
             except Exception:
                 tilt = 0
 
-    # --- helper for EMA smoothing of probabilities ---
+    # --- helper smoothing ---
     def _smooth(store: dict, key, p, alpha: float):
-        if alpha <= 0:
-            return p
+        if alpha <= 0: return p
         p_prev = store.get(key, p)
         p_s = alpha * p + (1 - alpha) * p_prev
         store[key] = p_s
@@ -1007,7 +860,7 @@ def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
     # ---------------- LONG branch ----------------
     p_long = _smooth(_PROBA_EMA, key_pt, p_raw, PROBA_EMA_ALPHA)
 
-    # Higher-TF consensus for LONGS (probability-based)
+    # Higher-TF consensus for LONGS (require p2 >= threshold if enabled)
     if CONSENSUS_TF and CONSENSUS_TF != tf_min:
         bars_hi = _resample(df1m, CONSENSUS_TF)
         if bars_hi is None or bars_hi.empty:
@@ -1075,7 +928,6 @@ def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
         p_down_raw = 1.0 - p_raw
         p_short = _smooth(_PROBA_EMA_SHORT, key_pt, p_down_raw, PROBA_EMA_ALPHA)
 
-        # Higher-TF consensus for SHORTS (probability-based on 1-p2)
         if CONSENSUS_TF and CONSENSUS_TF != tf_min:
             bars_hi = _resample(df1m, CONSENSUS_TF)
             if bars_hi is None or bars_hi.empty:
@@ -1103,7 +955,6 @@ def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
                     else:
                         p_short = float((p_short ** (1 - CONSENSUS_WEIGHT)) * ((1.0 - float(p2s)) ** CONSENSUS_WEIGHT))
 
-        # Rolling dynamic quantile for SHORTS
         if p_short >= 0 and CONF_ROLL_N > 0:
             dqS = _CONF_HIST.get(("S",) + key_pt)
             if dqS is None:
@@ -1117,7 +968,6 @@ def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
             if p_short >= 0:
                 dqS.append(p_short)
 
-        # Regime gate for SHORTS
         if REGIME_ENABLED and p_short >= 0:
             ref = _REF_BARS_1M.get(RS_SYMBOL, pd.DataFrame())
             if ref is None or ref.empty or len(ref) < max(REGIME_MA + 5, 60):
@@ -1135,14 +985,26 @@ def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
     base_thr_long  = max(CONF_THR_RUNTIME, conf_threshold)
     base_thr_short = max(CONF_THR_RUNTIME, SHORT_CONF_THR)
 
-    if tilt == 1:
+    if TILT_ON and tilt == 1:
         thr_long  = max(0.50, base_thr_long  - TILT_DELTA)
         thr_short = min(0.99, base_thr_short + TILT_DELTA)
-    elif tilt == -1:
+    elif TILT_ON and tilt == -1:
         thr_long  = min(0.99, base_thr_long  + TILT_DELTA)
         thr_short = max(0.50, base_thr_short - TILT_DELTA)
     else:
         thr_long, thr_short = base_thr_long, base_thr_short
+
+    # --- FAILSAFE: relax long threshold if absurdly few longs pass early session ---
+    try:
+        sess_now = _now_et()
+        session_minutes = (sess_now.hour - 9) * 60 + (sess_now.minute - 30)
+        if 0 <= session_minutes <= 180:
+            old_thr_long = thr_long
+            thr_long = _failsafe_adjust_long_threshold(thr_long, session_minutes)
+            if SCANNER_DEBUG and thr_long < old_thr_long:
+                print(f"[FAILSAFE] thr_long relaxed {old_thr_long:.3f} -> {thr_long:.3f}", flush=True)
+    except Exception:
+        pass
 
     # ---------------- Persistence & gates ----------------
     long_ok = False
@@ -1174,30 +1036,39 @@ def signal_ml_pattern_dual(symbol: str, df1m: pd.DataFrame, tf_min: int,
         if ENABLE_SHORTS and p_short >= 0 and dbg:
             gates.append("below_thr_S")
 
+    # --- AUDIT TAP (counts where longs are dying)
+    try:
+        _audit_note(p_up=(p_long if p_long >= 0 else None),
+                    long_ok=bool(long_ok),
+                    thr_long=thr_long)
+    except Exception:
+        pass
+
     # ---------------- Side selection with market bias ----------------
     side = None
     conf = -1.0
     lm = (p_long  - thr_long)  if long_ok  else -1e9
     sm = (p_short - thr_short) if short_ok else -1e9
 
-    if tilt == 1 and TILT_LONG_BIAS:
-        # Prefer longs in green tape; require short to beat by BIAS_DELTA to override
+    if (tilt == 1) and TILT_LONG_BIAS:
         if long_ok and (not short_ok or sm < lm + BIAS_DELTA):
             side, conf = ("long",  p_long)
         elif short_ok:
             side, conf = ("short", p_short)
-    elif tilt == -1 and TILT_SHORT_BIAS:
-        # Prefer shorts in red tape; require long to beat by BIAS_DELTA to override
+    elif (tilt == -1) and TILT_SHORT_BIAS:
         if short_ok and (not long_ok or lm < sm + BIAS_DELTA):
             side, conf = ("short", p_short)
         elif long_ok:
             side, conf = ("long",  p_long)
     else:
-        # Neutral: pick the greater margin if any
         if long_ok and (not short_ok or lm >= sm):
             side, conf = ("long",  p_long)
         elif short_ok:
             side, conf = ("short", p_short)
+
+    # If shorts are disabled, never pick short.
+    if not ENABLE_SHORTS and side == "short":
+        side = "long" if long_ok else None
 
     if side is None:
         COUNTS_STAGE["14_no_side_passed"] += 1
@@ -1323,11 +1194,11 @@ def check_daily_guards():
             ok, info = close_all_positions()
             print(f"[DAILY-GUARD] Flatten -> ok={ok} info={info}", flush=True)
 
-    # Drift auto-response: if enabled, gently raise threshold when high-p buckets underperform
+    # Drift auto-response
     if DRIFT_MONITOR:
         bad = []
         for (lo, hi), (w, t) in _RELIABILITY.items():
-            if t >= 10 and lo >= 0.80:  # only high-conf buckets
+            if t >= 10 and lo >= 0.80:
                 wr = w / max(1, t)
                 if wr < MIN_BUCKET_WIN:
                     bad.append((lo, hi, wr, t))
@@ -1371,27 +1242,21 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
 
     # --- pre-send short sanity gates ---
     if sig.get("action") in ("sell", "sell_short"):
-        # denylist: symbols that returned "cannot be sold short"
         if 'SHORT_DENY' not in globals():
             globals()['SHORT_DENY'] = set()
         if symbol in SHORT_DENY:
             print(f"[ORDER-SKIP] {symbol} on denylist (not shortable).", flush=True)
             return
-
-        # optional min price for shorts
         last_px = float(sig.get("entry") or LAST_PRICE.get(symbol, 0.0) or 0.0)
         if last_px and last_px < MIN_SHORT_PRICE:
             print(f"[ORDER-SKIP] {symbol} short @ {last_px:.2f} < MIN_SHORT_PRICE={MIN_SHORT_PRICE:.2f}.", flush=True)
             return
 
-    # send first, only record on success
     ok, info = send_to_broker(symbol, sig, strategy_tag="ml_pattern")
 
-    # If Alpaca rejects due to bracket distances, adjust once and retry
     info_str = str(info)
     if (not ok) and any(key in info_str for key in ("take_profit.limit_price", "stop_loss.stop_price")):
         try:
-            # Try to parse Alpaca's base_price from the error payload
             broker_base = None
             try:
                 s = info_str
@@ -1399,35 +1264,25 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
                 if jstart != -1:
                     j = json.loads(s[jstart:])
                     bp = j.get("base_price")
-                    if bp is not None:
-                        broker_base = float(bp)
+                    if bp is not None: broker_base = float(bp)
             except Exception:
                 broker_base = None
 
-            base = broker_base if (broker_base is not None) \
-                   else float(sig.get("entry") or LAST_PRICE.get(symbol, 0.0) or 0.0)
+            base = broker_base if (broker_base is not None) else float(sig.get("entry") or LAST_PRICE.get(symbol, 0.0) or 0.0)
             side = "long" if sig.get("action") == "buy" else "short"
             tp = float(sig["takeProfit"]); sl = float(sig["stopLoss"])
-
-            # Re-apply rules vs Alpaca's base_price with directional rounding + buffer
             tp2, sl2 = _apply_tick_rules(side, base, tp, sl, tick=MIN_TICK, extra_ticks=EXTRA_TICKS)
 
-            # Only resend if levels actually changed
             if (abs(tp2 - tp) >= MIN_TICK/2) or (abs(sl2 - sl) >= MIN_TICK/2):
-                sig2 = dict(sig)
-                sig2["takeProfit"] = tp2
-                sig2["stopLoss"]   = sl2
+                sig2 = dict(sig); sig2["takeProfit"] = tp2; sig2["stopLoss"] = sl2
                 ok, info = send_to_broker(symbol, sig2, strategy_tag="ml_pattern")
-                if ok:
-                    sig = sig2  # keep adjusted levels for local bookkeeping
+                if ok: sig = sig2
         except Exception:
             pass
 
-    # If Alpaca says asset cannot be shorted, add to denylist
     if (not ok) and ("cannot be sold short" in info_str):
         SHORT_DENY.add(symbol)
 
-    # Update counters and optionally record the open trade
     try:
         COMBO_COUNTS[f"{combo_key}::orders.{'ok' if ok else 'err'}"] += 1
         COUNTS["orders.ok" if ok else "orders.err"] += 1
@@ -1435,7 +1290,6 @@ def handle_signal(strat_name: str, symbol: str, tf_min: int, sig: dict):
         pass
 
     if ok:
-        # enrich meta, then record open trade
         meta = sig.get("meta", {})
         meta["combo"] = combo_key
         meta["timeframe"] = f"{int(tf_min)}m"
@@ -1458,32 +1312,19 @@ def _batched_symbols(universe: list):
     _round_robin = 0 if end >= N else end
     return batch
 
-# Optional sector lookup (kept simple; returns 'UNKNOWN' unless you wire a map)
 def _get_sector(symbol: str) -> str:
     return "UNKNOWN"
 
 def _prune_by_correlation(candidates, ret_series_map, max_corr=1.0):
-    """
-    Prunes highly-correlated candidates based on recent returns in ret_series_map.
-    Accepts candidate tuples of length 5 or 6:
-      (prob, sym, tf, sig, k) OR (prob, sym, tf, sig, k, sector)
-    Returns a filtered list with original tuples preserved.
-    """
-    if max_corr >= 0.999:  # effectively off
+    if max_corr >= 0.999:
         return candidates
-
     chosen = []
     for item in candidates:
-        # Support both 5- and 6-tuples without raising.
-        # Index 1 is symbol in both layouts.
         sym = item[1]
         r1 = ret_series_map.get(sym)
-
-        # If we don't have returns for this symbol, keep it.
         if r1 is None or len(r1) < 5:
             chosen.append(item)
             continue
-
         ok = True
         for j in chosen:
             sym2 = j[1]
@@ -1493,35 +1334,25 @@ def _prune_by_correlation(candidates, ret_series_map, max_corr=1.0):
             n = min(len(r1), len(r2))
             if n < 5:
                 continue
-            # Corr on the overlapping tail
             c = float(np.corrcoef(r1[-n:], r2[-n:])[0, 1])
             if np.isfinite(c) and abs(c) > max_corr:
                 ok = False
                 break
-
         if ok:
             chosen.append(item)
-
     return chosen
 
 def _refresh_shortable_if_needed():
-    """
-    Refresh cached set of shortable symbols from Alpaca every SHORTABLE_REFRESH_MIN minutes.
-    This is cheap enough to call each loop; it only fetches when stale.
-    """
     global SHORTABLE_SET, SHORTABLE_LAST
     if not os.getenv("SKIP_NON_SHORTABLE", "0").lower() in ("1","true","yes"):
         return
-
     try:
         mins = int(os.getenv("SHORTABLE_REFRESH_MIN", "30"))
     except Exception:
         mins = 30
-
     now = datetime.now(timezone.utc)
     if SHORTABLE_LAST and (now - SHORTABLE_LAST) < timedelta(minutes=mins):
         return
-
     try:
         base = os.getenv("ALPACA_TRADE_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
         url = f"{base}/v2/assets?status=active&tradable=true&shortable=true"
@@ -1543,42 +1374,11 @@ def _refresh_shortable_if_needed():
 # ==============================
 # BROKER AUTH PROBE (boot banner)
 # ==============================
-def probe_alpaca_auth():
-    """Simple startup check that Alpaca keys are valid and account is reachable."""
-    try:
-        base = os.getenv("ALPACA_TRADE_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
-        key = os.getenv("APCA_API_KEY_ID") or os.getenv("APCA-API-KEY-ID")
-        sec = os.getenv("APCA_API_SECRET_KEY") or os.getenv("APCA-API-SECRET-KEY")
-        if not key or not sec:
-            print("[PROBE] missing Alpaca API credentials", flush=True)
-            return False
-
-        r = requests.get(f"{base}/v2/account", headers={
-            "APCA-API-KEY-ID": key,
-            "APCA-API-SECRET-KEY": sec
-        }, timeout=10)
-
-        if r.status_code == 200:
-            acct = r.json()
-            print(f"[PROBE] GET /v2/account -> {r.status_code} key={key[:3]}…{key[-3:]} base={base}", flush=True)
-            print(f"[PROBE] account_number={acct.get('account_number')} status={acct.get('status')} currency={acct.get('currency')}", flush=True)
-            return True
-        else:
-            print(f"[PROBE] Alpaca auth failed ({r.status_code}): {r.text}", flush=True)
-            return False
-    except Exception as e:
-        print(f"[PROBE] Alpaca auth exception: {e}", flush=True)
-        return False
-
-# ---- Alpaca key normalization + probe (drop-in) ----
 def _get_alpaca_keys():
-    """
-    Return (key_id, secret_key) by checking multiple common env var names.
-    """
     key = (
         os.getenv("APCA_API_KEY_ID")
         or os.getenv("ALPACA_API_KEY_ID")
-        or os.getenv("APCA-API-KEY-ID")  # last-resort; hyphens usually not settable
+        or os.getenv("APCA-API-KEY-ID")
     )
     secret = (
         os.getenv("APCA_API_SECRET_KEY")
@@ -1596,31 +1396,20 @@ def _mask(s, keep=4):
     return f"{s[:keep]}…{s[-keep:]}"
 
 def probe_alpaca_auth():
-    """
-    Logs which env vars are detected, base URLs, and does a /v2/account probe.
-    Prevents false 'missing credentials' confusion.
-    """
     key, secret = _get_alpaca_keys()
     trade_base = os.getenv("ALPACA_TRADE_BASE_URL", "https://paper-api.alpaca.markets").rstrip("/")
     data_base  = os.getenv("ALPACA_DATA_BASE_URL",  "https://data.alpaca.markets").rstrip("/")
-
-    # Clear, masked boot log
     print(
         "[PROBE] Alpaca env "
         f"key={_mask(key)} secret={_mask(secret)} "
         f"trade_base={trade_base} data_base={data_base} PAPER_MODE={'1' if PAPER_MODE else '0'}",
         flush=True,
     )
-
     if not key or not secret:
         print("[PROBE] missing Alpaca API credentials (env not found)", flush=True)
         return
-
     try:
-        headers = {
-            "APCA-API-KEY-ID": key,
-            "APCA-API-SECRET-KEY": secret,
-        }
+        headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
         r = requests.get(f"{trade_base}/v2/account", headers=headers, timeout=15)
         if r.status_code == 200:
             acct = r.json()
@@ -1632,6 +1421,17 @@ def probe_alpaca_auth():
             print(f"[PROBE] GET /v2/account -> {r.status_code} body={r.text[:180]}", flush=True)
     except Exception as e:
         print(f"[PROBE] exception contacting Alpaca: {e}", flush=True)
+
+# ==============================
+# Maintenance / GC helpers
+# ==============================
+def _light_gc_afterhours():
+    """
+    When the market is closed AND SCANNER_MARKET_HOURS_ONLY=1,
+    free big caches to avoid memory creep on Render.
+    """
+    if SCANNER_MARKET_HOURS_ONLY and not _market_session_now():
+        _BARCACHE.clear(); _RESAMPLE_CACHE.clear(); _ML_CACHE.clear()
 
 # ==============================
 # MAIN LOOP
@@ -1725,6 +1525,10 @@ def main():
                 HALT_TRADING = True
 
             allow_entries = not HALT_TRADING
+
+            # After-hours GC to keep memory in check
+            _light_gc_afterhours()
+
             if not allow_entries:
                 time.sleep(POLL_SECONDS)
                 continue
@@ -1745,10 +1549,11 @@ def main():
             # reset per-batch audit tallies
             COUNTS_STAGE.clear()
             COUNTS_MODEL.clear()
+            _audit_reset()
 
-            # (Optional) shortable prefetch hook; safe if no-op in your codebase
+            # (Optional) shortable prefetch
             try:
-                _refresh_shortable_if_needed()  # if you implemented it; otherwise this is a no-op wrapper
+                _refresh_shortable_if_needed()
             except Exception:
                 pass
 
@@ -1780,7 +1585,7 @@ def main():
                 except Exception:
                     df1m.index = df1m.index.tz_localize("UTC").tz_convert(MARKET_TZ)
 
-                # --- quick liquidity gate: require some intraday activity today ---
+                # --- quick liquidity gate: require some intraday activity today (configurable) ---
                 try:
                     today = _now_et().date()
                     today_mask = (df1m.index.date == today)
@@ -1792,7 +1597,7 @@ def main():
                 except Exception:
                     pass
 
-                # --- optional ETF/ETN heuristic skip (keeps noise down on paper) ---
+                # --- optional ETF/ETN heuristic skip ---
                 if os.getenv("SKIP_ETFS", "0").lower() in ("1", "true", "yes"):
                     s_up = sym.upper()
                     looks_etf = (
@@ -1806,17 +1611,16 @@ def main():
                             print(f"[SKIP] {sym} ETF/ETN by heuristic.", flush=True)
                         continue
 
-                # store returns for corr pruning
+                # returns for corr pruning
                 try:
                     ret_series_map[sym] = df1m["close"].pct_change().dropna().tail(CORR_LOOKBACK).to_numpy()
                 except Exception:
                     pass
 
-                # ---- per-timeframe signals (ultra-defensive) ----
+                # ---- per-timeframe signals ----
                 for tf in TF_MIN_LIST:
                     sig = signal_ml_pattern_dual(sym, df1m, tf)
 
-                    # If no signal, optionally probe then continue
                     if not isinstance(sig, dict):
                         if SCANNER_DEBUG:
                             try:
@@ -1826,13 +1630,11 @@ def main():
                                     if ts_probe is not None and p_up_probe is not None:
                                         thrL = max(CONF_THR_RUNTIME, CONF_THR)
                                         thrS = max(CONF_THR_RUNTIME, float(os.getenv("SHORT_CONF_THR","0.7")))
-                                        print(f"[PROBE] {sym} {tf}m p_up={p_up_probe:.3f} "
-                                              f"long_thr={thrL:.3f} short_thr={thrS:.3f}", flush=True)
+                                        print(f"[PROBE] {sym} {tf}m p_up={p_up_probe:.3f} long_thr={thrL:.3f} short_thr={thrS:.3f}", flush=True)
                             except Exception:
                                 pass
-                        continue  # sig is None or not a dict
+                        continue  # sig is None
 
-                    # Require mandatory fields
                     action   = sig.get("action")
                     bar_time = sig.get("barTime") or sig.get("bar_time")
                     if not action or not bar_time:
@@ -1840,13 +1642,11 @@ def main():
                             print(f"[WARN] malformed signal {sym} {tf}m -> {sig}", flush=True)
                         continue
 
-                    # prevent pyramiding
                     if NO_PYRAMIDING and _has_open_position(sym):
                         if SCANNER_DEBUG:
                             print(f"[PYRAMID-BLOCK] {sym} already has open exposure. Skipping.", flush=True)
                         continue
 
-                    # dedupe key
                     try:
                         k = _dedupe_key(sym, tf, action, bar_time)
                     except Exception as e:
@@ -1857,7 +1657,6 @@ def main():
                     if k in _sent_keys:
                         continue
 
-                    # sort key uses either 'proba' or legacy 'proba_up'
                     meta = sig.get("meta", {}) or {}
                     prob = meta.get("proba")
                     if prob is None:
@@ -1871,14 +1670,12 @@ def main():
 
             # -------- selection: sort, optional sector cap, corr prune, top-K, then send --------
             if candidates:
-                # order by model confidence, highest first
                 candidates.sort(key=lambda x: x[0], reverse=True)
                 print(f"[CAND-COUNT] raw={len(candidates)}", flush=True)
                 top5_preview = ", ".join([f"{c[1]}:{c[0]:.3f}@{c[2]}m" for c in candidates[:5]])
                 if top5_preview:
                     print(f"[SELECT] after-sort={len(candidates)} top5={top5_preview}", flush=True)
 
-                # sector cap (optional)
                 if MAX_PER_SECTOR > 0:
                     sec_count = defaultdict(int)
                     kept = []
@@ -1891,7 +1688,6 @@ def main():
                         print(f"[SELECT] after-sector={len(kept)} (was {len(candidates)})", flush=True)
                     candidates = kept
 
-                # correlation prune (optional)
                 if MAX_CAND_CORR < 0.999:
                     prev = len(candidates)
                     candidates = _prune_by_correlation(candidates, ret_series_map, MAX_CAND_CORR)
@@ -1901,7 +1697,6 @@ def main():
                     if SCANNER_DEBUG:
                         print(f"[SELECT] after-corr={len(candidates)} (was {len(candidates)})", flush=True)
 
-                # top-K throttle
                 chosen = candidates[:BATCH_TOP_K] if BATCH_TOP_K else candidates
                 print(f"[SELECT] chosen={len(chosen)}", flush=True)
 
@@ -1911,6 +1706,12 @@ def main():
             else:
                 if SCANNER_DEBUG:
                     print("[CAND-COUNT] raw=0", flush=True)
+
+            # Print audit heartbeat
+            try:
+                _audit_maybe_print(thr_long=CONF_THR_RUNTIME)
+            except Exception:
+                pass
 
         except Exception as e:
             import traceback
